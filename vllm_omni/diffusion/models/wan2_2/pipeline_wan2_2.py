@@ -23,6 +23,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_noisy_chunk_pipeline
+from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
@@ -515,9 +516,7 @@ class Wan22Pipeline(
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(
-            config, quant_config=quant_config, replicate_for_chunk_pipeline=self.chunk_pipeline_mode
-        )
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     def _diffuse_chunks(self, req, latents, timesteps, prompt_embeds, dtype, generator):
         params = req.sampling_params_list[0]
@@ -533,22 +532,25 @@ class Wan22Pipeline(
             raise ValueError("Total output latent frames must be divisible by the chunk latent length")
         chunks = latents.shape[2] // chunk_t
         length = int(extra.get("chunk_cond_frames", min(4, chunk_t)))
-        lag = int(extra.get("chunk_lag", 1))
+        gap = int(extra.get("chunk_gap", extra.get("chunk_lag", 1)))
+        schedule = extra.get("chunk_schedule", "stepwise")
         if isinstance(generator, list):
             generator = generator[0]
         seed = params.seed if params.seed is not None else generator.initial_seed() if generator is not None else 0
         shape = (*latents.shape[:2], chunk_t, *latents.shape[3:])
 
-        def predict_noise(model_input, timestep, temporal_offset, step_idx):
+        def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None):
             self._current_timestep = timestep[0]
             self.record_denoise_step(step_idx, timestep[0])
-            return self.transformer(
+            return self.predict_noise(
+                current_model=self.transformer,
                 hidden_states=model_input.to(dtype),
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
                 temporal_offset=temporal_offset,
+                intermediate_tensors=intermediate_tensors,
                 return_dict=False,
-            )[0]
+            )
 
         result, self.chunk_pipeline_metrics = run_noisy_chunk_pipeline(
             predict_noise=predict_noise,
@@ -557,9 +559,11 @@ class Wan22Pipeline(
             shape=shape,
             chunks=chunks,
             cond_frames=length,
-            lag=lag,
+            gap=gap,
             seed=seed,
             device=latents.device,
+            schedule=schedule,
+            layer_range=(self.transformer.start_layer, self.transformer.end_layer),
         )
         return result
 
@@ -596,8 +600,28 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        profile = getattr(self, "_collect_pp_metrics", False)
+        if profile:
+            pp = get_pp_group()
+            current_omni_platform.synchronize()
+            if pp.world_size > 1:
+                torch.distributed.barrier(group=pp.device_group)
+            torch.accelerator.reset_peak_memory_stats(latents.device)
+            self._full_pp_records = []
+            self._full_pp_wait_ms = 0.0
+            self._full_pp_feedback_bytes = 0
+            self._full_pp_origin = torch.cuda.Event(enable_timing=True)
+            self._full_pp_origin.record()
+            profile_start = time.perf_counter()
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
+                if profile:
+                    wait_start = time.perf_counter()
+                    if isinstance(latents, AsyncLatents):
+                        latents = latents._resolve()
+                    self._sync_pp_send()
+                    self._full_pp_wait_ms += (time.perf_counter() - wait_start) * 1000
+                    self._full_pp_step_idx = step_idx
                 self._current_timestep = t
                 self.record_denoise_step(step_idx, t)
 
@@ -675,26 +699,77 @@ class Wan22Pipeline(
                 )
 
                 if self.is_dmd:
-                    pred_clean = self.scheduler.predict_clean(noise_pred, latents, t).to(noise_pred.dtype)
-                    if step_idx + 1 < len(timesteps):
+
+                    def update_dmd(prediction, sample):
+                        pred_clean = self.scheduler.predict_clean(prediction, sample, t).to(prediction.dtype)
+                        if step_idx + 1 == len(timesteps):
+                            return pred_clean
                         noise = randn_tensor(
-                            latents.shape,
-                            generator=generator,
-                            device=latents.device,
-                            dtype=pred_clean.dtype,
+                            sample.shape, generator=generator, device=sample.device, dtype=pred_clean.dtype
                         )
-                        latents = self.scheduler.add_noise(pred_clean, noise, timesteps[step_idx + 1])
-                    else:
-                        latents = pred_clean
+                        return self.scheduler.add_noise(pred_clean, noise, timesteps[step_idx + 1])
+
+                    latents = self.dmd_step_maybe_with_pp(noise_pred, latents, update_dmd)
                 else:
                     latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if profile and pp.world_size > 1 and pp.is_last_rank:
+                    self._full_pp_feedback_bytes += latents.numel() * latents.element_size()
                 pbar.update()
 
+        if profile:
+            wait_start = time.perf_counter()
+            if isinstance(latents, AsyncLatents):
+                latents = latents._resolve()
+            self._sync_pp_send()
+            self._full_pp_wait_ms += (time.perf_counter() - wait_start) * 1000
+            current_omni_platform.synchronize()
+            if pp.world_size > 1:
+                torch.distributed.barrier(group=pp.device_group)
+            wall_ms = (time.perf_counter() - profile_start) * 1000
+            payload = {
+                "rank": pp.rank_in_group,
+                "stage_idx": pp.rank_in_group,
+                "layer_range": [self.transformer.start_layer, self.transformer.end_layer],
+                "steps": self._full_pp_records,
+                "slots": [],
+                "denoise_wall_ms": wall_ms,
+                "comm_wait_ms": self._full_pp_wait_ms,
+                "comm_wait_scope": "explicit tensor receive and pending-send waits; metadata/dispatch remain in wall",
+                "denoise_peak_allocated_bytes": torch.accelerator.max_memory_allocated(latents.device),
+                "activation_bytes_sent": sum(r["activation_bytes_sent"] for r in self._full_pp_records),
+                "sample_bytes_sent": 0,
+                "feedback_bytes_sent": self._full_pp_feedback_bytes,
+                "condition_bytes_sent": 0,
+            }
+            ranks = [payload]
+            if pp.world_size > 1:
+                ranks = [None] * pp.world_size
+                torch.distributed.all_gather_object(ranks, payload, group=pp.cpu_group)
+            self.chunk_pipeline_metrics = {
+                "execution": "full_video_layer_pipeline",
+                "schedule": "full",
+                "gap": 0,
+                "lag": 0,
+                "world_size": pp.world_size,
+                "chunks": 1,
+                "chunk_latent_frames": latents.shape[2],
+                "cond_frames": 0,
+                "latent_shape": list(latents.shape),
+                "ranks": ranks,
+                "denoise_wall_ms": max(r["denoise_wall_ms"] for r in ranks),
+                "forward_total_ms": sum(s["forward_ms"] for r in ranks for s in r["steps"]),
+                "comm_wait_rank_sum_ms": sum(r["comm_wait_ms"] for r in ranks),
+                "condition_bytes_sent": 0,
+                "latent_gather_ms": 0.0,
+            }
+            self._full_pp_records = None
         return latents
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
+        self._collect_pp_metrics = bool((common.extra_args or {}).get("collect_pp_metrics", False))
+        self._full_pp_records = None
         prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
         negative_prompts = [
             None if isinstance(prompt, str) else prompt.get("negative_prompt") for prompt in req.prompts
@@ -786,7 +861,7 @@ class Wan22Pipeline(
         if self.chunk_pipeline_mode and request_latents is not None:
             raise ValueError("Chunk pipeline mode currently prepares its own per-chunk seeded noise")
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
@@ -819,7 +894,7 @@ class Wan22Pipeline(
                     dtype=dtype,
                 )
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
@@ -841,7 +916,7 @@ class Wan22Pipeline(
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             _t_latent_prep_start = time.perf_counter()
         images: list[PIL.Image.Image | torch.Tensor | None] = []
         for request_prompt in req.prompts:
@@ -938,14 +1013,14 @@ class Wan22Pipeline(
                 generator=generator,
                 latents=request_latents,
             )
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             current_omni_platform.synchronize()
             _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
 
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             _t_denoise_start = time.perf_counter()
         if self.chunk_pipeline_mode:
             latents = self._diffuse_chunks(req, latents, timesteps, prompt_embeds, dtype, generator)
@@ -970,7 +1045,7 @@ class Wan22Pipeline(
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             current_omni_platform.synchronize()
             _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
 
@@ -978,7 +1053,7 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             _t_decode_start = time.perf_counter()
         media = None
         if output_type == "latent":
@@ -1016,7 +1091,7 @@ class Wan22Pipeline(
             else:
                 output = decoded
 
-        if DEBUG_PERF or self.chunk_pipeline_mode:
+        if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             current_omni_platform.synchronize()
             _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
             _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
@@ -1038,9 +1113,12 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        if self.chunk_pipeline_mode and _is_rank_zero():
+        if (self.chunk_pipeline_mode or self._collect_pp_metrics) and _is_rank_zero():
             self.chunk_pipeline_metrics.update(
                 {
+                    "seed": common.seed,
+                    "experiment_iteration": (common.extra_args or {}).get("experiment_iteration"),
+                    "model_weight_layout": "layer_partition",
                     "height": height,
                     "width": width,
                     "num_frames": num_frames,
@@ -1087,7 +1165,41 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        records = getattr(self, "_full_pp_records", None)
+        if records is not None:
+            wait_start = time.perf_counter()
+            intermediate = kwargs.get("intermediate_tensors")
+            if intermediate is not None:
+                # Resolve the incoming activation before starting the GPU
+                # compute event, so peer waiting is not called DiT compute.
+                intermediate["hidden_states"]
+            wait_ms = (time.perf_counter() - wait_start) * 1000
+            self._full_pp_wait_ms += wait_ms
+            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            start.record()
         result = current_model(**kwargs)
+        if records is not None:
+            end.record()
+            end.synchronize()
+            records.append(
+                {
+                    "chunk_idx": 0,
+                    "step_idx": self._full_pp_step_idx,
+                    "slot_idx": self._full_pp_step_idx,
+                    "rank": get_pp_group().rank_in_group,
+                    "stage_idx": get_pp_group().rank_in_group,
+                    "timestep": float(kwargs["timestep"].flatten()[0].item()),
+                    "input_latent_frames": kwargs["hidden_states"].shape[2],
+                    "forward_ms": start.elapsed_time(end),
+                    "stage_start_ms": self._full_pp_origin.elapsed_time(start),
+                    "stage_end_ms": self._full_pp_origin.elapsed_time(end),
+                    "time_origin": "rank_local_cuda_event",
+                    "comm_wait_ms": wait_ms,
+                    "activation_bytes_sent": sum(t.numel() * t.element_size() for t in result.tensors.values())
+                    if isinstance(result, IntermediateTensors)
+                    else 0,
+                }
+            )
         return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(

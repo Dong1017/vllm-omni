@@ -1,18 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Benchmark one whole-request noisy chunk pipeline through Omni.generate.
+"""Benchmark layer-partitioned full / serial / stepwise video generation.
 
-Run from this checkout under the GPU scheduler, for example::
-
-    PYTHONPATH=/data/dxw/noisy_chunk_pp/vllm-omni gpu run --gpus 2 \
-        --timeout 30m --note omni-chunk-pp -- python \
-        examples/offline_inference/diffusion/noisy_chunk_pp.py \
-        --pp-size 2 --chunks 6 --mode lag1 --out /data/dxw/noisy_chunk_pp/omni_pp2
-
-The default saves a latent tensor for same-algorithm PP=1 versus PP=2 parity.
-With --decode, it saves a video instead. Worker CHUNK_PP_METRICS log records
-contain denoising/forward/communication timings; metadata.json records the
-client request wall time, including response transport but excluding saving.
+An instance runs one complete video warmup, three complete video measurements,
+then latent-only correctness requests. Run this program through ``gpu run``.
+Only the last measured video is saved; artifact writing is outside timing.
 """
 
 import argparse
@@ -21,36 +13,39 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execution", choices=("full", "serial", "stepwise"), required=True)
+    parser.add_argument("--gap", type=int, choices=(1, 2), default=1)
     parser.add_argument("--pp-size", type=int, choices=(1, 2), default=2)
     parser.add_argument("--chunks", type=int, default=6)
-    parser.add_argument(
-        "--cond-frames", type=int, choices=range(1, 21), default=4, help="Condition prefix length in latent frames."
-    )
-    parser.add_argument("--mode", choices=("lag1", "lag2"), default="lag1")
-    parser.add_argument("--out", type=Path, required=True, help="Output directory.")
-    parser.add_argument("--decode", action="store_true", help="Return decoded np video instead of latents.")
+    parser.add_argument("--cond-frames", type=int, choices=range(1, 21), default=4)
+    parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.chunks < 1:
         parser.error("--chunks must be positive")
     return args
 
 
+def write_metadata(path, data):
+    path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
 def main():
     args = parse_args()
-    # Workers spawned by Omni must import this checkout as well as the client.
     checkout = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(checkout))
-    existing_paths = os.environ.get("PYTHONPATH", "")
-    os.environ["PYTHONPATH"] = str(checkout) + (os.pathsep + existing_paths if existing_paths else "")
+    old_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = str(checkout) + (os.pathsep + old_pythonpath if old_pythonpath else "")
 
     import numpy as np
     import torch
+    from diffusers.utils import export_to_video
 
     import vllm_omni
     from vllm_omni.entrypoints.omni import Omni
@@ -60,29 +55,22 @@ def main():
     module_path = Path(vllm_omni.__file__).resolve()
     if not module_path.is_relative_to(checkout):
         raise RuntimeError(f"Expected vllm_omni from {checkout}, imported {module_path}")
-
     args.out.mkdir(parents=True, exist_ok=True)
+    metadata_path = args.out / "metadata.json"
+    if metadata_path.exists():
+        raise FileExistsError(f"Use a fresh experiment directory; {metadata_path} already exists")
+
     chunk_frames, chunk_latent_frames = 77, 20
     num_frames = args.chunks * chunk_latent_frames * 4 - 3
-    output_type = "np" if args.decode else "latent"
-    prompt = "A cinematic drone shot over snowy mountains at golden hour"
+    mode = "layer" if args.execution == "full" else "chunk"
+    schedule = "serial" if args.execution == "full" else args.execution
     model = "FastVideo/FastWan2.2-TI2V-5B-Diffusers"
-    extra_args = {
-        "chunk_frames": chunk_frames,
-        "chunk_cond_frames": args.cond_frames,
-        "chunk_lag": int(args.mode[-1]),
-    }
-    sampling = OmniDiffusionSamplingParams(
-        height=480,
-        width=832,
-        num_frames=num_frames,
-        num_inference_steps=3,
-        seed=1024,
-        guidance_scale=1.0,
-        output_type=output_type,
-        extra_args=extra_args,
-    )
+    prompt = "A cinematic drone shot over snowy mountains at golden hour"
+    run_id = uuid.uuid4().hex
     metadata = {
+        "schema_version": 2,
+        "status": "initializing",
+        "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "checkout": str(checkout),
         "checkout_head": subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
@@ -91,85 +79,159 @@ def main():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "model": model,
         "prompt": prompt,
+        "execution": args.execution,
+        "gap": 0 if args.execution == "full" else args.gap,
         "pipeline_parallel_size": args.pp_size,
-        "pipeline_parallel_mode": "chunk",
+        "pipeline_parallel_mode": mode,
         "enforce_eager": True,
         "chunks": args.chunks,
+        "chunk_latent_frames": chunk_latent_frames,
+        "cond_frames": 0 if args.execution == "full" else args.cond_frames,
+        "total_latent_frames": args.chunks * chunk_latent_frames,
         "height": 480,
         "width": 832,
         "num_frames": num_frames,
         "num_inference_steps": 3,
         "seed": 1024,
         "guidance_scale": 1.0,
-        "output_type": output_type,
-        "extra_args": extra_args,
+        "warmup_iterations": 1,
+        "timed_iterations": 3,
+        "iterations": [],
+        "artifacts": {},
         "timing_scope": {
-            "omni_init_wall_ms": "Omni constructor, including worker/model initialization",
-            "generate_request_wall_ms": "One Omni.generate call through complete response; excludes artifact saving",
-            "worker_metrics": "CHUNK_PP_METRICS JSON in worker log",
+            "omni_init_wall_ms": "Omni constructor, including automatic engine initialization/warmup",
+            "generate_request_wall_ms": "One complete Omni.generate response; excludes artifact saving",
+            "performance": "Median of exactly three phase=timed video requests following one complete video warmup",
+            "validation": "All latent-only requests excluded from performance statistics",
+            "worker_metrics": "CHUNK_PP_METRICS matched by unique experiment_iteration",
         },
     }
-    print("CHUNK_PP_CLIENT_CONFIG " + json.dumps(metadata), flush=True)
-    init_start = time.perf_counter()
-    omni = Omni(
-        model=model,
-        pipeline_parallel_size=args.pp_size,
-        pipeline_parallel_mode="chunk",
-        enforce_eager=True,
-    )
-    metadata["omni_init_wall_ms"] = (time.perf_counter() - init_start) * 1000
-    try:
-        request_start = time.perf_counter()
-        outputs = omni.generate(
-            {"prompt": prompt, "negative_prompt": "", "modalities": ["video"]},
-            sampling,
-            use_tqdm=False,
+    write_metadata(metadata_path, metadata)
+    print("LAYER_STEP_CLIENT_CONFIG " + json.dumps(metadata), flush=True)
+    omni = None
+
+    def request(phase, index, output_type, request_schedule):
+        iteration = f"{run_id}:{phase}:{index}"
+        extra_args = {
+            "chunk_frames": chunk_frames,
+            "chunk_cond_frames": args.cond_frames,
+            "chunk_gap": args.gap,
+            "chunk_schedule": request_schedule,
+            "collect_pp_metrics": True,
+            "experiment_iteration": iteration,
+        }
+        # New params / extra_args per call; no generator or request state reused.
+        sampling = OmniDiffusionSamplingParams(
+            height=480,
+            width=832,
+            num_frames=num_frames,
+            num_inference_steps=3,
+            seed=1024,
+            guidance_scale=1.0,
+            output_type=output_type,
+            extra_args=extra_args,
         )
-        metadata["generate_request_wall_ms"] = (time.perf_counter() - request_start) * 1000
+        record = {
+            "experiment_iteration": iteration,
+            "phase": phase,
+            "index": index,
+            "execution": args.execution,
+            "schedule": "full" if args.execution == "full" else request_schedule,
+            "gap": 0 if args.execution == "full" else args.gap,
+            "output_type": output_type,
+            "extra_args": dict(extra_args),
+            "status": "running",
+        }
+        metadata["iterations"].append(record)
+        write_metadata(metadata_path, metadata)
+        print("LAYER_STEP_ITERATION_START " + json.dumps(record), flush=True)
+        start = time.perf_counter()
+        outputs = omni.generate(
+            {"prompt": prompt, "negative_prompt": "", "modalities": ["video"]}, sampling, use_tqdm=False
+        )
+        record["generate_request_wall_ms"] = (time.perf_counter() - start) * 1000
         if not isinstance(outputs, list) or len(outputs) != 1 or not isinstance(outputs[0], OmniRequestOutput):
             raise TypeError(f"Expected one OmniRequestOutput, received {type(outputs)}")
         result = outputs[0]
-        metadata["request_id"] = result.request_id
-        metadata["final_output_type"] = result.final_output_type
-        metadata["stage_durations"] = result.stage_durations
-        metadata["worker_peak_memory_mb"] = result.peak_memory_mb
-        # Wan's latent postprocessor can carry its tensor in images; .latents
-        # is also used for diffusion trajectory data and may remain None.
-        payload = result.images
-        if not args.decode and result.latents is not None:
-            payload = result.latents
+        record.update(
+            request_id=result.request_id,
+            final_output_type=result.final_output_type,
+            stage_durations=result.stage_durations,
+            worker_peak_memory_mb=result.peak_memory_mb,
+        )
+        payload = result.latents if output_type == "latent" and result.latents is not None else result.images
         while isinstance(payload, list) and len(payload) == 1:
             payload = payload[0]
-
-        if args.decode:
-            from diffusers.utils import export_to_video
-
-            frames = np.asarray(payload)
-            if frames.ndim == 5 and frames.shape[0] == 1:
-                frames = frames[0]
-            expected_shape = (num_frames, 480, 832, 3)
-            if frames.shape != expected_shape:
-                raise ValueError(f"Expected decoded video {expected_shape}, received {frames.shape}")
-            artifact_path = args.out / "video.mp4"
-            export_to_video(list(frames), str(artifact_path), fps=16)
-            metadata.update(artifact_shape=list(frames.shape), artifact_dtype=str(frames.dtype), fps=16)
+        if output_type == "np":
+            payload = np.asarray(payload)
+            if payload.ndim == 5 and payload.shape[0] == 1:
+                payload = payload[0]
+            expected = (num_frames, 480, 832, 3)
+            if payload.shape != expected:
+                raise ValueError(f"Expected video {expected}, received {payload.shape}")
         else:
             if not isinstance(payload, torch.Tensor):
                 raise TypeError(f"Expected latent Tensor, received {type(payload)}")
             if payload.ndim == 4:
                 payload = payload.unsqueeze(0)
-            expected_shape = (1, 48, args.chunks * chunk_latent_frames, 30, 52)
-            if tuple(payload.shape) != expected_shape:
-                raise ValueError(f"Expected full latent {expected_shape}, received {tuple(payload.shape)}")
-            latents = payload.detach().to(device="cpu", dtype=torch.float32).contiguous()
-            artifact_path = args.out / "latents.pt"
-            torch.save(latents, artifact_path)
-            metadata.update(artifact_shape=list(latents.shape), artifact_dtype=str(latents.dtype))
-        metadata["artifact"] = str(artifact_path.resolve())
-        (args.out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        print("CHUNK_PP_CLIENT_METRICS " + json.dumps(metadata), flush=True)
+            expected = (1, 48, args.chunks * chunk_latent_frames, 30, 52)
+            if tuple(payload.shape) != expected:
+                raise ValueError(f"Expected latent {expected}, received {tuple(payload.shape)}")
+        record.update(status="complete", output_shape=list(payload.shape), output_dtype=str(payload.dtype))
+        write_metadata(metadata_path, metadata)
+        print("LAYER_STEP_ITERATION_COMPLETE " + json.dumps(record), flush=True)
+        return payload, record
+
+    try:
+        start = time.perf_counter()
+        omni = Omni(model=model, pipeline_parallel_size=args.pp_size, pipeline_parallel_mode=mode, enforce_eager=True)
+        metadata["omni_init_wall_ms"] = (time.perf_counter() - start) * 1000
+        metadata["status"] = "running"
+        write_metadata(metadata_path, metadata)
+        warmup, _ = request("warmup", 0, "np", schedule)
+        del warmup
+        for index in range(metadata["timed_iterations"]):
+            frames, record = request("timed", index, "np", schedule)
+            if index == metadata["timed_iterations"] - 1:
+                path = args.out / "video.mp4"
+                export_to_video(list(frames), str(path), fps=16)
+                metadata["artifacts"]["video"] = {
+                    "path": str(path.resolve()),
+                    "experiment_iteration": record["experiment_iteration"],
+                    "fps": 16,
+                }
+                write_metadata(metadata_path, metadata)
+            del frames
+
+        validations = [("latent_validation", schedule, "latents.pt", "latents")]
+        if args.execution == "stepwise" and args.gap == 2:
+            validations.append(("serial_latent_validation", "serial", "latents_serial_validation.pt", "serial_latents"))
+        for phase, request_schedule, filename, artifact_key in validations:
+            latent, record = request(phase, 0, "latent", request_schedule)
+            saved = latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            path = args.out / filename
+            torch.save(saved, path)
+            metadata["artifacts"][artifact_key] = {
+                "path": str(path.resolve()),
+                "experiment_iteration": record["experiment_iteration"],
+                "source_dtype": str(latent.dtype),
+                "saved_dtype": str(saved.dtype),
+                "shape": list(saved.shape),
+            }
+            write_metadata(metadata_path, metadata)
+            del latent, saved
+        metadata["status"] = "complete"
+        metadata["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        write_metadata(metadata_path, metadata)
+        print("LAYER_STEP_CLIENT_COMPLETE " + json.dumps(metadata), flush=True)
+    except Exception as exc:
+        metadata["status"] = "failed"
+        metadata["error"] = f"{type(exc).__name__}: {exc}"
+        write_metadata(metadata_path, metadata)
+        raise
     finally:
-        omni.close()
+        if omni is not None:
+            omni.close()
 
 
 if __name__ == "__main__":

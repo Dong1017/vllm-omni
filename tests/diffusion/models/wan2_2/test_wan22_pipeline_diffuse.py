@@ -473,6 +473,7 @@ class _StubDMDScheduler:
 
 
 def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.pipeline_parallel.get_pipeline_parallel_world_size", lambda: 1)
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()

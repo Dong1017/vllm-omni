@@ -1,79 +1,86 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU checks for the condition dependencies implied by the chunk schedule."""
+"""CPU checks for chunk dependencies and the two-stage layer schedule."""
 
 import pytest
 
-from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import slot_task
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_chunk_pipeline
 
 
 @pytest.mark.parametrize("world", [1, 2])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-@pytest.mark.parametrize("lag", [1, 2])
-def test_slot_task_condition_dependencies(world, chunks, lag):
-    # A serial schedule is an upper bound; do not duplicate the runner's slot
-    # count calculation or its model/communication implementation.
-    schedule = [[slot_task(slot, rank, chunks, world) for rank in range(world)] for slot in range(3 * chunks + world)]
-    execution_slot = {}
-    for slot, tasks in enumerate(schedule):
-        for rank, task in enumerate(tasks):
+@pytest.mark.parametrize("gap", [1, 2])
+@pytest.mark.parametrize("schedule", ["serial", "stepwise"])
+def test_each_layer_stage_executes_once_after_dependencies(world, chunks, gap, schedule):
+    slots = plan_chunk_pipeline(chunks, gap, world, schedule)
+    expected = {(chunk, step) for chunk in range(chunks) for step in range(3)}
+    executed = [{} for _ in range(world)]
+    completed = {}
+    for slot_idx, tasks in enumerate(slots):
+        assert len(tasks) == world
+        assert any(task is not None for task in tasks)
+        if schedule == "serial":
+            assert sum(task is not None for task in tasks) == 1
+        for stage, task in enumerate(tasks):
             if task is None:
                 continue
+            assert task in expected
+            assert task not in executed[stage]
             chunk, step = task
-            assert 0 <= chunk < chunks and 0 <= step < 3
-            assert rank == chunk % world
-            assert task not in execution_slot, f"Repeated execution of {task}"
-            execution_slot[task] = slot
-    assert set(execution_slot) == {(chunk, step) for chunk in range(chunks) for step in range(3)}
-    assert all(task is None for task in schedule[-1])
-    for chunk in range(chunks):
-        assert execution_slot[chunk, 0] < execution_slot[chunk, 1] < execution_slot[chunk, 2]
+            if stage == 0:
+                if step > 0:
+                    assert completed[chunk, step - 1] < slot_idx
+                if chunk > 0 and step >= gap:
+                    assert completed[chunk - 1, step - gap] < slot_idx
+            else:
+                assert executed[stage - 1][task] < slot_idx
+            executed[stage][task] = slot_idx
+        if tasks[-1] is not None:
+            completed[tasks[-1]] = slot_idx
+    assert set(completed) == expected
+    assert all(set(stage) == expected for stage in executed)
+    # Two stages mean twice as many local forward calls, not twice as many DiT steps.
+    assert sum(len(stage) for stage in executed) == world * chunks * 3
 
-    # Independent contract: adjacent chunk k+1 at step s+lag consumes k.s.
-    consumer_for = {(chunk, step): (chunk + 1, step + lag) for chunk in range(chunks - 1) for step in range(3 - lag)}
-    source_for = {consumer: source for source, consumer in consumer_for.items()}
-    caches = [{} for _ in range(world)]
-    sent = set()
-    consumed = set()
-    bidirectional_slots = 0
 
-    for slot, tasks in enumerate(schedule):
-        # Consume before delivering this slot's results: a same-slot producer
-        # cannot satisfy an input required before the consumer's forward.
-        for rank, task in enumerate(tasks):
-            if task not in source_for:
-                continue
-            source = source_for[task]
-            assert source in caches[rank], f"{task} needs uncached {source} at slot {slot}"
-            assert caches[rank].pop(source) == execution_slot[source] < slot
-            assert task not in consumed
-            consumed.add(task)
+@pytest.mark.parametrize("gap", [1, 2])
+@pytest.mark.parametrize("chunks", [1, 2, 3, 6])
+def test_serial_and_stepwise_execute_the_same_jobs(gap, chunks):
+    jobs = []
+    for schedule in ("serial", "stepwise"):
+        slots = plan_chunk_pipeline(chunks, gap, 2, schedule)
+        jobs.append([{task for tasks in slots if (task := tasks[stage]) is not None} for stage in range(2)])
+    assert jobs[0] == jobs[1]
 
-        sends = {(rank, consumer_for[task][0] % world, task) for rank, task in enumerate(tasks) if task in consumer_for}
-        # A receiving rank must post at the producer's slot, even when its own
-        # task is idle or belongs to an earlier chunk. Pair by endpoint AND key.
-        receives = set()
-        for receiver in range(world):
-            producer = (receiver - 1) % world
-            source = tasks[producer]
-            if source in consumer_for:
-                receives.add((producer, receiver, source))
-        assert sends == receives
-        if world == 2 and len(sends) == 2:
-            bidirectional_slots += 1
-            assert {(src, dst) for src, dst, _ in sends} == {(0, 1), (1, 0)}
 
-        for _, receiver, source in receives:
-            assert source not in sent
-            assert source not in caches[receiver]
-            assert execution_slot[consumer_for[source]] > slot
-            caches[receiver][source] = slot
-            sent.add(source)
+def test_gap_one_two_chunk_stage_order():
+    assert plan_chunk_pipeline(2, 1, 2) == [
+        ((0, 0), None),
+        ((1, 0), (0, 0)),
+        ((0, 1), (1, 0)),
+        ((1, 1), (0, 1)),
+        ((0, 2), (1, 1)),
+        ((1, 2), (0, 2)),
+        (None, (1, 2)),
+    ]
 
-    # In world=1 these logical sends are local cache handoffs, not network IO.
-    assert len(sent) == (chunks - 1) * (3 - lag)
-    assert sent == set(consumer_for)
-    assert consumed == set(source_for)
-    assert all(not cache for cache in caches)
-    if world == 2 and chunks >= 3 and lag == 1:
-        assert bidirectional_slots > 0
+
+@pytest.mark.parametrize("gap", [1, 2])
+def test_six_chunks_fill_two_stages_in_nineteen_slots(gap):
+    slots = plan_chunk_pipeline(6, gap, 2)
+    assert len(slots) == 19
+    assert sum(all(task is not None for task in tasks) for tasks in slots) == 17
+    assert slots[0][1] is None
+    assert slots[-1][0] is None
+
+
+@pytest.mark.parametrize("gap", [1, 2])
+def test_single_chunk_waits_for_each_last_stage(gap):
+    assert plan_chunk_pipeline(1, gap, 2) == [
+        ((0, 0), None),
+        (None, (0, 0)),
+        ((0, 1), None),
+        (None, (0, 1)),
+        ((0, 2), None),
+        (None, (0, 2)),
+    ]

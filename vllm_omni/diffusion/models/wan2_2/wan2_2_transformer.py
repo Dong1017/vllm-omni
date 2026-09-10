@@ -893,11 +893,10 @@ class WanTransformer3DModel(nn.Module):
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: int | None = None,
         quant_config: QuantizationConfig | None = None,
-        replicate_for_chunk_pipeline: bool = False,
     ):
         super().__init__()
-        self.is_first_stage = replicate_for_chunk_pipeline or is_pipeline_first_stage()
-        self.is_last_stage = replicate_for_chunk_pipeline or is_pipeline_last_stage()
+        self.is_first_stage = is_pipeline_first_stage()
+        self.is_last_stage = is_pipeline_last_stage()
         # Store config for compatibility
         self.config = type(
             "Config",
@@ -970,11 +969,7 @@ class WanTransformer3DModel(nn.Module):
                 prefix=prefix,
             )
 
-        if replicate_for_chunk_pipeline:
-            self.start_layer, self.end_layer = 0, num_layers
-            self.blocks = nn.ModuleList([layer_factory(f"blocks.{index}") for index in range(num_layers)])
-        else:
-            self.start_layer, self.end_layer, self.blocks = make_layers(num_layers, layer_factory, prefix="blocks")
+        self.start_layer, self.end_layer, self.blocks = make_layers(num_layers, layer_factory, prefix="blocks")
 
         # 4. Output norm & projection — only on the last PP stage
         if self.is_last_stage:
