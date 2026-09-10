@@ -208,10 +208,15 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, temporal_offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+        if temporal_offset < 0 or temporal_offset % p_t:
+            raise ValueError("temporal_offset must be nonnegative and divisible by the temporal patch size")
+        start = temporal_offset // p_t
+        if start + ppf > self.max_seq_len:
+            raise ValueError("Chunk temporal positions exceed the configured RoPE range")
 
         split_sizes = [
             self.attention_head_dim - 2 * (self.attention_head_dim // 3),
@@ -222,11 +227,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
         freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
 
-        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_f = freqs_cos[0][start : start + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_f = freqs_sin[0][start : start + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
@@ -888,8 +893,11 @@ class WanTransformer3DModel(nn.Module):
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        replicate_for_chunk_pipeline: bool = False,
     ):
         super().__init__()
+        self.is_first_stage = replicate_for_chunk_pipeline or is_pipeline_first_stage()
+        self.is_last_stage = replicate_for_chunk_pipeline or is_pipeline_last_stage()
         # Store config for compatibility
         self.config = type(
             "Config",
@@ -924,7 +932,7 @@ class WanTransformer3DModel(nn.Module):
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
-        if is_pipeline_first_stage():
+        if self.is_first_stage:
             self.patch_embedding = Conv3dLayer(
                 in_channels=in_channels,
                 out_channels=inner_dim,
@@ -950,9 +958,8 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
         # with PPMissingLayer so that weight names stay globally consistent.
-        self.start_layer, self.end_layer, self.blocks = make_layers(
-            num_layers,
-            lambda prefix: WanTransformerBlock(
+        def layer_factory(prefix):
+            return WanTransformerBlock(
                 inner_dim,
                 ffn_dim,
                 num_attention_heads,
@@ -961,12 +968,16 @@ class WanTransformer3DModel(nn.Module):
                 cross_attn_norm,
                 quant_config=quant_config,
                 prefix=prefix,
-            ),
-            prefix="blocks",
-        )
+            )
+
+        if replicate_for_chunk_pipeline:
+            self.start_layer, self.end_layer = 0, num_layers
+            self.blocks = nn.ModuleList([layer_factory(f"blocks.{index}") for index in range(num_layers)])
+        else:
+            self.start_layer, self.end_layer, self.blocks = make_layers(num_layers, layer_factory, prefix="blocks")
 
         # 4. Output norm & projection — only on the last PP stage
-        if is_pipeline_last_stage():
+        if self.is_last_stage:
             self.norm_out = AdaLayerNorm(inner_dim, elementwise_affine=False, eps=eps)
             self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         else:
@@ -975,7 +986,7 @@ class WanTransformer3DModel(nn.Module):
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
         self._sp_shard_point = nn.Identity()
-        if is_pipeline_last_stage():
+        if self.is_last_stage:
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
             self.output_scale_shift_prepare = PPMissingLayer()
@@ -1000,6 +1011,7 @@ class WanTransformer3DModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        temporal_offset: int = 0,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -1008,16 +1020,16 @@ class WanTransformer3DModel(nn.Module):
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
+        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width, temporal_offset)
         if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
             rotary_emb = self._cached_rope_emb
         else:
-            freqs_cos, freqs_sin = self.rope(hidden_states)
+            freqs_cos, freqs_sin = self.rope(hidden_states, temporal_offset=temporal_offset)
             rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
             self._hidden_states_shape = hidden_states.shape
             self._cached_rope_emb = rotary_emb
 
-        if is_pipeline_first_stage():
+        if self.is_first_stage:
             # Patch embedding and flatten to sequence. SP sharding happens at
             # _sp_shard_point so downstream block wrappers see local tensors.
             hidden_states = self.patch_embedding(hidden_states)
@@ -1095,7 +1107,7 @@ class WanTransformer3DModel(nn.Module):
                 self.preserve_vsa_all_blocks,
             )
 
-        if not is_pipeline_last_stage():
+        if not self.is_last_stage:
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
             # predict_noise will broadcast it to the next stage before calling that stage's forward.
             return IntermediateTensors({"hidden_states": hidden_states})

@@ -22,6 +22,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_noisy_chunk_pipeline
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
@@ -178,7 +179,11 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
 
 
 def create_transformer_from_config(
-    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+    prefix: str = "",
+    *,
+    replicate_for_chunk_pipeline: bool = False,
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -223,6 +228,8 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix
+    if replicate_for_chunk_pipeline:
+        kwargs["replicate_for_chunk_pipeline"] = True
 
     return WanTransformer3DModel(**kwargs)
 
@@ -348,6 +355,7 @@ class Wan22Pipeline(
     ):
         super().__init__()
         self.od_config = od_config
+        self.chunk_pipeline_mode = getattr(od_config.parallel_config, "pipeline_parallel_mode", "layer") == "chunk"
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
@@ -385,6 +393,8 @@ class Wan22Pipeline(
             except Exception:
                 pass
 
+        if self.chunk_pipeline_mode and (not self.is_dmd or self.has_transformer_2):
+            raise ValueError("Chunk pipeline mode currently requires a single-transformer WanDMDPipeline checkpoint")
         self.boundary_ratio = od_config.boundary_ratio
 
         # Determine which transformers to load based on boundary_ratio
@@ -505,7 +515,53 @@ class Wan22Pipeline(
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(config, quant_config=quant_config)
+        return create_transformer_from_config(
+            config, quant_config=quant_config, replicate_for_chunk_pipeline=self.chunk_pipeline_mode
+        )
+
+    def _diffuse_chunks(self, req, latents, timesteps, prompt_embeds, dtype, generator):
+        params = req.sampling_params_list[0]
+        if req.num_reqs != 1 or params.num_outputs_per_prompt != 1:
+            raise ValueError("Chunk pipeline mode currently accepts one video request at a time")
+        extra = params.extra_args or {}
+        chunk_frames = int(extra.get("chunk_frames", 77))
+        scale = self.vae_scale_factor_temporal
+        if chunk_frames < 1 or (chunk_frames - 1) % scale:
+            raise ValueError("chunk_frames must be positive and 1 modulo the VAE temporal scale")
+        chunk_t = min((chunk_frames - 1) // scale + 1, latents.shape[2])
+        if latents.shape[2] % chunk_t:
+            raise ValueError("Total output latent frames must be divisible by the chunk latent length")
+        chunks = latents.shape[2] // chunk_t
+        length = int(extra.get("chunk_cond_frames", min(4, chunk_t)))
+        lag = int(extra.get("chunk_lag", 1))
+        if isinstance(generator, list):
+            generator = generator[0]
+        seed = params.seed if params.seed is not None else generator.initial_seed() if generator is not None else 0
+        shape = (*latents.shape[:2], chunk_t, *latents.shape[3:])
+
+        def predict_noise(model_input, timestep, temporal_offset, step_idx):
+            self._current_timestep = timestep[0]
+            self.record_denoise_step(step_idx, timestep[0])
+            return self.transformer(
+                hidden_states=model_input.to(dtype),
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                temporal_offset=temporal_offset,
+                return_dict=False,
+            )[0]
+
+        result, self.chunk_pipeline_metrics = run_noisy_chunk_pipeline(
+            predict_noise=predict_noise,
+            scheduler=self.scheduler,
+            timesteps=timesteps,
+            shape=shape,
+            chunks=chunks,
+            cond_frames=length,
+            lag=lag,
+            seed=seed,
+            device=latents.device,
+        )
+        return result
 
     @property
     def guidance_scale(self):
@@ -685,6 +741,8 @@ class Wan22Pipeline(
             common,
             default_guidance_scale=1.0 if self.is_dmd else 4.0,
         )
+        if self.chunk_pipeline_mode and (guidance_low != 1.0 or guidance_high != 1.0):
+            raise ValueError("Chunk pipeline mode currently requires guidance_scale=1")
 
         # record guidance for properties
         self._guidance_scale = guidance_low
@@ -725,8 +783,10 @@ class Wan22Pipeline(
 
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)
+        if self.chunk_pipeline_mode and request_latents is not None:
+            raise ValueError("Chunk pipeline mode currently prepares its own per-chunk seeded noise")
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
@@ -759,7 +819,7 @@ class Wan22Pipeline(
                     dtype=dtype,
                 )
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
@@ -781,7 +841,7 @@ class Wan22Pipeline(
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             _t_latent_prep_start = time.perf_counter()
         images: list[PIL.Image.Image | torch.Tensor | None] = []
         for request_prompt in req.prompts:
@@ -797,6 +857,8 @@ class Wan22Pipeline(
 
         latent_condition = None
         first_frame_mask = None
+        if self.chunk_pipeline_mode and any(image is not None for image in images):
+            raise ValueError("Chunk pipeline mode currently supports text-to-video requests")
 
         if self.expand_timesteps and any(image is not None for image in images):
             if not all(image is not None for image in images):
@@ -876,36 +938,39 @@ class Wan22Pipeline(
                 generator=generator,
                 latents=request_latents,
             )
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             current_omni_platform.synchronize()
             _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
 
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             _t_denoise_start = time.perf_counter()
-        latents = self.diffuse(
-            latents=latents,
-            timesteps=timesteps,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            guidance_low=guidance_low,
-            guidance_high=guidance_high,
-            boundary_timestep=boundary_timestep,
-            dtype=dtype,
-            attention_kwargs=attention_kwargs,
-            latent_condition=latent_condition,
-            first_frame_mask=first_frame_mask,
-            generator=generator,
-        )
+        if self.chunk_pipeline_mode:
+            latents = self._diffuse_chunks(req, latents, timesteps, prompt_embeds, dtype, generator)
+        else:
+            latents = self.diffuse(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                guidance_low=guidance_low,
+                guidance_high=guidance_high,
+                boundary_timestep=boundary_timestep,
+                dtype=dtype,
+                attention_kwargs=attention_kwargs,
+                latent_condition=latent_condition,
+                first_frame_mask=first_frame_mask,
+                generator=generator,
+            )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             current_omni_platform.synchronize()
             _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
 
@@ -913,7 +978,7 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             _t_decode_start = time.perf_counter()
         media = None
         if output_type == "latent":
@@ -936,7 +1001,7 @@ class Wan22Pipeline(
             # owning rank and keep the placeholder on the legacy output field, so
             # the media batch-dimension check in split_diffusion_output_by_request
             # does not trip on every non-owner rank.
-            if decoded.dim() == 5:
+            if decoded is not None and decoded.dim() == 5:
                 output = None
                 media = DiffusionMediaOutput(
                     video=VideoMediaOutput(
@@ -951,7 +1016,7 @@ class Wan22Pipeline(
             else:
                 output = decoded
 
-        if DEBUG_PERF:
+        if DEBUG_PERF or self.chunk_pipeline_mode:
             current_omni_platform.synchronize()
             _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
             _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
@@ -972,6 +1037,28 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms,
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
+
+        if self.chunk_pipeline_mode and _is_rank_zero():
+            self.chunk_pipeline_metrics.update(
+                {
+                    "height": height,
+                    "width": width,
+                    "num_frames": num_frames,
+                    "output_type": output_type,
+                    "torch": torch.__version__,
+                    "dtype": str(dtype),
+                    "gpu": torch.cuda.get_device_name(self.device),
+                    "transformer_layer_range": [self.transformer.start_layer, self.transformer.end_layer],
+                    "stage_ms": {
+                        "text_encode": _t_text_enc_ms,
+                        "latent_prep": _t_latent_prep_ms,
+                        "denoise_and_gather": _t_denoise_ms,
+                        "vae_decode": _t_decode_ms,
+                        "pipeline_wall": _t_pipeline_wall_ms,
+                    },
+                }
+            )
+            logger.info("CHUNK_PP_METRICS %s", json.dumps(self.chunk_pipeline_metrics))
 
         return split_diffusion_output_by_request(
             DiffusionOutput(

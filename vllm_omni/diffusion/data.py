@@ -217,7 +217,10 @@ class DiffusionParallelConfig:
     """Configuration for diffusion model distributed execution."""
 
     pipeline_parallel_size: int = 1
-    """Number of pipeline parallel stages."""
+    """Number of pipeline parallel stages or full-model chunk workers."""
+
+    pipeline_parallel_mode: str = "layer"
+    """Layer partitioning by default; chunk mode keeps a full model per PP rank."""
 
     data_parallel_size: int | None = None
     """Number of data parallel groups. Inferred from WORLD when omitted."""
@@ -340,6 +343,33 @@ class DiffusionParallelConfig:
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
 
+        if self.pipeline_parallel_mode not in {"layer", "chunk"}:
+            raise ValueError("pipeline_parallel_mode must be 'layer' or 'chunk'")
+        if self.pipeline_parallel_mode == "chunk":
+            if self.pipeline_parallel_size not in (1, 2):
+                raise ValueError("Chunk pipeline parallelism requires pipeline_parallel_size to be 1 or 2")
+            incompatible = [
+                name
+                for name in (
+                    "tensor_parallel_size",
+                    "sequence_parallel_size",
+                    "cfg_parallel_size",
+                    "vae_patch_parallel_size",
+                    "text_encoder_tp_size",
+                )
+                if getattr(self, name) != 1
+            ]
+            if self.data_parallel_size not in (None, 1):
+                incompatible.append("data_parallel_size")
+            if self.use_hsdp:
+                incompatible.append("use_hsdp")
+            if self.enable_expert_parallel:
+                incompatible.append("enable_expert_parallel")
+            if incompatible:
+                raise ValueError(
+                    "Chunk pipeline parallelism requires full model replicas; unsupported: " + ", ".join(incompatible)
+                )
+
         # Validate HSDP configuration
         if self.use_hsdp:
             assert self.hsdp_replicate_size > 0, "HSDP replicate size must be > 0"
@@ -417,6 +447,8 @@ class DiffusionParallelConfig:
         """Resolve or validate diffusion DP against the actual WORLD size."""
         if world_size <= 0:
             raise ValueError(f"WORLD size must be > 0, but got {world_size}")
+        if self.pipeline_parallel_mode == "chunk" and world_size != self.pipeline_parallel_size:
+            raise ValueError("Chunk pipeline parallelism requires num_gpus to equal pipeline_parallel_size")
 
         if self.use_hsdp:
             if self.data_parallel_size not in (None, 1):
@@ -1219,6 +1251,10 @@ class OmniDiffusionConfig:
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
+        if self.parallel_config.pipeline_parallel_mode == "chunk" and (self.step_execution or self.streaming_output):
+            raise ValueError(
+                "Chunk pipeline parallelism requires request execution: step_execution=False and streaming_output=False"
+            )
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []

@@ -56,6 +56,24 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.tensor_parallel_size == 4
         assert od.parallel_config.world_size == 4
 
+    @pytest.mark.parametrize(("pp_size", "expected_devices"), [(1, "0"), (2, "0,1")])
+    def test_flat_chunk_parallel_roundtrip(self, pp_size, expected_devices):
+        stages = StageConfigFactory.create_default_diffusion(
+            {
+                "model": "x",
+                "pipeline_parallel_mode": "chunk",
+                "pipeline_parallel_size": pp_size,
+            }
+        )
+        assert stages[0]["runtime"]["devices"] == expected_devices
+
+        engine_args = dict(stages[0]["engine_args"])
+        od = OmniDiffusionConfig.from_kwargs(**engine_args)
+        assert od.parallel_config.pipeline_parallel_mode == "chunk"
+        assert od.parallel_config.pipeline_parallel_size == pp_size
+        assert od.parallel_config.world_size == pp_size
+        assert od.num_gpus == pp_size
+
     def test_sp_config_roundtrip(self):
         pc = DiffusionParallelConfig(
             tensor_parallel_size=2,
