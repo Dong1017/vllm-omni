@@ -599,6 +599,33 @@ class StageConfigFactory:
         Returns:
             List containing a single config dict for the diffusion stage.
         """
+        # Chunk PP uses the existing PP worker topology, but flat Omni kwargs
+        # must reach its world-size calculation before devices are assigned.
+        parallel_config = kwargs.get("parallel_config")
+        nested_mode = (
+            parallel_config.get("pipeline_parallel_mode")
+            if isinstance(parallel_config, dict)
+            else getattr(parallel_config, "pipeline_parallel_mode", None)
+        )
+        if kwargs.get("pipeline_parallel_mode", nested_mode) == "chunk":
+            from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+            valid_fields = {item.name for item in dataclasses.fields(DiffusionParallelConfig) if item.init}
+            if parallel_config is None:
+                values = {key: value for key, value in kwargs.items() if key in valid_fields}
+            elif isinstance(parallel_config, dict):
+                values = dict(parallel_config)
+            elif dataclasses.is_dataclass(parallel_config) and not isinstance(parallel_config, type):
+                values = asdict(parallel_config)
+            else:
+                values = dict(vars(parallel_config))
+            if "pipeline_parallel_mode" in kwargs:
+                values["pipeline_parallel_mode"] = kwargs["pipeline_parallel_mode"]
+            kwargs = dict(kwargs)
+            kwargs["parallel_config"] = DiffusionParallelConfig.from_dict(
+                {key: value for key, value in values.items() if key in valid_fields}
+            )
+
         # Calculate devices based on parallel config
         devices = "0"
         if "parallel_config" in kwargs:
