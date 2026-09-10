@@ -538,8 +538,15 @@ class Wan22Pipeline(
             generator = generator[0]
         seed = params.seed if params.seed is not None else generator.initial_seed() if generator is not None else 0
         shape = (*latents.shape[:2], chunk_t, *latents.shape[3:])
+        use_kv = extra.get("chunk_conditioning") == "latest_kv"
+        step_noises = None
+        if use_kv:
+            step_noises = [
+                randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=dtype)
+                for _ in range(len(timesteps) - 1)
+            ]
 
-        def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None):
+        def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None):
             self._current_timestep = timestep[0]
             self.record_denoise_step(step_idx, timestep[0])
             return self.predict_noise(
@@ -549,6 +556,7 @@ class Wan22Pipeline(
                 encoder_hidden_states=prompt_embeds,
                 temporal_offset=temporal_offset,
                 intermediate_tensors=intermediate_tensors,
+                kv_context=kv_context,
                 return_dict=False,
             )
 
@@ -564,6 +572,9 @@ class Wan22Pipeline(
             device=latents.device,
             schedule=schedule,
             layer_range=(self.transformer.start_layer, self.transformer.end_layer),
+            initial_latents=latents if use_kv else None,
+            step_noises=step_noises,
+            kv_history_chunks=int(extra.get("kv_history_chunks", 6)) if use_kv else None,
         )
         return result
 

@@ -26,6 +26,11 @@ def parse_args():
     parser.add_argument("--chunks", type=int, default=6)
     parser.add_argument("--cond-frames", type=int, choices=range(1, 21), default=4)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--conditioning", choices=("latent", "latest_kv"), default="latent")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--model", default="FastVideo/FastWan2.2-TI2V-5B-Diffusers")
     args = parser.parse_args()
     if args.chunks < 1:
         parser.error("--chunks must be positive")
@@ -64,8 +69,15 @@ def main():
     num_frames = args.chunks * chunk_latent_frames * 4 - 3
     mode = "layer" if args.execution == "full" else "chunk"
     schedule = "serial" if args.execution == "full" else args.execution
-    model = "FastVideo/FastWan2.2-TI2V-5B-Diffusers"
+    model = args.model
     prompt = "A cinematic drone shot over snowy mountains at golden hour"
+    samples = (
+        json.loads(args.manifest.read_text())["samples"]
+        if args.manifest
+        else [{"id": "smoke", "prompt": prompt, "seed": 1024}]
+    )
+    seed = 1024
+    sample_id = "smoke"
     run_id = uuid.uuid4().hex
     metadata = {
         "schema_version": 2,
@@ -79,14 +91,18 @@ def main():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "model": model,
         "prompt": prompt,
+        "samples": samples,
+        "conditioning": "full_attention" if args.execution == "full" else args.conditioning,
+        "quality_frames": "lossless RGB uint8 before video compression, frames.npy",
         "execution": args.execution,
-        "gap": 0 if args.execution == "full" else args.gap,
+        "gap": 0 if args.execution == "full" else None if args.conditioning == "latest_kv" else args.gap,
         "pipeline_parallel_size": args.pp_size,
         "pipeline_parallel_mode": mode,
         "enforce_eager": True,
         "chunks": args.chunks,
         "chunk_latent_frames": chunk_latent_frames,
-        "cond_frames": 0 if args.execution == "full" else args.cond_frames,
+        "cond_frames": 0 if args.execution == "full" or args.conditioning == "latest_kv" else args.cond_frames,
+        "kv_history_chunks": 6 if args.execution != "full" and args.conditioning == "latest_kv" else None,
         "total_latent_frames": args.chunks * chunk_latent_frames,
         "height": 480,
         "width": 832,
@@ -94,14 +110,14 @@ def main():
         "num_inference_steps": 3,
         "seed": 1024,
         "guidance_scale": 1.0,
-        "warmup_iterations": 1,
-        "timed_iterations": 3,
+        "warmup_iterations": args.warmups,
+        "timed_iterations": args.repeats,
         "iterations": [],
         "artifacts": {},
         "timing_scope": {
             "omni_init_wall_ms": "Omni constructor, including automatic engine initialization/warmup",
             "generate_request_wall_ms": "One complete Omni.generate response; excludes artifact saving",
-            "performance": "Median of exactly three phase=timed video requests following one complete video warmup",
+            "performance": "Per-sample median of phase=timed video requests; warmup/repeat counts recorded explicitly",
             "validation": "All latent-only requests excluded from performance statistics",
             "worker_metrics": "CHUNK_PP_METRICS matched by unique experiment_iteration",
         },
@@ -111,7 +127,7 @@ def main():
     omni = None
 
     def request(phase, index, output_type, request_schedule):
-        iteration = f"{run_id}:{phase}:{index}"
+        iteration = f"{run_id}:{sample_id}:{phase}:{index}"
         extra_args = {
             "chunk_frames": chunk_frames,
             "chunk_cond_frames": args.cond_frames,
@@ -120,19 +136,24 @@ def main():
             "collect_pp_metrics": True,
             "experiment_iteration": iteration,
         }
+        if args.conditioning == "latest_kv":
+            extra_args.update(chunk_conditioning="latest_kv", kv_history_chunks=6)
         # New params / extra_args per call; no generator or request state reused.
         sampling = OmniDiffusionSamplingParams(
             height=480,
             width=832,
             num_frames=num_frames,
             num_inference_steps=3,
-            seed=1024,
+            seed=seed,
             guidance_scale=1.0,
             output_type=output_type,
             extra_args=extra_args,
         )
         record = {
             "experiment_iteration": iteration,
+            "sample_id": sample_id,
+            "seed": seed,
+            "prompt": prompt,
             "phase": phase,
             "index": index,
             "execution": args.execution,
@@ -188,38 +209,48 @@ def main():
         metadata["omni_init_wall_ms"] = (time.perf_counter() - start) * 1000
         metadata["status"] = "running"
         write_metadata(metadata_path, metadata)
-        warmup, _ = request("warmup", 0, "np", schedule)
-        del warmup
-        for index in range(metadata["timed_iterations"]):
-            frames, record = request("timed", index, "np", schedule)
-            if index == metadata["timed_iterations"] - 1:
-                path = args.out / "video.mp4"
-                export_to_video(list(frames), str(path), fps=16)
-                metadata["artifacts"]["video"] = {
+        for sample in samples:
+            prompt, seed, sample_id = sample["prompt"], sample["seed"], sample["id"]
+            sample_out = args.out / sample_id if args.manifest else args.out
+            sample_out.mkdir(exist_ok=True)
+            for index in range(metadata["warmup_iterations"]):
+                warmup, _ = request("warmup", index, "np", schedule)
+                del warmup
+            for index in range(metadata["timed_iterations"]):
+                frames, record = request("timed", index, "np", schedule)
+                if index == metadata["timed_iterations"] - 1:
+                    path = sample_out / "video.mp4"
+                    rgb = np.rint(np.clip(frames, 0, 1) * 255).astype(np.uint8)
+                    np.save(sample_out / "frames.npy", rgb)
+                    export_to_video(list(rgb), str(path), fps=16)
+                    del rgb
+                    metadata["artifacts"][f"{sample_id}:video"] = {
+                        "path": str(path.resolve()),
+                        "experiment_iteration": record["experiment_iteration"],
+                        "fps": 16,
+                    }
+                    write_metadata(metadata_path, metadata)
+                del frames
+
+            validations = [("latent_validation", schedule, "latents.pt", "latents")]
+            if args.execution == "stepwise" and (args.gap == 2 or args.conditioning == "latest_kv"):
+                validations.append(
+                    ("serial_latent_validation", "serial", "latents_serial_validation.pt", "serial_latents")
+                )
+            for phase, request_schedule, filename, artifact_key in validations:
+                latent, record = request(phase, 0, "latent", request_schedule)
+                saved = latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                path = sample_out / filename
+                torch.save(saved, path)
+                metadata["artifacts"][f"{sample_id}:{artifact_key}"] = {
                     "path": str(path.resolve()),
                     "experiment_iteration": record["experiment_iteration"],
-                    "fps": 16,
+                    "source_dtype": str(latent.dtype),
+                    "saved_dtype": str(saved.dtype),
+                    "shape": list(saved.shape),
                 }
                 write_metadata(metadata_path, metadata)
-            del frames
-
-        validations = [("latent_validation", schedule, "latents.pt", "latents")]
-        if args.execution == "stepwise" and args.gap == 2:
-            validations.append(("serial_latent_validation", "serial", "latents_serial_validation.pt", "serial_latents"))
-        for phase, request_schedule, filename, artifact_key in validations:
-            latent, record = request(phase, 0, "latent", request_schedule)
-            saved = latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
-            path = args.out / filename
-            torch.save(saved, path)
-            metadata["artifacts"][artifact_key] = {
-                "path": str(path.resolve()),
-                "experiment_iteration": record["experiment_iteration"],
-                "source_dtype": str(latent.dtype),
-                "saved_dtype": str(saved.dtype),
-                "shape": list(saved.shape),
-            }
-            write_metadata(metadata_path, metadata)
-            del latent, saved
+                del latent, saved
         metadata["status"] = "complete"
         metadata["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         write_metadata(metadata_path, metadata)
