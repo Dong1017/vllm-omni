@@ -383,10 +383,13 @@ class TestDMDStep:
         group.isend_tensor_dict.assert_not_called()
         group.irecv_tensor_dict.assert_not_called()
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
     @pytest.mark.parametrize("first", [True, False], ids=["first-rank", "last-rank"])
-    def test_diffuse_resolves_final_dmd_latents_and_flushes_sends(self, monkeypatch, first):
+    def test_diffuse_resolves_final_dmd_latents_and_flushes_sends(self, monkeypatch, first, dtype):
         group = self._group(monkeypatch, first=first, last=not first)
-        updated = torch.full((2, 3), 0.75)
+        # Conversion through torch.as_tensor can take the numpy array protocol,
+        # which cannot preserve a received bf16 tensor. Resolve it directly.
+        updated = torch.full((2, 3), 0.75, dtype=dtype)
         recv_work, send_work = FakeWork(), FakeWork()
         postprocess = Mock()
         group.irecv_tensor_dict.return_value = ({"latents": updated}, [recv_work], [postprocess])
@@ -407,7 +410,8 @@ class TestDMDStep:
 
         result = pipeline.diffuse(noise, latents)
 
-        assert isinstance(result, torch.Tensor)
+        assert result is updated
+        assert result.dtype == dtype
         assert result.data_ptr() == updated.data_ptr()
         assert send_work.waited
         assert pipeline._pp_send_work == []
