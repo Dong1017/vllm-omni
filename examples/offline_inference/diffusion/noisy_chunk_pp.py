@@ -222,7 +222,9 @@ def main():
                     path = sample_out / "video.mp4"
                     rgb = np.rint(np.clip(frames, 0, 1) * 255).astype(np.uint8)
                     np.save(sample_out / "frames.npy", rgb)
-                    export_to_video(list(rgb), str(path), fps=16)
+                    # NumPy frames passed to export_to_video must stay in [0, 1];
+                    # the helper performs the uint8 scaling itself.
+                    export_to_video(list(frames), str(path), fps=16)
                     del rgb
                     metadata["artifacts"][f"{sample_id}:video"] = {
                         "path": str(path.resolve()),
