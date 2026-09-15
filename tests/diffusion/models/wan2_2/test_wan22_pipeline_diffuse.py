@@ -307,6 +307,44 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
     assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
 
 
+@pytest.mark.parametrize(
+    ("output_type", "expected_empty_cache_calls"),
+    [("latent", 0), ("np", 1)],
+)
+def test_forward_only_clears_cache_before_vae_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    output_type: str,
+    expected_empty_cache_calls: int,
+) -> None:
+    pipeline = _make_pipeline()
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+    empty_cache_calls: list[None] = []
+    platform = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=lambda: empty_cache_calls.append(None),
+    )
+    module = importlib.import_module(Wan22Pipeline.__module__)
+    monkeypatch.setattr(module, "current_omni_platform", platform)
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type=output_type,
+                ),
+            )
+        ]
+    )
+
+    pipeline.forward(batch)
+
+    assert len(empty_cache_calls) == expected_empty_cache_calls
+
+
 @pytest.mark.parametrize("decoded", [None, torch.empty(0)], ids=["none", "empty-tensor"])
 def test_forward_keeps_legacy_output_on_non_owner_vae_rank(decoded: torch.Tensor | None) -> None:
     # Non-owner VAE ranks can return None or an empty tensor. Exercise the full
@@ -458,6 +496,43 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+def test_diffuse_publishes_precomputed_forward_context_timesteps(monkeypatch) -> None:
+    """Native PP avoids a per-step accelerator scalar readback too."""
+    pipeline = _make_pipeline()
+    timesteps = torch.tensor([[7], [3]], dtype=torch.int64)
+    recorded: list[tuple[int, object, float | None]] = []
+
+    def record(step_idx, timestep=None, scheduler=None, normalized_timestep=None, total_steps=None):
+        del scheduler, total_steps
+        recorded.append((step_idx, timestep, normalized_timestep))
+
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    pipeline.predict_noise_maybe_with_cfg = (  # type: ignore[method-assign]
+        lambda **kwargs: torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+    )
+    pipeline.scheduler_step_maybe_with_cfg = (  # type: ignore[method-assign]
+        lambda noise_pred, t, current_latents, do_true_cfg: current_latents
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True
+    )
+
+    pipeline.diffuse(
+        latents=torch.zeros((1, 1, 1, 2, 2)),
+        timesteps=timesteps,
+        prompt_embeds=torch.zeros(1, 8),
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+    )
+
+    assert [(step_idx, timestep) for step_idx, timestep, _ in recorded] == [(0, None), (1, None)]
+    assert [normalized for _, _, normalized in recorded] == pytest.approx([0.007, 0.003])
+
+
 class _StubDMDScheduler:
     def __init__(self) -> None:
         self.predict_clean_calls: list[tuple[float, float, float]] = []
@@ -509,6 +584,71 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def test_chunk_pipeline_publishes_precomputed_denoise_timesteps(monkeypatch) -> None:
+    """Chunk PP must not turn the per-slot CUDA timestep into a Python scalar."""
+    pipeline = _make_pipeline()
+    pipeline.transformer.start_layer = 0
+    pipeline.transformer.end_layer = 1
+    # A scheduler may expose [steps, 1] rather than a flat tensor.  The
+    # chunk implementation accepts either form and must still avoid a scalar
+    # readback inside each slot.
+    timesteps = torch.tensor([[900.0], [500.0], [100.0]])
+    latents = torch.zeros((1, 4, 2, 1, 1), dtype=torch.float32)
+    recorded: list[tuple[int, object, float | None]] = []
+
+    def record(step_idx, timestep=None, scheduler=None, normalized_timestep=None, total_steps=None):
+        del scheduler, total_steps
+        recorded.append((step_idx, timestep, normalized_timestep))
+
+    def fake_predict_noise(**kwargs):
+        return torch.zeros_like(kwargs["hidden_states"])
+
+    def fake_run_noisy_chunk_pipeline(**kwargs):
+        model_input = kwargs["initial_latents"]
+        for step_idx in range(4):
+            timestep = kwargs["timesteps"][step_idx : step_idx + 1] if step_idx < 3 else timesteps.new_zeros(1)
+            kwargs["predict_noise"](model_input, timestep, 0, step_idx)
+        return kwargs["initial_latents"], {}
+
+    pipeline.predict_noise = fake_predict_noise  # type: ignore[method-assign]
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.run_noisy_chunk_pipeline",
+        fake_run_noisy_chunk_pipeline,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True
+    )
+    req = SimpleNamespace(
+        num_reqs=1,
+        sampling_params_list=[
+            SimpleNamespace(
+                extra_args={"chunk_frames": 5, "chunk_conditioning": "latest_kv", "kv_history_chunks": 1},
+                num_outputs_per_prompt=1,
+                seed=1,
+            )
+        ],
+    )
+
+    result = pipeline._diffuse_chunks(
+        req,
+        latents,
+        timesteps,
+        torch.zeros(1, 2, 8),
+        torch.float32,
+        torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert result is latents
+    assert [(step_idx, timestep) for step_idx, timestep, _ in recorded] == [
+        (0, None),
+        (1, None),
+        (2, None),
+        (3, None),
+    ]
+    assert [normalized for _, _, normalized in recorded] == pytest.approx([0.9, 0.5, 0.1, 0.0])
 
 
 def _make_gate_loading_pipeline():

@@ -26,7 +26,7 @@ from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_noisy_ch
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, is_forward_context_available
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -545,10 +545,27 @@ class Wan22Pipeline(
                 randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=dtype)
                 for _ in range(len(timesteps) - 1)
             ]
+        # ``record_denoise_step`` normally turns a CUDA scalar into a Python
+        # float. In chunk PP that happens once per local slot and forces the
+        # host to synchronize the current stream. The scheduler timesteps are
+        # immutable for this request, so materialize their normalized values
+        # once before the chunk pipeline starts instead.
+        num_train_timesteps = getattr(getattr(self.scheduler, "config", None), "num_train_timesteps", None)
+        normalized_timesteps = None
+        if num_train_timesteps and is_forward_context_available():
+            normalized_timesteps = tuple(
+                float(value) / float(num_train_timesteps)
+                for value in timesteps.detach().cpu().flatten().tolist()
+            )
 
         def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None):
             self._current_timestep = timestep[0]
-            self.record_denoise_step(step_idx, timestep[0])
+            if normalized_timesteps is None:
+                self.record_denoise_step(step_idx, timestep[0])
+            else:
+                # The KV clean pass uses a synthetic t=0 at step index 3.
+                normalized = normalized_timesteps[step_idx] if step_idx < len(normalized_timesteps) else 0.0
+                self.record_denoise_step(step_idx, normalized_timestep=normalized)
             return self.predict_noise(
                 current_model=self.transformer,
                 hidden_states=model_input.to(dtype),
@@ -612,6 +629,17 @@ class Wan22Pipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
         profile = getattr(self, "_collect_pp_metrics", False)
+        # ``record_denoise_step`` materializes a CUDA scalar only when a
+        # request ForwardContext is active. Resolve immutable scheduler values
+        # once in that case (or when metrics need their host-side copy), rather
+        # than synchronizing once per native PP stage forward.
+        normalized_timesteps = None
+        timestep_values = None
+        if profile or is_forward_context_available():
+            timestep_values = tuple(float(value) for value in timesteps.detach().cpu().flatten().tolist())
+            ntt = getattr(getattr(self.scheduler, "config", None), "num_train_timesteps", None)
+            if ntt:
+                normalized_timesteps = tuple(value / float(ntt) for value in timestep_values)
         if profile:
             pp = get_pp_group()
             current_omni_platform.synchronize()
@@ -619,10 +647,15 @@ class Wan22Pipeline(
                 torch.distributed.barrier(group=pp.device_group)
             torch.accelerator.reset_peak_memory_stats(latents.device)
             self._full_pp_records = []
+            # Resolve CUDA events only after the request. Resolving them per
+            # stage forward changes the native PP baseline being measured.
+            self._full_pp_pending_timings = []
             self._full_pp_wait_ms = 0.0
             self._full_pp_feedback_bytes = 0
             self._full_pp_origin = torch.cuda.Event(enable_timing=True)
             self._full_pp_origin.record()
+            assert timestep_values is not None
+            self._full_pp_timestep_values = timestep_values
             profile_start = time.perf_counter()
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
@@ -634,7 +667,10 @@ class Wan22Pipeline(
                     self._full_pp_wait_ms += (time.perf_counter() - wait_start) * 1000
                     self._full_pp_step_idx = step_idx
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                if normalized_timesteps is None:
+                    self.record_denoise_step(step_idx, t)
+                else:
+                    self.record_denoise_step(step_idx, normalized_timestep=normalized_timesteps[step_idx])
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -736,6 +772,10 @@ class Wan22Pipeline(
             current_omni_platform.synchronize()
             if pp.world_size > 1:
                 torch.distributed.barrier(group=pp.device_group)
+            for record, start, end in self._full_pp_pending_timings:
+                record["forward_ms"] = start.elapsed_time(end)
+                record["stage_start_ms"] = self._full_pp_origin.elapsed_time(start)
+                record["stage_end_ms"] = self._full_pp_origin.elapsed_time(end)
             wall_ms = (time.perf_counter() - profile_start) * 1000
             payload = {
                 "rank": pp.rank_in_group,
@@ -774,6 +814,8 @@ class Wan22Pipeline(
                 "latent_gather_ms": 0.0,
             }
             self._full_pp_records = None
+            self._full_pp_pending_timings = None
+            self._full_pp_timestep_values = None
         return latents
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
@@ -1052,8 +1094,10 @@ class Wan22Pipeline(
             )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
-        # so we empty the cache here to avoid OOM before vae decoding.
-        if current_omni_platform.is_available():
+        # so we empty the cache here to avoid OOM before VAE decoding. A latent
+        # response does not decode through the VAE, so avoid an unnecessary
+        # allocator flush on that path.
+        if output_type != "latent" and current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
         if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
@@ -1191,26 +1235,25 @@ class Wan22Pipeline(
         result = current_model(**kwargs)
         if records is not None:
             end.record()
-            end.synchronize()
-            records.append(
-                {
-                    "chunk_idx": 0,
-                    "step_idx": self._full_pp_step_idx,
-                    "slot_idx": self._full_pp_step_idx,
-                    "rank": get_pp_group().rank_in_group,
-                    "stage_idx": get_pp_group().rank_in_group,
-                    "timestep": float(kwargs["timestep"].flatten()[0].item()),
-                    "input_latent_frames": kwargs["hidden_states"].shape[2],
-                    "forward_ms": start.elapsed_time(end),
-                    "stage_start_ms": self._full_pp_origin.elapsed_time(start),
-                    "stage_end_ms": self._full_pp_origin.elapsed_time(end),
-                    "time_origin": "rank_local_cuda_event",
-                    "comm_wait_ms": wait_ms,
-                    "activation_bytes_sent": sum(t.numel() * t.element_size() for t in result.tensors.values())
-                    if isinstance(result, IntermediateTensors)
-                    else 0,
-                }
-            )
+            record = {
+                "chunk_idx": 0,
+                "step_idx": self._full_pp_step_idx,
+                "slot_idx": self._full_pp_step_idx,
+                "rank": get_pp_group().rank_in_group,
+                "stage_idx": get_pp_group().rank_in_group,
+                "timestep": self._full_pp_timestep_values[self._full_pp_step_idx],
+                "input_latent_frames": kwargs["hidden_states"].shape[2],
+                "forward_ms": 0.0,
+                "stage_start_ms": 0.0,
+                "stage_end_ms": 0.0,
+                "time_origin": "rank_local_cuda_event",
+                "comm_wait_ms": wait_ms,
+                "activation_bytes_sent": sum(t.numel() * t.element_size() for t in result.tensors.values())
+                if isinstance(result, IntermediateTensors)
+                else 0,
+            }
+            records.append(record)
+            self._full_pp_pending_timings.append((record, start, end))
         return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(

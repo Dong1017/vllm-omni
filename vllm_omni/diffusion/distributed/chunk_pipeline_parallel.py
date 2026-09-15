@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -152,9 +154,16 @@ def run_noisy_chunk_pipeline(
     t_l, length = shape[2], cond_frames
     current, generators, cache, clean_chunks = {}, {}, {}, {}
     records, slot_records = [], []
+    # CUDA events are resolved after the request completes. Resolving each
+    # event in the hot loop would make the CPU wait for every stage forward.
+    pending_timings = []
     comm_ms = 0.0
     activation_bytes = sample_bytes = feedback_bytes = condition_bytes = 0
     stage_input = None
+    trace_enabled = os.environ.get("VLLM_OMNI_CHUNK_PP_TRACE") == "1"
+
+    def trace_scope(name: str):
+        return torch.profiler.record_function(name) if trace_enabled else nullcontext()
 
     def has_consumer(task):
         chunk, step = task
@@ -186,6 +195,10 @@ def run_noisy_chunk_pipeline(
         if world == 2:
             dist.barrier(group=pp.device_group)
 
+    # Keep metrics collection out of the timed request path. ``timesteps`` is
+    # resident on the accelerator, so converting it in a per-slot record would
+    # otherwise introduce a device-to-host synchronization for every forward.
+    timestep_values = tuple(float(value) for value in timesteps.detach().cpu().tolist())
     torch.accelerator.synchronize(device)
     barrier()
     torch.accelerator.reset_peak_memory_stats(device)
@@ -227,22 +240,23 @@ def run_noisy_chunk_pipeline(
             kwargs = {"intermediate_tensors": intermediate}
             if kv:
                 kwargs["kv_context"] = ChunkKVContext(kv_layers, task, kv_sources[task])
-            prediction = predict_noise(model_input, t.expand(shape[0]), offset, step, **kwargs)
+            with trace_scope(f"chunk_pp.forward.slot{slot_idx}.rank{rank}.chunk{chunk}.step{step}"):
+                prediction = predict_noise(model_input, t.expand(shape[0]), offset, step, **kwargs)
             last.record(stream)
-            last.synchronize()
             record = {
                 "chunk_idx": chunk,
                 "step_idx": step,
                 "slot_idx": slot_idx,
                 "rank": rank,
                 "stage_idx": rank,
-                "timestep": float(t.item()),
-                "forward_ms": first.elapsed_time(last),
-                "stage_start_ms": origin.elapsed_time(first),
-                "stage_end_ms": origin.elapsed_time(last),
+                "timestep": 0.0 if clean_pass else timestep_values[step],
+                "forward_ms": 0.0,
+                "stage_start_ms": 0.0,
+                "stage_end_ms": 0.0,
                 "comm_wait_ms": 0.0,
                 "input_latent_frames": model_input.shape[2],
             }
+            pending_timings.append((record, first, last))
             if kv:
                 record.update(
                     pass_kind="clean_kv" if clean_pass else "denoise",
@@ -286,9 +300,11 @@ def run_noisy_chunk_pipeline(
                     condition_bytes += _tensor_bytes(
                         {"condition": feedback_payload["condition"]} if "condition" in feedback_payload else None
                     )
-                    handles.extend(pp.isend_tensor_dict(feedback_payload, dst=0))
+                    with trace_scope(f"chunk_pp.metadata.send_feedback.slot{slot_idx}"):
+                        handles.extend(pp.isend_tensor_dict(feedback_payload, dst=0))
                 else:
-                    received_feedback, work, postprocess = pp.irecv_tensor_dict(src=1)
+                    with trace_scope(f"chunk_pp.metadata.recv_feedback.slot{slot_idx}"):
+                        received_feedback, work, postprocess = pp.irecv_tensor_dict(src=1)
                     postprocessors.extend(postprocess)
                     handles.extend(work)
             if tasks[0] is not None:
@@ -297,17 +313,22 @@ def run_noisy_chunk_pipeline(
                         {key: value for key, value in forward_payload.items() if key != "model_input"}
                     )
                     sample_bytes += _tensor_bytes({"model_input": forward_payload["model_input"]})
-                    handles.extend(pp.isend_tensor_dict(forward_payload, dst=1))
+                    with trace_scope(f"chunk_pp.metadata.send_forward.slot{slot_idx}"):
+                        handles.extend(pp.isend_tensor_dict(forward_payload, dst=1))
                 else:
-                    received_forward, work, postprocess = pp.irecv_tensor_dict(src=0)
+                    with trace_scope(f"chunk_pp.metadata.recv_forward.slot{slot_idx}"):
+                        received_forward, work, postprocess = pp.irecv_tensor_dict(src=0)
                     postprocessors.extend(postprocess)
                     handles.extend(work)
             # Keep all outgoing and incoming payloads alive until transfer ends.
-            for handle in handles:
-                handle.wait()
+            with trace_scope(f"chunk_pp.p2p.wait.slot{slot_idx}"):
+                for handle in handles:
+                    handle.wait()
             for postprocess in postprocessors:
                 postprocess()
-            stream.synchronize()
+            # ``Work.wait`` establishes the dependency from the P2P work to
+            # this stream. A full stream synchronization here only blocks the
+            # host before it can enqueue the next ready slot.
             if received_feedback is not None:
                 accept_feedback(tasks[1], received_feedback)
             stage_input = received_forward
@@ -319,6 +340,10 @@ def run_noisy_chunk_pipeline(
     if cache:
         raise RuntimeError(f"Unconsumed chunk conditions: {list(cache)}")
     torch.accelerator.synchronize(device)
+    for record, first, last in pending_timings:
+        record["forward_ms"] = first.elapsed_time(last)
+        record["stage_start_ms"] = origin.elapsed_time(first)
+        record["stage_end_ms"] = origin.elapsed_time(last)
     barrier()
     local_wall = (time.perf_counter() - start_wall) * 1000
     payload = {
