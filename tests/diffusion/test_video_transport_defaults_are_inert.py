@@ -41,6 +41,7 @@ def test_wan_uses_the_typed_media_contract() -> None:
     # BCTHW tensors.
     assert _DIFFUSION_POST_PROCESS_FUNCS["WanPipeline"] == "get_wan22_post_process_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["WanDMDPipeline"] == "get_wan22_post_process_func"
+    assert _DIFFUSION_POST_PROCESS_FUNCS["WanCausalDMDPipeline"] == "get_wan22_post_process_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["WanT2VDMD2Pipeline"] == "get_wan22_post_process_func"
 
 

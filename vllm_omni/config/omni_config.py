@@ -210,7 +210,6 @@ class _RuntimeEngineOverrides(TypedDict, total=False):
 
 class _ParallelConfigEngineOverrides(TypedDict, total=False):
     pipeline_parallel_size: int
-    pipeline_parallel_mode: str
     data_parallel_size: int
     tensor_parallel_size: int
     sequence_parallel_size: int
@@ -606,8 +605,6 @@ class OmniStageParallelConfig(_TrackExplicitConfigFields, VllmParallelConfig):
 @config(kw_only=True)
 class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     """Diffusion-stage distributed parallelism behavior."""
-
-    pipeline_parallel_mode: str = "layer"
 
     sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)

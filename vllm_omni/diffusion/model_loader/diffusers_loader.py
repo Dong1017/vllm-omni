@@ -309,7 +309,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             hf_weights_files = [os.path.join(hf_folder, filename) for filename in indexed_weight_files]
             missing_files = [filename for filename in hf_weights_files if not os.path.isfile(filename)]
             if missing_files:
-                raise FileNotFoundError(f"Weight files referenced in index but missing: {missing_files}")
+                # Some preview/local Diffusers trees keep an index that lists
+                # shards but only ship the consolidated single-file weights.
+                consolidated = os.path.join(hf_folder, "diffusion_pytorch_model.safetensors")
+                if os.path.isfile(consolidated):
+                    logger.warning(
+                        "Index shards missing under %s; loading consolidated %s instead",
+                        hf_folder,
+                        consolidated,
+                    )
+                    hf_weights_files = [consolidated]
+                else:
+                    raise FileNotFoundError(f"Weight files referenced in index but missing: {missing_files}")
             use_safetensors = any(filename.endswith(".safetensors") for filename in hf_weights_files)
         else:
             hf_weights_files = []

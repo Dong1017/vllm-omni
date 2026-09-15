@@ -95,7 +95,10 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.vae = _StubVae()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
-    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
+    pipeline.od_config = SimpleNamespace(
+        flow_shift=5.0,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
     pipeline._sample_solver = "unipc"
     pipeline._flow_shift = 5.0
     pipeline.vae_scale_factor_temporal = 4
@@ -103,7 +106,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
     pipeline.is_dmd = False
-    pipeline.chunk_pipeline_mode = False
+    pipeline.is_causalwan_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None

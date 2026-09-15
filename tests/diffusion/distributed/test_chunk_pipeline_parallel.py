@@ -1,16 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU checks for chunk dependencies and the two-stage layer schedule."""
+"""CPU checks for chunk dependencies and the N-stage layer schedule."""
 
 import pytest
 
-from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_chunk_pipeline
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import (
+    ChunkKVContext,
+    evict_kv_versions,
+    plan_chunk_pipeline,
+    plan_clean_kv_sources,
+    plan_kv_last_use,
+    plan_latest_kv_sources,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 def test_latest_kv_never_reads_same_slot_or_future_chunk(chunks):
-    from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_latest_kv_sources
-
     slots = plan_chunk_pipeline(chunks, 1, 2, kv=True)
     sources = plan_latest_kv_sources(slots, 6)
     completed = [{}, {}]
@@ -33,29 +40,55 @@ def test_latest_kv_never_reads_same_slot_or_future_chunk(chunks):
                 completed[rank][task] = tick
     expected_tasks = {(c, s) for c in range(chunks) for s in range(4)}
     assert all(set(stage) == expected_tasks for stage in completed)
-    # The serial replay must have every explicitly selected historical version.
-    available = [set(), set()]
-    for tasks in plan_chunk_pipeline(chunks, 1, 2, "serial", kv=True):
+
+
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
+@pytest.mark.parametrize("chunks", [1, 2, 3, 6])
+@pytest.mark.parametrize("num_denoise_steps", [3, 8])
+def test_serial_kv_reads_only_clean_history(world, chunks, num_denoise_steps):
+    slots = plan_chunk_pipeline(chunks, 1, world, "serial", kv=True, num_denoise_steps=num_denoise_steps)
+    sources = plan_clean_kv_sources(slots, 6, num_denoise_steps)
+    published = [set() for _ in range(world)]
+    for tasks in slots:
         for rank, task in enumerate(tasks):
-            if task is not None:
-                assert set(sources[rank][task]) <= available[rank]
-                available[rank].add(task)
+            if task is None:
+                continue
+            chunk, _ = task
+            expected = tuple((c, num_denoise_steps) for c in range(max(0, chunk - 6), chunk))
+            assert sources[rank][task] == expected
+            assert set(expected) <= published[rank]
+            published[rank].add(task)
+
+
+def test_serial_kv_history_window_drops_chunks_outside_h():
+    slots = plan_chunk_pipeline(4, 1, 2, "serial", kv=True)
+    sources = plan_clean_kv_sources(slots, 1, 3)
+    for rank in range(2):
+        assert sources[rank][(1, 0)] == ((0, 3),)
+        assert sources[rank][(2, 2)] == ((1, 3),)
+        assert sources[rank][(3, 3)] == ((2, 3),)
 
 
 def test_latest_kv_includes_clean_versions_after_pair_finishes():
-    from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_latest_kv_sources
-
     sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 1, 2, kv=True), 6)
     for rank in range(2):
         assert sources[rank][(1, 0)] == ((0, 0),)
         assert sources[rank][(2, 0)] == ((0, 3), (1, 3))
 
 
+def test_latest_kv_eight_step_clean_version_is_denoise_count():
+    sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 1, 2, kv=True, num_denoise_steps=8), 6)
+    for rank in range(2):
+        assert sources[rank][(1, 0)] == ((0, 0),)
+        assert sources[rank][(2, 0)] == ((0, 8), (1, 8))
+        expected_tasks = {(c, s) for c in range(4) for s in range(9)}
+        planned = {task for tasks in plan_chunk_pipeline(4, 1, 2, kv=True, num_denoise_steps=8) for task in tasks if task}
+        assert planned == expected_tasks
+
+
 def test_kv_attention_matches_explicit_history_and_keeps_versions_separate():
     import torch
     import torch.nn.functional as F
-
-    from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import ChunkKVContext
 
     rng = torch.Generator().manual_seed(7)
     tensors = [torch.randn(1, 5, 2, 4, generator=rng) for _ in range(7)]
@@ -76,7 +109,69 @@ def test_kv_attention_matches_explicit_history_and_keeps_versions_separate():
         ChunkKVContext(layers, (1, 0), ()).append(15, key, value)
 
 
-@pytest.mark.parametrize("world", [1, 2])
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
+@pytest.mark.parametrize("chunks", [1, 2, 3, 6])
+@pytest.mark.parametrize("history", [1, 6])
+@pytest.mark.parametrize("schedule", ["serial", "stepwise"])
+@pytest.mark.parametrize("num_denoise_steps", [3, 8])
+def test_kv_last_use_eviction_keeps_needed_sources(world, chunks, history, schedule, num_denoise_steps):
+    import torch
+
+    execution = plan_chunk_pipeline(chunks, 1, world, schedule, kv=True, num_denoise_steps=num_denoise_steps)
+    if schedule == "serial":
+        planned = plan_clean_kv_sources(execution, history, num_denoise_steps)
+    else:
+        planned = plan_latest_kv_sources(execution, history)
+    last_use = plan_kv_last_use(execution, planned)
+    dummy = torch.zeros(1, 1, 1, 1)
+    for rank in range(world):
+        layers = {}
+        published = set()
+        for slot_idx, tasks in enumerate(execution):
+            task = tasks[rank]
+            if task is None:
+                continue
+            ChunkKVContext(layers, task, planned[rank][task]).append(0, dummy, dummy)
+            published.add(task)
+            assert set(layers[0]) == {version for version in published if last_use[rank][version] >= slot_idx}
+            evict_kv_versions(
+                layers, [version for version, use in last_use[rank].items() if use == slot_idx]
+            )
+            remaining = set(layers.get(0, {}))
+            assert remaining == {version for version in published if last_use[rank][version] > slot_idx}
+            for later in execution[slot_idx + 1 :]:
+                future = later[rank]
+                if future is not None:
+                    assert set(planned[rank][future]) & published <= remaining
+        assert not layers
+
+
+def test_serial_evicts_noisy_immediately_and_keeps_clean_for_later_chunks():
+    stepwise = plan_chunk_pipeline(4, 1, 2, "stepwise", kv=True)
+    serial = plan_chunk_pipeline(4, 1, 2, "serial", kv=True)
+    latest = plan_latest_kv_sources(stepwise, 6)
+    clean = plan_clean_kv_sources(serial, 6, 3)
+    stepwise_use = plan_kv_last_use(stepwise, latest)
+    serial_use = plan_kv_last_use(serial, clean)
+    for rank in range(2):
+        assert latest[rank][(1, 0)] == ((0, 0),)
+        assert clean[rank][(1, 0)] == ((0, 3),)
+        assert clean[rank][(2, 0)] == ((0, 3), (1, 3))
+        stepwise_clean = next(idx for idx, tasks in enumerate(stepwise) if tasks[rank] == (0, 3))
+        serial_noisy = next(idx for idx, tasks in enumerate(serial) if tasks[rank] == (0, 0))
+        serial_clean = next(idx for idx, tasks in enumerate(serial) if tasks[rank] == (0, 3))
+        serial_reader = next(idx for idx, tasks in enumerate(serial) if tasks[rank] == (1, 0))
+        assert stepwise_use[rank][(0, 0)] < stepwise_clean
+        assert serial_use[rank][(0, 0)] == serial_noisy
+        assert serial_use[rank][(0, 0)] < serial_clean
+        assert serial_use[rank][(0, 3)] == next(
+            idx for idx, tasks in enumerate(serial) if tasks[rank] == (3, 3)
+        )
+        assert serial_use[rank][(0, 3)] > serial_reader
+        assert stepwise_use[rank][(0, 3)] > stepwise_clean
+
+
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 @pytest.mark.parametrize("gap", [1, 2])
 @pytest.mark.parametrize("schedule", ["serial", "stepwise"])
@@ -108,17 +203,18 @@ def test_each_layer_stage_executes_once_after_dependencies(world, chunks, gap, s
             completed[tasks[-1]] = slot_idx
     assert set(completed) == expected
     assert all(set(stage) == expected for stage in executed)
-    # Two stages mean twice as many local forward calls, not twice as many DiT steps.
+    # N stages mean N times as many local forward calls, not N times as many DiT steps.
     assert sum(len(stage) for stage in executed) == world * chunks * 3
 
 
 @pytest.mark.parametrize("gap", [1, 2])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-def test_serial_and_stepwise_execute_the_same_jobs(gap, chunks):
+@pytest.mark.parametrize("world", [2, 3, 4])
+def test_serial_and_stepwise_execute_the_same_jobs(gap, chunks, world):
     jobs = []
     for schedule in ("serial", "stepwise"):
-        slots = plan_chunk_pipeline(chunks, gap, 2, schedule)
-        jobs.append([{task for tasks in slots if (task := tasks[stage]) is not None} for stage in range(2)])
+        slots = plan_chunk_pipeline(chunks, gap, world, schedule)
+        jobs.append([{task for tasks in slots if (task := tasks[stage]) is not None} for stage in range(world)])
     assert jobs[0] == jobs[1]
 
 
@@ -131,6 +227,22 @@ def test_gap_one_two_chunk_stage_order():
         ((0, 2), (1, 1)),
         ((1, 2), (0, 2)),
         (None, (1, 2)),
+    ]
+
+
+def test_gap_one_two_chunk_three_stage_order():
+    # Completion only happens on the last stage, so step N+1 waits a bubble.
+    assert plan_chunk_pipeline(2, 1, 3) == [
+        ((0, 0), None, None),
+        ((1, 0), (0, 0), None),
+        (None, (1, 0), (0, 0)),
+        ((0, 1), None, (1, 0)),
+        ((1, 1), (0, 1), None),
+        (None, (1, 1), (0, 1)),
+        ((0, 2), None, (1, 1)),
+        ((1, 2), (0, 2), None),
+        (None, (1, 2), (0, 2)),
+        (None, None, (1, 2)),
     ]
 
 
@@ -152,4 +264,19 @@ def test_single_chunk_waits_for_each_last_stage(gap):
         (None, (0, 1)),
         ((0, 2), None),
         (None, (0, 2)),
+    ]
+
+
+@pytest.mark.parametrize("gap", [1, 2])
+def test_single_chunk_drains_three_stages(gap):
+    assert plan_chunk_pipeline(1, gap, 3) == [
+        ((0, 0), None, None),
+        (None, (0, 0), None),
+        (None, None, (0, 0)),
+        ((0, 1), None, None),
+        (None, (0, 1), None),
+        (None, None, (0, 1)),
+        ((0, 2), None, None),
+        (None, (0, 2), None),
+        (None, None, (0, 2)),
     ]
