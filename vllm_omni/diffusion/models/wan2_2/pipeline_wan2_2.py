@@ -554,8 +554,7 @@ class Wan22Pipeline(
         normalized_timesteps = None
         if num_train_timesteps and is_forward_context_available():
             normalized_timesteps = tuple(
-                float(value) / float(num_train_timesteps)
-                for value in timesteps.detach().cpu().flatten().tolist()
+                float(value) / float(num_train_timesteps) for value in timesteps.detach().cpu().flatten().tolist()
             )
 
         def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None):
@@ -592,6 +591,7 @@ class Wan22Pipeline(
             initial_latents=latents if use_kv else None,
             step_noises=step_noises,
             kv_history_chunks=int(extra.get("kv_history_chunks", 6)) if use_kv else None,
+            output_type=getattr(params, "output_type", None) or "np",
         )
         return result
 

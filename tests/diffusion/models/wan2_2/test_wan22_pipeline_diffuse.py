@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_noisy_chunk_pipeline
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -513,9 +514,7 @@ def test_diffuse_publishes_precomputed_forward_context_timesteps(monkeypatch) ->
     pipeline.scheduler_step_maybe_with_cfg = (  # type: ignore[method-assign]
         lambda noise_pred, t, current_latents, do_true_cfg: current_latents
     )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True
-    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
 
     pipeline.diffuse(
         latents=torch.zeros((1, 1, 1, 2, 2)),
@@ -618,9 +617,7 @@ def test_chunk_pipeline_publishes_precomputed_denoise_timesteps(monkeypatch) -> 
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.run_noisy_chunk_pipeline",
         fake_run_noisy_chunk_pipeline,
     )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True
-    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
     req = SimpleNamespace(
         num_reqs=1,
         sampling_params_list=[
@@ -719,3 +716,123 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+class _StubChunkScheduler:
+    def predict_clean(self, model_output, sample, timestep):
+        del timestep
+        return sample - model_output
+
+    def add_noise(self, clean_sample, noise, timestep):
+        del timestep
+        return clean_sample + noise
+
+
+class _FakeCudaStream:
+    pass
+
+
+class _FakeCudaEvent:
+    def __init__(self, enable_timing=False):
+        del enable_timing
+
+    def record(self, stream=None):
+        del stream
+
+    def elapsed_time(self, other):
+        del other
+        return 0.0
+
+
+def _patch_cpu_chunk_pp_runtime(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.chunk_pipeline_parallel.get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1, device_group=None, cpu_group=None),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _FakeCudaStream())
+    monkeypatch.setattr(torch.cuda, "Event", _FakeCudaEvent)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda *a, **k: 0)
+
+
+def test_run_noisy_chunk_pipeline_accepts_steps_by_1_timesteps(monkeypatch) -> None:
+    """A [steps, 1] scheduler timesteps tensor must not turn into a float([]) readback."""
+    _patch_cpu_chunk_pp_runtime(monkeypatch)
+    scheduler = _StubChunkScheduler()
+    timesteps = torch.tensor([[900.0], [500.0], [100.0]])
+    chunks = 6
+    shape = (1, 4, 2, 1, 1)
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+    ):
+        del timestep, temporal_offset, step_idx, intermediate_tensors, kv_context
+        return torch.zeros_like(model_input)
+
+    result, metrics = run_noisy_chunk_pipeline(
+        predict_noise=fake_predict_noise,
+        scheduler=scheduler,
+        timesteps=timesteps,
+        shape=shape,
+        chunks=chunks,
+        cond_frames=shape[2],
+        gap=1,
+        seed=0,
+        device=torch.device("cpu"),
+    )
+
+    assert result.shape == (1, 4, chunks * shape[2], 1, 1)
+    steps = metrics["ranks"][0]["steps"]
+    assert len(steps) == chunks * 3
+    by_step: dict[int, list[float]] = {}
+    for record in steps:
+        by_step.setdefault(record["step_idx"], []).append(record["timestep"])
+    assert by_step[0] == [900.0] * chunks
+    assert by_step[1] == [500.0] * chunks
+    assert by_step[2] == [100.0] * chunks
+
+
+@pytest.mark.parametrize(("schedule", "expected_peak"), [("stepwise", 3), ("serial", 5)])
+def test_chunk_kv_evicts_versions_and_reports_peak(monkeypatch, schedule: str, expected_peak: int) -> None:
+    """KV task-versions are freed once their last consumer's forward completes."""
+    _patch_cpu_chunk_pp_runtime(monkeypatch)
+    scheduler = _StubChunkScheduler()
+    chunks = 6
+    t_l = 2
+    shape = (1, 4, t_l, 1, 1)
+    initial_latents = torch.zeros((1, 4, chunks * t_l, 1, 1), dtype=torch.float32)
+    step_noises = [torch.zeros_like(initial_latents), torch.zeros_like(initial_latents)]
+    captured: dict[str, dict] = {}
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+    ):
+        del timestep, temporal_offset, step_idx, intermediate_tensors
+        if kv_context is not None:
+            captured["kv_layers"] = kv_context.layers
+            for layer in range(3):
+                kv_context.append(layer, model_input, model_input)
+        return torch.zeros_like(model_input)
+
+    result, metrics = run_noisy_chunk_pipeline(
+        predict_noise=fake_predict_noise,
+        scheduler=scheduler,
+        timesteps=torch.tensor([900.0, 500.0, 100.0]),
+        shape=shape,
+        chunks=chunks,
+        cond_frames=t_l,
+        gap=1,
+        seed=0,
+        device=torch.device("cpu"),
+        schedule=schedule,
+        initial_latents=initial_latents,
+        step_noises=step_noises,
+        kv_history_chunks=1,
+    )
+
+    del result
+    kv_layers = captured["kv_layers"]
+    assert all(not cache for cache in kv_layers.values())  # final live count == 0
+    assert metrics["kv_evicted_versions"] == chunks * 4
+    assert metrics["kv_live_versions"] == expected_peak
