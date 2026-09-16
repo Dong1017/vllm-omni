@@ -591,7 +591,6 @@ class Wan22Pipeline(
             initial_latents=latents if use_kv else None,
             step_noises=step_noises,
             kv_history_chunks=int(extra.get("kv_history_chunks", 6)) if use_kv else None,
-            output_type=getattr(params, "output_type", None) or "np",
         )
         return result
 

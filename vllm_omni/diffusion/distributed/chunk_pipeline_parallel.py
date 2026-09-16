@@ -114,6 +114,8 @@ def _tensor_bytes(payload: dict[str, torch.Tensor] | None) -> int:
 
 
 def _kv_retained_bytes(kv_layers: dict) -> int:
+    """Logical bytes of the K/V tensors currently cached (numel * element_size),
+    not allocator reservations; the cache stores post-RoPE tensors per layer."""
     total = 0
     for cache in kv_layers.values():
         for key, value in cache.values():
@@ -138,7 +140,6 @@ def run_noisy_chunk_pipeline(
     initial_latents: torch.Tensor | None = None,
     step_noises: list[torch.Tensor] | None = None,
     kv_history_chunks: int | None = None,
-    output_type: str = "np",
 ) -> tuple[torch.Tensor, dict]:
     """Run local layers and exchange activations/state in a common direction order.
 
@@ -217,8 +218,11 @@ def run_noisy_chunk_pipeline(
 
     def release_kv(task):
         nonlocal kv_live, kv_peak_live, kv_evicted, kv_peak_retained_bytes
+        # Sample both peaks at the residency maximum, before any release: the
+        # task just published its version, so bytes mirror the live count.
         kv_live += 1
         kv_peak_live = max(kv_peak_live, kv_live)
+        kv_peak_retained_bytes = max(kv_peak_retained_bytes, _kv_retained_bytes(kv_layers))
         for source in kv_sources[task]:
             kv_remaining[source] -= 1
             if kv_remaining[source] == 0:
@@ -231,7 +235,6 @@ def run_noisy_chunk_pipeline(
             kv_evicted += 1
             for layer_cache in kv_layers.values():
                 layer_cache.pop(task)
-        kv_peak_retained_bytes = max(kv_peak_retained_bytes, _kv_retained_bytes(kv_layers))
 
     # Keep metrics collection out of the timed request path. ``timesteps`` is
     # resident on the accelerator, so converting it in a per-slot record would
@@ -240,9 +243,10 @@ def run_noisy_chunk_pipeline(
     torch.accelerator.synchronize(device)
     barrier()
     torch.accelerator.reset_peak_memory_stats(device)
-    # All chunk forwards and P2P waits are issued on this one stream; the CUDA
-    # events recorded per slot therefore order every slot without per-slot
-    # host-side stream synchronization.
+    # All chunk forwards and P2P waits are issued on this one stream, so
+    # slots execute in issue order and a per-slot Work.wait() is enough to
+    # keep consumption ordered; the per-slot CUDA events only timestamp the
+    # forwards (Event.record records a time, it synchronizes nothing).
     stream = torch.cuda.current_stream(device)
     origin = torch.cuda.Event(enable_timing=True)
     origin.record(stream)
@@ -396,7 +400,10 @@ def run_noisy_chunk_pipeline(
         "slots": slot_records,
         "denoise_wall_ms": local_wall,
         "comm_wait_ms": comm_ms,
-        "comm_wait_scope": "explicit tensor receive and pending-send waits; metadata/dispatch remain in wall",
+        "comm_wait_scope": (
+            "host wall time of the per-slot tensor-dict exchange, including dict metadata, "
+            "P2P submission and waits, and postprocessing; not device-communication-only time"
+        ),
         "condition_bytes_sent": condition_bytes,
         "activation_bytes_sent": activation_bytes,
         "sample_bytes_sent": sample_bytes,
@@ -432,7 +439,6 @@ def run_noisy_chunk_pipeline(
         "chunk_latent_frames": t_l,
         "cond_frames": length,
         "seed": seed,
-        "output_type": output_type,
         "latent_shape": list(shape),
         "ranks": all_metrics,
         "forward_call_unit": "layer_stage" if world == 2 else "whole_transformer",
@@ -457,6 +463,10 @@ def run_noisy_chunk_pipeline(
             kv_live_versions=max(item["kv_live_versions"] for item in all_metrics),
             kv_evicted_versions=sum(item["kv_evicted_versions"] for item in all_metrics),
             kv_retained_bytes_est=max(item["kv_retained_bytes_est"] for item in all_metrics),
+            kv_retained_bytes_scope=(
+                "logical K/V bytes (numel * element_size) per layer stage, sampled at each "
+                "release entry; summed across layers, not allocator reserved bytes"
+            ),
             clean_kv_forward=True,
             clean_kv_forward_total_ms=sum(
                 row["forward_ms"] for item in all_metrics for row in item["steps"] if row["pass_kind"] == "clean_kv"

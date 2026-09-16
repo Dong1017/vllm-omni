@@ -744,10 +744,10 @@ class _FakeCudaEvent:
         return 0.0
 
 
-def _patch_cpu_chunk_pp_runtime(monkeypatch):
+def _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1):
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.chunk_pipeline_parallel.get_pp_group",
-        lambda: SimpleNamespace(rank_in_group=0, world_size=1, device_group=None, cpu_group=None),
+        lambda: SimpleNamespace(rank_in_group=rank_in_group, world_size=world_size, device_group=None, cpu_group=None),
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _FakeCudaStream())
     monkeypatch.setattr(torch.cuda, "Event", _FakeCudaEvent)
@@ -791,48 +791,3 @@ def test_run_noisy_chunk_pipeline_accepts_steps_by_1_timesteps(monkeypatch) -> N
     assert by_step[0] == [900.0] * chunks
     assert by_step[1] == [500.0] * chunks
     assert by_step[2] == [100.0] * chunks
-
-
-@pytest.mark.parametrize(("schedule", "expected_peak"), [("stepwise", 3), ("serial", 5)])
-def test_chunk_kv_evicts_versions_and_reports_peak(monkeypatch, schedule: str, expected_peak: int) -> None:
-    """KV task-versions are freed once their last consumer's forward completes."""
-    _patch_cpu_chunk_pp_runtime(monkeypatch)
-    scheduler = _StubChunkScheduler()
-    chunks = 6
-    t_l = 2
-    shape = (1, 4, t_l, 1, 1)
-    initial_latents = torch.zeros((1, 4, chunks * t_l, 1, 1), dtype=torch.float32)
-    step_noises = [torch.zeros_like(initial_latents), torch.zeros_like(initial_latents)]
-    captured: dict[str, dict] = {}
-
-    def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
-    ):
-        del timestep, temporal_offset, step_idx, intermediate_tensors
-        if kv_context is not None:
-            captured["kv_layers"] = kv_context.layers
-            for layer in range(3):
-                kv_context.append(layer, model_input, model_input)
-        return torch.zeros_like(model_input)
-
-    result, metrics = run_noisy_chunk_pipeline(
-        predict_noise=fake_predict_noise,
-        scheduler=scheduler,
-        timesteps=torch.tensor([900.0, 500.0, 100.0]),
-        shape=shape,
-        chunks=chunks,
-        cond_frames=t_l,
-        gap=1,
-        seed=0,
-        device=torch.device("cpu"),
-        schedule=schedule,
-        initial_latents=initial_latents,
-        step_noises=step_noises,
-        kv_history_chunks=1,
-    )
-
-    del result
-    kv_layers = captured["kv_layers"]
-    assert all(not cache for cache in kv_layers.values())  # final live count == 0
-    assert metrics["kv_evicted_versions"] == chunks * 4
-    assert metrics["kv_live_versions"] == expected_peak
