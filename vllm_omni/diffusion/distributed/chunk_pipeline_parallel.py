@@ -153,18 +153,32 @@ def plan_clean_kv_sources(slots, history_chunks: int, clean_step: int):
 
 @dataclass
 class ChunkKVContext:
-    """Request-local, stage-local cache of post-normalization/post-RoPE K and V."""
+    """Request-local, stage-local cache of post-normalization/post-RoPE K and V.
+
+    Every published version carries the producer identity (which tower ran
+    the forward). Readers only ever consume versions produced by their own
+    tower, mirroring the reference implementation's two independent per-tower
+    caches; the planner-level sources are tower-agnostic and are resolved
+    against the reading tower's producer here.
+    """
 
     layers: dict
     task: ChunkStep
     sources: tuple[ChunkStep, ...]
+    producer: str | None = None
+
+    def _cache_for(self, layer: int) -> dict:
+        return self.layers.setdefault(layer, {})
 
     def append(self, layer: int, key: torch.Tensor, value: torch.Tensor):
-        cache = self.layers.setdefault(layer, {})
-        if self.task in cache:
-            raise RuntimeError(f"Duplicate KV publication for layer {layer}, task {self.task}")
-        history = [cache[source] for source in self.sources]
-        cache[self.task] = (key.contiguous(), value.contiguous())
+        cache = self._cache_for(layer)
+        store_key = (self.task, self.producer)
+        if store_key in cache:
+            raise RuntimeError(
+                f"Duplicate KV publication for layer {layer}, task {self.task}, producer {self.producer}"
+            )
+        history = [cache[(source, self.producer)] for source in self.sources]
+        cache[store_key] = (key.contiguous(), value.contiguous())
         if not history:
             return key, value
         return (
@@ -191,6 +205,7 @@ def _kv_retained_bytes(kv_layers: dict) -> int:
 def run_noisy_chunk_pipeline(
     *,
     predict_noise: Callable,
+    update_sample: Callable,
     scheduler,
     timesteps: torch.Tensor,
     shape: tuple[int, ...],
@@ -205,13 +220,24 @@ def run_noisy_chunk_pipeline(
     step_noises: list[torch.Tensor] | None = None,
     kv_history_chunks: int | None = None,
     kv_source_policy: str = "latest",
+    kv_producers: tuple[str, ...] = ("single",),
+    kv_reader_producer: Callable | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Run local layers and exchange activations/state in a common direction order.
 
-    The callback accepts (model_input, timestep, temporal_offset, step_idx,
-    intermediate_tensors=None). It returns IntermediateTensors on the first of
-    two stages, and a noise-prediction Tensor on the last stage. Each chunk has
-    its own RNG; only the last stage draws the two scheduler re-noising samples.
+    The ``predict_noise`` callback accepts (model_input, timestep,
+    temporal_offset, step_idx, producer, intermediate_tensors=None,
+    kv_context=None). It returns IntermediateTensors on the first of two
+    stages, and a noise-prediction Tensor on the last stage. Each chunk has
+    its own RNG; only the last stage draws the two scheduler re-noising
+    samples.
+
+    ``kv_producers`` names the KV cache producer identities (towers). A
+    dual-expert checkpoint uses ("high", "low"): the context pass runs once
+    per producer with that producer's tower and each version is stored under
+    its producer, and every denoise forward consumes only history produced
+    by its own tower (``kv_reader_producer(step_idx) -> producer name``),
+    matching the reference implementation's two independent per-tower caches.
     """
     pp = get_pp_group()
     rank, world = pp.rank_in_group, pp.world_size
@@ -252,12 +278,14 @@ def run_noisy_chunk_pipeline(
             raise ValueError(
                 "KV execution requires the shared full-video initial sample and one re-noising tensor per transition"
             )
-        # Each task's stored KV is consumed by the later same-rank tasks that
-        # list it in their frozen sources. Zero-consumer tasks free immediately.
-        kv_remaining = {task: 0 for task in kv_sources}
+        # Each (task, producer) version is consumed by the later same-rank
+        # tasks that list it in their frozen sources, one consumption per
+        # producer. Zero-consumer versions free immediately.
+        kv_remaining = {(task, producer): 0 for task in kv_sources for producer in kv_producers}
         for sources in kv_sources.values():
             for source in sources:
-                kv_remaining[source] += 1
+                for producer in kv_producers:
+                    kv_remaining[(source, producer)] += 1
     if num_denoise_steps < 1 or not 1 <= cond_frames <= shape[2]:
         raise ValueError("Chunk pipeline requires DMD timesteps and a valid condition prefix")
     t_l, length = shape[2], cond_frames
@@ -304,25 +332,29 @@ def run_noisy_chunk_pipeline(
         if world == 2:
             dist.barrier(group=pp.device_group)
 
-    def release_kv(task):
+    def release_kv(task, published: tuple[str, ...]):
         nonlocal kv_live, kv_peak_live, kv_evicted, kv_peak_retained_bytes
         # Sample both peaks at the residency maximum, before any release: the
-        # task just published its version, so bytes mirror the live count.
-        kv_live += 1
+        # task just published its version(s), so bytes mirror the live count.
+        kv_live += len(published)
         kv_peak_live = max(kv_peak_live, kv_live)
         kv_peak_retained_bytes = max(kv_peak_retained_bytes, _kv_retained_bytes(kv_layers))
         for source in kv_sources[task]:
-            kv_remaining[source] -= 1
-            if kv_remaining[source] == 0:
+            for producer in kv_producers:
+                remaining_key = (source, producer)
+                kv_remaining[remaining_key] -= 1
+                if kv_remaining[remaining_key] == 0:
+                    kv_live -= 1
+                    kv_evicted += 1
+                    for layer_cache in kv_layers.values():
+                        layer_cache.pop(remaining_key, None)
+        for producer in published:
+            remaining_key = (task, producer)
+            if kv_remaining[remaining_key] == 0:
                 kv_live -= 1
                 kv_evicted += 1
                 for layer_cache in kv_layers.values():
-                    layer_cache.pop(source)
-        if kv_remaining[task] == 0:
-            kv_live -= 1
-            kv_evicted += 1
-            for layer_cache in kv_layers.values():
-                layer_cache.pop(task)
+                    layer_cache.pop(remaining_key, None)
 
     # Keep metrics collection out of the timed request path. ``timesteps`` is
     # resident on the accelerator, so converting it in a per-slot record would
@@ -370,11 +402,23 @@ def run_noisy_chunk_pipeline(
                 )
             first, last = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             first.record(stream)
-            kwargs = {"intermediate_tensors": intermediate}
             if kv:
-                kwargs["kv_context"] = ChunkKVContext(kv_layers, task, kv_sources[task])
-            with trace_scope(f"chunk_pp.forward.slot{slot_idx}.rank{rank}.chunk{chunk}.step{step}"):
-                prediction = predict_noise(model_input, t.expand(shape[0]), offset, step, **kwargs)
+                # Per the reference contract, the clean/context pass runs once
+                # per tower and each tower stores its own version; a denoise
+                # forward consumes history produced by its own tower only.
+                reader = kv_reader_producer(step) if kv_reader_producer else kv_producers[0]
+                publishers = kv_producers if clean_pass else (reader,)
+                kwargs = {"intermediate_tensors": intermediate}
+                prediction = None
+                for producer in publishers:
+                    kv_context = ChunkKVContext(kv_layers, task, kv_sources[task], producer=producer)
+                    kwargs["kv_context"] = kv_context
+                    with trace_scope(f"chunk_pp.forward.slot{slot_idx}.rank{rank}.chunk{chunk}.step{step}.{producer}"):
+                        prediction = predict_noise(model_input, t.expand(shape[0]), offset, step, producer, **kwargs)
+            else:
+                prediction = predict_noise(
+                    model_input, t.expand(shape[0]), offset, step, None, intermediate_tensors=intermediate
+                )
             last.record(stream)
             record = {
                 "chunk_idx": chunk,
@@ -393,27 +437,39 @@ def run_noisy_chunk_pipeline(
             if kv:
                 record.update(
                     pass_kind="clean_kv" if clean_pass else "denoise",
+                    kv_reader_producer=reader,
                     kv_sources=[list(source) for source in kv_sources[task]],
                     kv_history_latent_frames=len(kv_sources[task]) * t_l,
                 )
-                release_kv(task)
+                release_kv(task, publishers)
             records.append(record)
             if world == 2 and rank == 0:
                 forward_payload = {**prediction.tensors, "model_input": model_input}
             else:
                 prediction = prediction[:, :, -t_l:]
-                clean = model_input if clean_pass else scheduler.predict_clean(prediction, model_input[:, :, -t_l:], t)
-                if kv and not clean_pass:
-                    clean = clean.to(prediction.dtype)
-                if step < last_denoise:
+                if clean_pass:
+                    # The context pass publishes KV only: per the reference
+                    # contract it never updates the sample state.
+                    updated = model_input
+                    clean = model_input
+                else:
                     noise = (
                         step_noises[step][:, :, chunk * t_l : (chunk + 1) * t_l].contiguous()
-                        if kv
-                        else torch.randn(shape, generator=generators[chunk], device=device, dtype=torch.float32)
+                        if kv and step < last_denoise
+                        else (
+                            torch.randn(shape, generator=generators[chunk], device=device, dtype=torch.float32)
+                            if step < last_denoise
+                            else None
+                        )
                     )
-                    updated = scheduler.add_noise(clean, noise, timesteps[step + 1])
-                else:
-                    updated = clean
+                    updated = update_sample(
+                        prediction=prediction,
+                        sample=model_input[:, :, -t_l:],
+                        timestep=float(timestep_values[step]),
+                        next_timestep=timestep_values[step + 1] if step < last_denoise else None,
+                        noise=noise,
+                    )
+                    clean = updated
                 feedback_payload = {"latents": updated}
                 if gap == 2 and has_consumer(task):
                     feedback_payload["condition"] = clean[:, :, -length:].to(torch.bfloat16).contiguous()

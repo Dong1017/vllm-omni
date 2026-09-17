@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.causal_dmd import update_sample
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
@@ -660,8 +661,22 @@ class Wan22Pipeline(
                 return_dict=False,
             )
 
+        def update_sample_for_chunk(
+            prediction, sample, timestep, next_timestep, noise, boundary_timestep=boundary_timestep
+        ):
+            return update_sample(
+                self.scheduler,
+                prediction=prediction,
+                sample=sample,
+                timestep=timestep,
+                next_timestep=next_timestep,
+                noise=noise,
+                boundary_timestep=boundary_timestep,
+            )
+
         result, self.chunk_pipeline_metrics = run_noisy_chunk_pipeline(
             predict_noise=predict_noise,
+            update_sample=update_sample_for_chunk,
             scheduler=self.scheduler,
             timesteps=timesteps,
             shape=shape,
@@ -832,13 +847,21 @@ class Wan22Pipeline(
                 if self.is_dmd:
 
                     def update_dmd(prediction, sample):
-                        pred_clean = self.scheduler.predict_clean(prediction, sample, t).to(prediction.dtype)
-                        if step_idx + 1 == len(timesteps):
-                            return pred_clean
-                        noise = randn_tensor(
-                            sample.shape, generator=generator, device=sample.device, dtype=pred_clean.dtype
+                        next_t = float(timesteps[step_idx + 1]) if step_idx + 1 < len(timesteps) else None
+                        noise = (
+                            randn_tensor(sample.shape, generator=generator, device=sample.device, dtype=sample.dtype)
+                            if next_t is not None
+                            else None
                         )
-                        return self.scheduler.add_noise(pred_clean, noise, timesteps[step_idx + 1])
+                        return update_sample(
+                            self.scheduler,
+                            prediction=prediction,
+                            sample=sample,
+                            timestep=float(t),
+                            next_timestep=next_t,
+                            noise=noise,
+                            boundary_timestep=self._request_boundary_timestep(),
+                        )
 
                     latents = self.dmd_step_maybe_with_pp(noise_pred, latents, update_dmd)
                 else:

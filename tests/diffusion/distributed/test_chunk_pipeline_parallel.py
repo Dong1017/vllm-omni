@@ -82,19 +82,24 @@ def test_kv_attention_matches_explicit_history_and_keeps_versions_separate():
     tensors = [torch.randn(1, 5, 2, 4, generator=rng) for _ in range(7)]
     k0, v0, k1, v1, key, value, query = tensors
     layers = {}
-    ChunkKVContext(layers, (0, 0), ()).append(15, k0, v0)
-    ChunkKVContext(layers, (0, 3), ()).append(15, k1, v1)
-    k, v = ChunkKVContext(layers, (1, 0), ((0, 0),)).append(15, key, value)
+    ChunkKVContext(layers, (0, 0), (), producer="single").append(15, k0, v0)
+    ChunkKVContext(layers, (0, 3), (), producer="single").append(15, k1, v1)
+    k, v = ChunkKVContext(layers, (1, 0), ((0, 0),), producer="single").append(15, key, value)
     actual = F.scaled_dot_product_attention(query.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     expected = F.scaled_dot_product_attention(
         query.transpose(1, 2), torch.cat([k0, key], 1).transpose(1, 2), torch.cat([v0, value], 1).transpose(1, 2)
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert layers[15][(0, 3)][0] is k1
+    # Versions are stored under (task, producer): the same task published by
+    # another tower lands on a separate key and never collides.
+    assert layers[15][((0, 3), "single")][0] is k1
+    other = ChunkKVContext(layers, (0, 3), (), producer="other")
+    other.append(15, k0, v0)
+    assert layers[15][((0, 3), "other")][0] is k0
     with pytest.raises(KeyError):
-        ChunkKVContext(layers, (1, 1), ((0, 0),)).append(16, key, value)
+        ChunkKVContext(layers, (1, 1), ((0, 0),), producer="single").append(16, key, value)
     with pytest.raises(RuntimeError, match="Duplicate KV"):
-        ChunkKVContext(layers, (1, 0), ()).append(15, key, value)
+        ChunkKVContext(layers, (1, 0), (), producer="single").append(15, key, value)
 
 
 @pytest.mark.parametrize("world", [1, 2])
@@ -256,6 +261,16 @@ def _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1, peer
 # 6 at H=6) are covered by the dedicated clean-semantics test. Each rank
 # executes every task once, so 24 versions are published and evicted per rank
 # (48 across PP2).
+def _stub_update_sample(sample=None, **kwargs):
+    """Deterministic sample update for runner tests: identity on the sample.
+
+    The runner tests exercise scheduling, KV bookkeeping and exchange; the
+    update math itself is covered by the causal_dmd unit tests.
+    """
+    del kwargs
+    return sample
+
+
 _EXPECTED_PEAKS = {
     (1, "stepwise"): 3,
     (1, "serial"): 5,
@@ -285,7 +300,7 @@ def test_chunk_kv_evicts_versions_and_reports_peak(
     checked_histories = 0
 
     def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
     ):
         del timestep, temporal_offset, step_idx, intermediate_tensors
         nonlocal checked_histories
@@ -311,6 +326,7 @@ def test_chunk_kv_evicts_versions_and_reports_peak(
 
     result, metrics = run_noisy_chunk_pipeline(
         predict_noise=fake_predict_noise,
+        update_sample=_stub_update_sample,
         scheduler=_StubChunkScheduler(),
         timesteps=torch.tensor([900.0, 500.0, 100.0]),
         shape=shape,
@@ -348,7 +364,7 @@ def test_chunk_kv_reports_retained_bytes_peak_before_release(monkeypatch) -> Non
     version_bytes = 0
 
     def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
     ):
         nonlocal version_bytes
         del timestep, temporal_offset, step_idx, intermediate_tensors
@@ -360,6 +376,7 @@ def test_chunk_kv_reports_retained_bytes_peak_before_release(monkeypatch) -> Non
 
     result, metrics = run_noisy_chunk_pipeline(
         predict_noise=fake_predict_noise,
+        update_sample=_stub_update_sample,
         scheduler=_StubChunkScheduler(),
         timesteps=torch.tensor([900.0, 500.0, 100.0]),
         shape=shape,
@@ -407,7 +424,7 @@ def test_chunk_kv_serial_semantics_selects_clean_versions(monkeypatch) -> None:
     checked = 0
 
     def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
     ):
         nonlocal checked
         del timestep, temporal_offset, step_idx, intermediate_tensors
@@ -428,6 +445,7 @@ def test_chunk_kv_serial_semantics_selects_clean_versions(monkeypatch) -> None:
 
     result, metrics = run_noisy_chunk_pipeline(
         predict_noise=fake_predict_noise,
+        update_sample=_stub_update_sample,
         scheduler=_StubChunkScheduler(),
         timesteps=torch.tensor([900.0, 700.0, 500.0, 300.0, 100.0]),
         shape=shape,
@@ -455,6 +473,7 @@ def test_chunk_kv_clean_policy_rejects_stepwise(monkeypatch) -> None:
     with pytest.raises(ValueError, match="clean KV source policy requires the serial schedule"):
         run_noisy_chunk_pipeline(
             predict_noise=lambda *args, **kwargs: torch.zeros(1, 4, 2, 1, 1),
+            update_sample=lambda **kwargs: torch.zeros(1, 4, 2, 1, 1),
             scheduler=_StubChunkScheduler(),
             timesteps=torch.tensor([900.0]),
             shape=(1, 4, 2, 1, 1),
@@ -486,7 +505,7 @@ def test_chunk_kv_serial_latest_replays_stepwise_sources(monkeypatch) -> None:
     observed = {}
 
     def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
     ):
         del timestep, temporal_offset, step_idx, intermediate_tensors
         if kv_context is not None:
@@ -501,6 +520,7 @@ def test_chunk_kv_serial_latest_replays_stepwise_sources(monkeypatch) -> None:
 
     common = dict(
         predict_noise=fake_predict_noise,
+        update_sample=_stub_update_sample,
         scheduler=_StubChunkScheduler(),
         timesteps=torch.tensor([900.0, 500.0, 100.0]),
         shape=shape,
@@ -540,6 +560,7 @@ def test_chunk_kv_world_two_matches_whole_transformer(monkeypatch) -> None:
     ]
     common = dict(
         scheduler=_StubChunkScheduler(),
+        update_sample=_stub_update_sample,
         timesteps=torch.tensor([900.0, 500.0, 100.0]),
         shape=shape,
         chunks=chunks,
@@ -564,7 +585,7 @@ def test_chunk_kv_world_two_matches_whole_transformer(monkeypatch) -> None:
     split_stages = False
 
     def fake_predict_noise(
-        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
     ):
         del timestep, temporal_offset, step_idx, intermediate_tensors
         if kv_context is not None:
