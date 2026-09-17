@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Chunk scheduling over the existing layer pipeline stages."""
+"""Chunk scheduling over existing layer-split PP stages.
+
+Layer weights are partitioned at model build time. This module schedules
+temporal ``(chunk, step)`` work, optional KV history, and stage communication.
+"""
 
 from __future__ import annotations
 
@@ -14,26 +18,28 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 
+# (chunk_idx, step_idx); with kv, step == num_denoise_steps is the clean pass.
 ChunkStep = tuple[int, int]
 
 
 def plan_chunk_pipeline(
     chunks: int,
-    gap: int,
     world: int,
     schedule: str = "stepwise",
     *,
     kv: bool = False,
     num_denoise_steps: int = 3,
 ) -> list[tuple[ChunkStep | None, ...]]:
-    """Plan stage work using only results completed before the current slot.
+    """Plan per-slot work for each PP stage.
 
-    ``world`` is ``pipeline_parallel_size``: each rank owns one layer stage.
-    Jobs enter at stage 0 and shift one stage per slot until the last stage
-    completes them (and only then unlocks dependents).
+    Returns slots of length ``world``. A job enters stage 0 and advances one
+    stage per slot; completion on the last stage unlocks dependents.
+
+    ``serial`` runs one chunk at a time. ``stepwise`` interleaves waves of
+    ``world`` chunks. With ``kv``, each chunk includes one extra clean step.
     """
-    if chunks < 1 or gap not in (1, 2) or world < 1:
-        raise ValueError("Chunk pipeline requires positive chunks, gap 1/2 and pipeline_parallel_size >= 1")
+    if chunks < 1 or world < 1:
+        raise ValueError("Chunk pipeline requires positive chunks and pipeline_parallel_size >= 1")
     if num_denoise_steps < 1:
         raise ValueError("Chunk pipeline requires a positive number of denoise steps")
     steps = num_denoise_steps + 1 if kv else num_denoise_steps
@@ -42,16 +48,15 @@ def plan_chunk_pipeline(
     elif schedule == "stepwise":
         jobs = [
             (chunk, step)
-            for first in range(0, chunks, 2)
+            for first in range(0, chunks, world)
             for step in range(steps)
-            for chunk in range(first, min(first + 2, chunks))
+            for chunk in range(first, min(first + world, chunks))
         ]
     else:
         raise ValueError("Chunk schedule must be 'serial' or 'stepwise'")
 
     slots = []
     completed = set()
-    # carry[i] becomes stage i+1 on the next slot (everything except the last stage).
     carry = [None] * (world - 1)
     cursor = 0
     while cursor < len(jobs) or any(task is not None for task in carry):
@@ -59,8 +64,6 @@ def plan_chunk_pipeline(
         if cursor < len(jobs) and not (schedule == "serial" and any(task is not None for task in carry)):
             chunk, step = jobs[cursor]
             dependencies = {(chunk, step - 1)} if step else set()
-            if not kv and chunk > 0 and step >= gap:
-                dependencies.add((chunk - 1, step - gap))
             if dependencies <= completed:
                 launched = jobs[cursor]
                 cursor += 1
@@ -75,11 +78,10 @@ def plan_chunk_pipeline(
 
 
 def plan_latest_kv_sources(slots, history_chunks: int):
-    """Freeze latest completed versions BEFORE a slot, separately per layer stage.
+    """Latest-KV sources for stepwise: freeze history before each slot, per stage.
 
-    Stepwise therefore concatenates the highest finished denoise or clean step of
-    each history chunk. Step N (the extra t=0 pass) publishes clean KV and does
-    not denoise.
+    Each task reads the highest step already published on that rank for prior
+    chunks in the window ``H``. Same-slot publications are not visible yet.
     """
     if history_chunks < 1:
         raise ValueError("KV history must contain at least one chunk")
@@ -100,7 +102,7 @@ def plan_latest_kv_sources(slots, history_chunks: int):
 
 
 def plan_clean_kv_sources(slots, history_chunks: int, clean_step: int):
-    """Serial Self Forcing: each chunk concatenates predecessors' clean KV only."""
+    """Clean-KV sources for serial Self Forcing: predecessors use ``clean_step`` only."""
     if history_chunks < 1:
         raise ValueError("KV history must contain at least one chunk")
     if clean_step < 0:
@@ -117,7 +119,7 @@ def plan_clean_kv_sources(slots, history_chunks: int, clean_step: int):
 
 
 def plan_kv_last_use(slots, sources_by_rank):
-    """Last execution slot on this rank that still needs a published KV version."""
+    """Last slot on each rank that still references a published KV version."""
     last_use = [{} for _ in slots[0]]
     for slot_idx, tasks in enumerate(slots):
         for rank, task in enumerate(tasks):
@@ -130,6 +132,7 @@ def plan_kv_last_use(slots, sources_by_rank):
 
 
 def evict_kv_versions(layers: dict, versions) -> None:
+    """Remove KV versions from the per-layer cache; drop empty layer entries."""
     empty = []
     for layer, cache in layers.items():
         for version in versions:
@@ -142,13 +145,14 @@ def evict_kv_versions(layers: dict, versions) -> None:
 
 @dataclass
 class ChunkKVContext:
-    """Request-local, stage-local cache of post-normalization/post-RoPE K and V."""
+    """Stage-local post-norm / post-RoPE K/V cache for one attention call."""
 
     layers: dict
     task: ChunkStep
     sources: tuple[ChunkStep, ...]
 
     def append(self, layer: int, key: torch.Tensor, value: torch.Tensor):
+        """Store this task's K/V and return history concatenated on dim=1."""
         cache = self.layers.setdefault(layer, {})
         if self.task in cache:
             raise RuntimeError(f"Duplicate KV publication for layer {layer}, task {self.task}")
@@ -163,6 +167,7 @@ class ChunkKVContext:
 
 
 def _tensor_bytes(payload: dict[str, torch.Tensor] | None) -> int:
+    """Byte size of tensors in a communication payload."""
     return sum(value.numel() * value.element_size() for value in payload.values()) if payload else 0
 
 
@@ -170,12 +175,11 @@ def _tensor_bytes(payload: dict[str, torch.Tensor] | None) -> int:
 def run_chunk_pipeline(
     *,
     predict_noise: Callable,
-    scheduler,
+    predict_clean: Callable,
+    add_noise: Callable,
     timesteps: torch.Tensor,
     shape: tuple[int, ...],
     chunks: int,
-    cond_frames: int,
-    gap: int,
     seed: int,
     device: torch.device,
     schedule: str = "stepwise",
@@ -184,12 +188,14 @@ def run_chunk_pipeline(
     step_noises: list[torch.Tensor] | None = None,
     kv_history_chunks: int | None = None,
 ) -> tuple[torch.Tensor, dict]:
-    """Run local layers and exchange activations/state in a common direction order.
+    """Run the chunk timetable on this PP rank.
 
-    The callback accepts (model_input, timestep, temporal_offset, step_idx,
-    intermediate_tensors=None). It returns IntermediateTensors on every non-last
-    stage, and a noise-prediction Tensor on the last stage. Each chunk has its
-    own RNG; only the last stage draws the two scheduler re-noising samples.
+    All ranks share the same slots; rank ``r`` executes ``tasks[r]``.
+    ``predict_noise`` returns ``IntermediateTensors`` on non-last stages and a
+    noise tensor on the last stage. ``predict_clean(pred, sample, t)`` and
+    ``add_noise(sample, noise, t)`` perform the last-stage latent update.
+    Per slot, communicate last→0 feedback, then stage i→i+1 activations.
+    KV mode requires shared ``initial_latents`` and ``step_noises``.
     """
     pp = get_pp_group()
     rank, world = pp.rank_in_group, pp.world_size
@@ -197,7 +203,7 @@ def run_chunk_pipeline(
     kv = kv_history_chunks is not None
     num_denoise_steps = len(timesteps)
     last_denoise = num_denoise_steps - 1
-    slots = plan_chunk_pipeline(chunks, gap, world, schedule, kv=kv, num_denoise_steps=num_denoise_steps)
+    slots = plan_chunk_pipeline(chunks, world, schedule, kv=kv, num_denoise_steps=num_denoise_steps)
     kv_layers = {}
     kv_sources = None
     kv_last_use = None
@@ -214,27 +220,20 @@ def run_chunk_pipeline(
                 "KV execution requires the shared full-video initial sample "
                 "and one re-noising tensor per transition"
             )
-    if num_denoise_steps < 1 or not 1 <= cond_frames <= shape[2]:
-        raise ValueError("Chunk pipeline requires DMD timesteps and a valid condition prefix")
-    t_l, length = shape[2], cond_frames
-    current, generators, cache, clean_chunks = {}, {}, {}, {}
+    if num_denoise_steps < 1:
+        raise ValueError("Chunk pipeline requires a positive number of denoise steps")
+    t_l = shape[2]
+    current, generators, clean_chunks = {}, {}, {}
     records, slot_records = [], []
     comm_ms = 0.0
-    activation_bytes = sample_bytes = feedback_bytes = condition_bytes = 0
+    activation_bytes = sample_bytes = feedback_bytes = 0
     stage_input = None
-
-    def has_consumer(task):
-        chunk, step = task
-        return not kv and chunk + 1 < chunks and step + gap < num_denoise_steps
 
     def accept_feedback(task, payload):
         chunk, step = task
         current[chunk] = payload["latents"]
         if step == last_denoise:
             clean_chunks[chunk] = current[chunk]
-        if has_consumer(task):
-            source = current[chunk][:, :, -length:] if gap == 1 else payload["condition"]
-            cache[task] = source.to(torch.bfloat16).contiguous()
 
     def initialize_chunk(chunk):
         if kv:
@@ -246,8 +245,7 @@ def run_chunk_pipeline(
         initial = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
         if rank == 0:
             current[chunk] = initial
-        # Non-first ranks consume the same initialization draw; the exact sample
-        # arrives with model_input, and this generator owns the later draws.
+        # Non-first ranks share the RNG stream; the sample arrives via model_input.
 
     def barrier():
         if world > 1:
@@ -270,20 +268,10 @@ def run_chunk_pipeline(
             t = timesteps.new_zeros(()) if clean_pass else timesteps[step]
             if step == 0:
                 initialize_chunk(chunk)
-            has_prefix = not kv and chunk > 0 and step >= gap
-            offset = chunk * t_l - (length if has_prefix else 0)
+            offset = chunk * t_l
             intermediate = None
             if rank == 0:
                 model_input = current[chunk]
-                if has_prefix:
-                    cond = cache.pop((chunk - 1, step - gap)).float()
-                    if gap == 2:
-                        cond_generator = torch.Generator(device=device).manual_seed(
-                            seed + 1000000007 + chunk * 100003 + step * 1009
-                        )
-                        noise = torch.randn(cond.shape, generator=cond_generator, device=device, dtype=torch.float32)
-                        cond = scheduler.add_noise(cond, noise, t)
-                    model_input = torch.cat([cond, model_input], dim=2)
             else:
                 model_input = stage_input["model_input"]
                 intermediate = IntermediateTensors(
@@ -326,7 +314,8 @@ def run_chunk_pipeline(
                 forward_payload = {**prediction.tensors, "model_input": model_input}
             else:
                 prediction = prediction[:, :, -t_l:]
-                clean = model_input if clean_pass else scheduler.predict_clean(prediction, model_input[:, :, -t_l:], t)
+                sample = model_input[:, :, -t_l:]
+                clean = sample if clean_pass else predict_clean(prediction, sample, t)
                 if kv and not clean_pass:
                     clean = clean.to(prediction.dtype)
                 if step < last_denoise:
@@ -335,12 +324,10 @@ def run_chunk_pipeline(
                         if kv
                         else torch.randn(shape, generator=generators[chunk], device=device, dtype=torch.float32)
                     )
-                    updated = scheduler.add_noise(clean, noise, timesteps[step + 1])
+                    updated = add_noise(clean, noise, timesteps[step + 1])
                 else:
                     updated = clean
                 feedback_payload = {"latents": updated}
-                if gap == 2 and has_consumer(task):
-                    feedback_payload["condition"] = clean[:, :, -length:].to(torch.bfloat16).contiguous()
                 if world == 1:
                     accept_feedback(task, feedback_payload)
 
@@ -350,14 +337,10 @@ def run_chunk_pipeline(
             handles = []
             postprocessors = []
             received_feedback = received_forward = None
-            # Dictionary APIs send metadata synchronously. Every rank must use
-            # this SAME direction order: last→0 feedback, then stage i→i+1.
+            # Same order on every rank: last→0 feedback, then i→i+1 forward.
             if tasks[last_rank] is not None:
                 if rank == last_rank:
                     feedback_bytes += _tensor_bytes({"latents": feedback_payload["latents"]})
-                    condition_bytes += _tensor_bytes(
-                        {"condition": feedback_payload["condition"]} if "condition" in feedback_payload else None
-                    )
                     handles.extend(pp.isend_tensor_dict(feedback_payload, dst=0))
                 elif rank == 0:
                     received_feedback, work, postprocess = pp.irecv_tensor_dict(src=last_rank)
@@ -377,7 +360,6 @@ def run_chunk_pipeline(
                     received_forward, work, postprocess = pp.irecv_tensor_dict(src=src)
                     postprocessors.extend(postprocess)
                     handles.extend(work)
-            # Keep all outgoing and incoming payloads alive until transfer ends.
             for handle in handles:
                 handle.wait()
             for postprocess in postprocessors:
@@ -392,8 +374,6 @@ def run_chunk_pipeline(
         if record is not None:
             record["comm_wait_ms"] = exchange_ms
         slot_records.append({"slot_idx": slot_idx, "task": task, "comm_wait_ms": exchange_ms})
-    if cache:
-        raise RuntimeError(f"Unconsumed chunk conditions: {list(cache)}")
     torch.accelerator.synchronize(device)
     barrier()
     local_wall = (time.perf_counter() - start_wall) * 1000
@@ -405,11 +385,10 @@ def run_chunk_pipeline(
         "slots": slot_records,
         "denoise_wall_ms": local_wall,
         "comm_wait_ms": comm_ms,
-        "condition_bytes_sent": condition_bytes,
         "activation_bytes_sent": activation_bytes,
         "sample_bytes_sent": sample_bytes,
         "feedback_bytes_sent": feedback_bytes,
-        "total_payload_bytes_sent": activation_bytes + sample_bytes + feedback_bytes + condition_bytes,
+        "total_payload_bytes_sent": activation_bytes + sample_bytes + feedback_bytes,
         "denoise_peak_allocated_bytes": torch.accelerator.max_memory_allocated(device),
     }
     if kv:
@@ -429,23 +408,18 @@ def run_chunk_pipeline(
     metrics = {
         "execution": "whole_request_layer_chunk_pipeline",
         "schedule": schedule,
-        "gap": gap,
-        "lag": gap,
         "world_size": world,
         "chunks": chunks,
         "chunk_latent_frames": t_l,
-        "cond_frames": length,
         "seed": seed,
         "latent_shape": list(shape),
         "ranks": all_metrics,
         "forward_call_unit": "layer_stage" if world > 1 else "whole_transformer",
         "stage_time_basis": "rank_local_cuda_event_origin; clocks are not aligned across ranks",
         "activation_bytes_include_model_input": False,
-        "condition_bytes_scope": "separate bf16 clean-prefix payload for gap2; gap1 derives prefix from feedback",
         "denoise_wall_ms": max(item["denoise_wall_ms"] for item in all_metrics),
         "forward_total_ms": sum(row["forward_ms"] for item in all_metrics for row in item["steps"]),
         "comm_wait_rank_sum_ms": sum(item["comm_wait_ms"] for item in all_metrics),
-        "condition_bytes_sent": sum(item["condition_bytes_sent"] for item in all_metrics),
         "activation_bytes_sent": sum(item["activation_bytes_sent"] for item in all_metrics),
         "sample_bytes_sent": sum(item["sample_bytes_sent"] for item in all_metrics),
         "feedback_bytes_sent": sum(item["feedback_bytes_sent"] for item in all_metrics),
@@ -465,9 +439,6 @@ def run_chunk_pipeline(
             clean_kv_forward_total_ms=sum(
                 row["forward_ms"] for item in all_metrics for row in item["steps"] if row["pass_kind"] == "clean_kv"
             ),
-            noise_contract="shared full-video initial sample and BF16 re-noising; native BF16 clean update",
-            cond_frames=0,
-            gap=None,
-            lag=None,
+            noise_contract="shared full-video initial sample and one re-noise tensor per step transition",
         )
     return result, metrics

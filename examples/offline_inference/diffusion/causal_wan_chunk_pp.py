@@ -72,6 +72,11 @@ def parse_args():
         action="store_true",
         help="Skip post-benchmark latent-only correctness requests.",
     )
+    parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable Omni model-level CPU offload (default: off; trades PCIe for lower peak VRAM).",
+    )
     args = parser.parse_args()
     if args.chunks < 1:
         parser.error("--chunks must be positive")
@@ -140,6 +145,7 @@ def main():
         "chunk_frames": request_chunk_frames,
         "num_frames": num_frames,
         "kv_history_chunks": None if args.execution == "full" else args.kv_history_chunks,
+        "enable_cpu_offload": args.enable_cpu_offload,
         "repeats": args.repeats,
         "samples": samples,
         "iterations": [],
@@ -226,6 +232,7 @@ def main():
             model=model,
             pipeline_parallel_size=args.pp_size,
             enforce_eager=True,
+            enable_cpu_offload=args.enable_cpu_offload,
         )
         metadata["omni_init_wall_ms"] = (time.perf_counter() - start) * 1000
         metadata["status"] = "running"

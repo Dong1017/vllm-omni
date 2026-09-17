@@ -607,8 +607,6 @@ class Wan22Pipeline(
         )
         if chunks < 2:
             raise ValueError("Chunk pipeline requires more than one temporal chunk")
-        length = int(extra.get("chunk_cond_frames", min(4, chunk_t)))
-        gap = int(extra.get("chunk_gap", extra.get("chunk_lag", 1)))
         schedule = extra.get("chunk_schedule", "stepwise")
         if isinstance(generator, list):
             generator = generator[0]
@@ -638,12 +636,11 @@ class Wan22Pipeline(
 
         result, self.chunk_pipeline_metrics = run_chunk_pipeline(
             predict_noise=predict_noise,
-            scheduler=self.scheduler,
+            predict_clean=self.scheduler.predict_clean,
+            add_noise=self.scheduler.add_noise,
             timesteps=timesteps,
             shape=shape,
             chunks=chunks,
-            cond_frames=length,
-            gap=gap,
             seed=seed,
             device=latents.device,
             schedule=schedule,
@@ -826,7 +823,6 @@ class Wan22Pipeline(
                 "activation_bytes_sent": sum(r["activation_bytes_sent"] for r in self._full_pp_records),
                 "sample_bytes_sent": 0,
                 "feedback_bytes_sent": self._full_pp_feedback_bytes,
-                "condition_bytes_sent": 0,
             }
             ranks = [payload]
             if pp.world_size > 1:
@@ -835,18 +831,14 @@ class Wan22Pipeline(
             self.chunk_pipeline_metrics = {
                 "execution": "full_video_layer_pipeline",
                 "schedule": "full",
-                "gap": 0,
-                "lag": 0,
                 "world_size": pp.world_size,
                 "chunks": 1,
                 "chunk_latent_frames": latents.shape[2],
-                "cond_frames": 0,
                 "latent_shape": list(latents.shape),
                 "ranks": ranks,
                 "denoise_wall_ms": max(r["denoise_wall_ms"] for r in ranks),
                 "forward_total_ms": sum(s["forward_ms"] for r in ranks for s in r["steps"]),
                 "comm_wait_rank_sum_ms": sum(r["comm_wait_ms"] for r in ranks),
-                "condition_bytes_sent": 0,
                 "latent_gather_ms": 0.0,
             }
             self._full_pp_records = None

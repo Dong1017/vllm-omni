@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 def test_latest_kv_never_reads_same_slot_or_future_chunk(chunks):
-    slots = plan_chunk_pipeline(chunks, 1, 2, kv=True)
+    slots = plan_chunk_pipeline(chunks, 2, kv=True)
     sources = plan_latest_kv_sources(slots, 6)
     completed = [{}, {}]
     for tick, tasks in enumerate(slots):
@@ -46,7 +46,7 @@ def test_latest_kv_never_reads_same_slot_or_future_chunk(chunks):
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 @pytest.mark.parametrize("num_denoise_steps", [3, 8])
 def test_serial_kv_reads_only_clean_history(world, chunks, num_denoise_steps):
-    slots = plan_chunk_pipeline(chunks, 1, world, "serial", kv=True, num_denoise_steps=num_denoise_steps)
+    slots = plan_chunk_pipeline(chunks, world, "serial", kv=True, num_denoise_steps=num_denoise_steps)
     sources = plan_clean_kv_sources(slots, 6, num_denoise_steps)
     published = [set() for _ in range(world)]
     for tasks in slots:
@@ -61,7 +61,7 @@ def test_serial_kv_reads_only_clean_history(world, chunks, num_denoise_steps):
 
 
 def test_serial_kv_history_window_drops_chunks_outside_h():
-    slots = plan_chunk_pipeline(4, 1, 2, "serial", kv=True)
+    slots = plan_chunk_pipeline(4, 2, "serial", kv=True)
     sources = plan_clean_kv_sources(slots, 1, 3)
     for rank in range(2):
         assert sources[rank][(1, 0)] == ((0, 3),)
@@ -70,19 +70,19 @@ def test_serial_kv_history_window_drops_chunks_outside_h():
 
 
 def test_latest_kv_includes_clean_versions_after_pair_finishes():
-    sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 1, 2, kv=True), 6)
+    sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 2, kv=True), 6)
     for rank in range(2):
         assert sources[rank][(1, 0)] == ((0, 0),)
         assert sources[rank][(2, 0)] == ((0, 3), (1, 3))
 
 
 def test_latest_kv_eight_step_clean_version_is_denoise_count():
-    sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 1, 2, kv=True, num_denoise_steps=8), 6)
+    sources = plan_latest_kv_sources(plan_chunk_pipeline(4, 2, kv=True, num_denoise_steps=8), 6)
     for rank in range(2):
         assert sources[rank][(1, 0)] == ((0, 0),)
         assert sources[rank][(2, 0)] == ((0, 8), (1, 8))
         expected_tasks = {(c, s) for c in range(4) for s in range(9)}
-        planned = {task for tasks in plan_chunk_pipeline(4, 1, 2, kv=True, num_denoise_steps=8) for task in tasks if task}
+        planned = {task for tasks in plan_chunk_pipeline(4, 2, kv=True, num_denoise_steps=8) for task in tasks if task}
         assert planned == expected_tasks
 
 
@@ -117,7 +117,7 @@ def test_kv_attention_matches_explicit_history_and_keeps_versions_separate():
 def test_kv_last_use_eviction_keeps_needed_sources(world, chunks, history, schedule, num_denoise_steps):
     import torch
 
-    execution = plan_chunk_pipeline(chunks, 1, world, schedule, kv=True, num_denoise_steps=num_denoise_steps)
+    execution = plan_chunk_pipeline(chunks, world, schedule, kv=True, num_denoise_steps=num_denoise_steps)
     if schedule == "serial":
         planned = plan_clean_kv_sources(execution, history, num_denoise_steps)
     else:
@@ -147,8 +147,8 @@ def test_kv_last_use_eviction_keeps_needed_sources(world, chunks, history, sched
 
 
 def test_serial_evicts_noisy_immediately_and_keeps_clean_for_later_chunks():
-    stepwise = plan_chunk_pipeline(4, 1, 2, "stepwise", kv=True)
-    serial = plan_chunk_pipeline(4, 1, 2, "serial", kv=True)
+    stepwise = plan_chunk_pipeline(4, 2, "stepwise", kv=True)
+    serial = plan_chunk_pipeline(4, 2, "serial", kv=True)
     latest = plan_latest_kv_sources(stepwise, 6)
     clean = plan_clean_kv_sources(serial, 6, 3)
     stepwise_use = plan_kv_last_use(stepwise, latest)
@@ -173,10 +173,9 @@ def test_serial_evicts_noisy_immediately_and_keeps_clean_for_later_chunks():
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-@pytest.mark.parametrize("gap", [1, 2])
 @pytest.mark.parametrize("schedule", ["serial", "stepwise"])
-def test_each_layer_stage_executes_once_after_dependencies(world, chunks, gap, schedule):
-    slots = plan_chunk_pipeline(chunks, gap, world, schedule)
+def test_each_layer_stage_executes_once_after_dependencies(world, chunks, schedule):
+    slots = plan_chunk_pipeline(chunks, world, schedule)
     expected = {(chunk, step) for chunk in range(chunks) for step in range(3)}
     executed = [{} for _ in range(world)]
     completed = {}
@@ -194,8 +193,6 @@ def test_each_layer_stage_executes_once_after_dependencies(world, chunks, gap, s
             if stage == 0:
                 if step > 0:
                     assert completed[chunk, step - 1] < slot_idx
-                if chunk > 0 and step >= gap:
-                    assert completed[chunk - 1, step - gap] < slot_idx
             else:
                 assert executed[stage - 1][task] < slot_idx
             executed[stage][task] = slot_idx
@@ -207,19 +204,18 @@ def test_each_layer_stage_executes_once_after_dependencies(world, chunks, gap, s
     assert sum(len(stage) for stage in executed) == world * chunks * 3
 
 
-@pytest.mark.parametrize("gap", [1, 2])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 @pytest.mark.parametrize("world", [2, 3, 4])
-def test_serial_and_stepwise_execute_the_same_jobs(gap, chunks, world):
+def test_serial_and_stepwise_execute_the_same_jobs(chunks, world):
     jobs = []
     for schedule in ("serial", "stepwise"):
-        slots = plan_chunk_pipeline(chunks, gap, world, schedule)
+        slots = plan_chunk_pipeline(chunks, world, schedule)
         jobs.append([{task for tasks in slots if (task := tasks[stage]) is not None} for stage in range(world)])
     assert jobs[0] == jobs[1]
 
 
-def test_gap_one_two_chunk_stage_order():
-    assert plan_chunk_pipeline(2, 1, 2) == [
+def test_two_chunk_two_stage_order():
+    assert plan_chunk_pipeline(2, 2) == [
         ((0, 0), None),
         ((1, 0), (0, 0)),
         ((0, 1), (1, 0)),
@@ -230,9 +226,9 @@ def test_gap_one_two_chunk_stage_order():
     ]
 
 
-def test_gap_one_two_chunk_three_stage_order():
+def test_two_chunk_three_stage_order():
     # Completion only happens on the last stage, so step N+1 waits a bubble.
-    assert plan_chunk_pipeline(2, 1, 3) == [
+    assert plan_chunk_pipeline(2, 3) == [
         ((0, 0), None, None),
         ((1, 0), (0, 0), None),
         (None, (1, 0), (0, 0)),
@@ -246,18 +242,34 @@ def test_gap_one_two_chunk_three_stage_order():
     ]
 
 
-@pytest.mark.parametrize("gap", [1, 2])
-def test_six_chunks_fill_two_stages_in_nineteen_slots(gap):
-    slots = plan_chunk_pipeline(6, gap, 2)
+def test_stepwise_wave_width_matches_world():
+    # Four stages interleave four chunks per step before the next wave.
+    slots = plan_chunk_pipeline(8, 4, "stepwise")
+    launched = [tasks[0] for tasks in slots if tasks[0] is not None]
+    assert launched[:8] == [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (3, 1),
+    ]
+    assert (4, 0) in launched
+    assert launched.index((4, 0)) > launched.index((3, 2))
+
+
+def test_six_chunks_fill_two_stages_in_nineteen_slots():
+    slots = plan_chunk_pipeline(6, 2)
     assert len(slots) == 19
     assert sum(all(task is not None for task in tasks) for tasks in slots) == 17
     assert slots[0][1] is None
     assert slots[-1][0] is None
 
 
-@pytest.mark.parametrize("gap", [1, 2])
-def test_single_chunk_waits_for_each_last_stage(gap):
-    assert plan_chunk_pipeline(1, gap, 2) == [
+def test_single_chunk_waits_for_each_last_stage():
+    assert plan_chunk_pipeline(1, 2) == [
         ((0, 0), None),
         (None, (0, 0)),
         ((0, 1), None),
@@ -267,9 +279,8 @@ def test_single_chunk_waits_for_each_last_stage(gap):
     ]
 
 
-@pytest.mark.parametrize("gap", [1, 2])
-def test_single_chunk_drains_three_stages(gap):
-    assert plan_chunk_pipeline(1, gap, 3) == [
+def test_single_chunk_drains_three_stages():
+    assert plan_chunk_pipeline(1, 3) == [
         ((0, 0), None, None),
         (None, (0, 0), None),
         (None, None, (0, 0)),
