@@ -57,6 +57,10 @@ DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
 FASTWAN_DMD_TIMESTEPS = (1000.0, 757.0, 522.0)
 FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
+CAUSALWAN_DMD_TIMESTEPS = (1000.0, 850.0, 700.0, 550.0, 350.0, 275.0, 200.0, 125.0)
+CAUSALWAN_DMD_SCHEDULER_SHIFT = 12.0
+WAN_DMD_CLASS_NAMES = frozenset({"WanDMDPipeline", "WanCausalDMDPipeline"})
+CAUSALWAN_DMD_CLASS_NAMES = frozenset({"WanCausalDMDPipeline"})
 
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
@@ -367,6 +371,7 @@ class Wan22Pipeline(
         # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
         self.expand_timesteps = False
         self.is_dmd = False
+        self.is_causalwan_dmd = False
         self.has_transformer_2 = False
         if local_files_only:
             model_index_path = os.path.join(model, "model_index.json")
@@ -374,7 +379,9 @@ class Wan22Pipeline(
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
-                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
+                    class_name = model_index.get("_class_name")
+                    self.is_dmd = class_name in WAN_DMD_CLASS_NAMES
+                    self.is_causalwan_dmd = class_name in CAUSALWAN_DMD_CLASS_NAMES
             # Check if this is a two-stage model (MoE with transformer_2)
             transformer_2_path = os.path.join(model, "transformer_2")
             self.has_transformer_2 = os.path.exists(transformer_2_path)
@@ -387,15 +394,17 @@ class Wan22Pipeline(
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
-                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
+                    class_name = model_index.get("_class_name")
+                    self.is_dmd = class_name in WAN_DMD_CLASS_NAMES
+                    self.is_causalwan_dmd = class_name in CAUSALWAN_DMD_CLASS_NAMES
                     # Check transformer_2 from model_index
                     transformer_2_info = model_index.get("transformer_2", [None, None])
                     self.has_transformer_2 = transformer_2_info[0] is not None
             except Exception:
                 pass
 
-        if self.chunk_pipeline_mode and (not self.is_dmd or self.has_transformer_2):
-            raise ValueError("Chunk pipeline mode currently requires a single-transformer WanDMDPipeline checkpoint")
+        if self.chunk_pipeline_mode and not self.is_dmd:
+            raise ValueError("Chunk pipeline mode currently requires a DMD Wan checkpoint")
         self.boundary_ratio = od_config.boundary_ratio
 
         # Determine which transformers to load based on boundary_ratio
@@ -492,9 +501,15 @@ class Wan22Pipeline(
             raise RuntimeError("No transformer loaded")
 
         self._sample_solver = "euler" if self.is_dmd else "unipc"
+        if self.is_causalwan_dmd:
+            default_dmd_shift = CAUSALWAN_DMD_SCHEDULER_SHIFT
+        elif self.is_dmd:
+            default_dmd_shift = FASTWAN_DMD_SCHEDULER_SHIFT
+        else:
+            default_dmd_shift = None
         self._flow_shift = (
-            FASTWAN_DMD_SCHEDULER_SHIFT
-            if self.is_dmd
+            default_dmd_shift
+            if default_dmd_shift is not None
             else od_config.flow_shift
             if od_config.flow_shift is not None
             else 5.0
@@ -517,6 +532,32 @@ class Wan22Pipeline(
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
         return create_transformer_from_config(config, quant_config=quant_config)
+
+    def _dmd_timesteps(self) -> tuple[float, ...]:
+        if self.is_causalwan_dmd:
+            return CAUSALWAN_DMD_TIMESTEPS
+        return FASTWAN_DMD_TIMESTEPS
+
+    def _active_layer_range(self) -> tuple[int, int]:
+        # Both towers shard identically (same layer count and config), so the
+        # chunk pipeline ranges are interchangeable; prefer the loaded one.
+        transformer = self.transformer if self.transformer is not None else self.transformer_2
+        if transformer is None:
+            raise RuntimeError("No transformer available")
+        return (transformer.start_layer, transformer.end_layer)
+
+    def _select_dit(self, timestep) -> WanTransformer3DModel:
+        value = timestep.reshape(-1)[0] if isinstance(timestep, torch.Tensor) else timestep
+        t = float(value)
+        ratio = self.boundary_ratio if self.boundary_ratio is not None else 0.875
+        boundary = ratio * self.scheduler.config.num_train_timesteps
+        if t < boundary and self.transformer_2 is not None:
+            return self.transformer_2
+        if self.transformer is not None:
+            return self.transformer
+        if self.transformer_2 is not None:
+            return self.transformer_2
+        raise RuntimeError("No transformer available")
 
     def _diffuse_chunks(self, req, latents, timesteps, prompt_embeds, dtype, generator):
         params = req.sampling_params_list[0]
@@ -562,11 +603,12 @@ class Wan22Pipeline(
             if normalized_timesteps is None:
                 self.record_denoise_step(step_idx, timestep[0])
             else:
-                # The KV clean pass uses a synthetic t=0 at step index 3.
+                # The KV clean pass uses a synthetic t=0 at the extra final
+                # step index, past the normalized denoise timesteps.
                 normalized = normalized_timesteps[step_idx] if step_idx < len(normalized_timesteps) else 0.0
                 self.record_denoise_step(step_idx, normalized_timestep=normalized)
             return self.predict_noise(
-                current_model=self.transformer,
+                current_model=self._select_dit(timestep[0]),
                 hidden_states=model_input.to(dtype),
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
@@ -587,7 +629,7 @@ class Wan22Pipeline(
             seed=seed,
             device=latents.device,
             schedule=schedule,
-            layer_range=(self.transformer.start_layer, self.transformer.end_layer),
+            layer_range=self._active_layer_range(),
             initial_latents=latents if use_kv else None,
             step_noises=step_noises,
             kv_history_chunks=int(extra.get("kv_history_chunks", 6)) if use_kv else None,
@@ -854,9 +896,9 @@ class Wan22Pipeline(
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
         if self.is_dmd:
-            # The checkpoint was distilled for these three transitions. Ignore
+            # The checkpoint was distilled for these transitions. Ignore
             # request-level step counts, including the engine's 1-step warmup.
-            num_steps = len(FASTWAN_DMD_TIMESTEPS)
+            num_steps = len(self._dmd_timesteps())
         else:
             num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
@@ -951,7 +993,7 @@ class Wan22Pipeline(
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
         if self.is_dmd:
-            timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
+            timesteps = torch.tensor(self._dmd_timesteps(), device=device, dtype=torch.float32)
         else:
             first_request = req.requests[0]
             sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
