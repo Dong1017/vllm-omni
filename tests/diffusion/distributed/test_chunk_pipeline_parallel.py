@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU checks for chunk dependencies, the two-stage layer schedule, and the KV runner."""
 
+import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +60,16 @@ def test_latest_kv_includes_clean_versions_after_pair_finishes():
     for rank in range(2):
         assert sources[rank][(1, 0)] == ((0, 0),)
         assert sources[rank][(2, 0)] == ((0, 3), (1, 3))
+
+
+def test_latest_kv_sources_reject_unfinished_history():
+    from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_latest_kv_sources
+
+    # A broken plan that schedules chunk 1 before chunk 0 has run anywhere
+    # must be rejected instead of silently conditioning on a short history.
+    slots = [((0, 0), None), (None, (1, 0))]
+    with pytest.raises(RuntimeError, match=r"history chunks \[0\]"):
+        plan_latest_kv_sources(slots, 6)
 
 
 def test_kv_attention_matches_explicit_history_and_keeps_versions_separate():
@@ -235,15 +247,15 @@ def _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1, peer
 
 
 # Peaks for 6 chunks, 4 steps, H-history conditioning. The stepwise reference
-# freezes sources before each slot; serial replays the identical versions. At
-# H=1 the stepwise peak is 3 live versions (5 for serial); at the formal
-# benchmark's H=6 it is 6 (9 for serial). Each rank executes every task once,
-# so 24 versions are published and evicted per rank (48 across PP2).
+# freezes sources before each slot (peak 3 at H=1, 6 at H=6); serial consumes
+# only predecessors' clean passes (peak 2 at H=1, 6 at H=6). Each rank executes
+# every task once, so 24 versions are published and evicted per rank (48
+# across PP2).
 _EXPECTED_PEAKS = {
     (1, "stepwise"): 3,
-    (1, "serial"): 5,
+    (1, "serial"): 2,
     (6, "stepwise"): 6,
-    (6, "serial"): 9,
+    (6, "serial"): 6,
 }
 
 
@@ -363,3 +375,167 @@ def test_chunk_kv_reports_retained_bytes_peak_before_release(monkeypatch) -> Non
     assert metrics["kv_evicted_versions"] == 4
     assert metrics["kv_live_versions"] == 1
     assert metrics["kv_retained_bytes_est"] == 2 * version_bytes
+
+
+def test_clean_kv_sources_target_only_clean_passes():
+    from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import plan_clean_kv_sources
+
+    slots = plan_chunk_pipeline(3, 1, 2, "serial", kv=True, num_denoise_steps=3)
+    sources = plan_clean_kv_sources(slots, 2, 3)
+    for rank in (0, 1):
+        for task, source in sources[rank].items():
+            chunk = task[0]
+            assert source == tuple((c, 3) for c in range(max(0, chunk - 2), chunk))
+
+
+def test_chunk_kv_serial_semantics_selects_clean_versions(monkeypatch) -> None:
+    """Serial-conditioned tasks must read the predecessors' clean-pass KV.
+
+    The replay semantics would freeze the latest finished version before each
+    slot; the clean semantics always point at (chunk, clean_step) instead.
+    """
+    chunks, t_l, layers_count = 3, 2, 3
+    shape = (1, 4, t_l, 1, 1)
+    _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=1, world_size=2, peer_payload_shape=shape)
+    initial_latents = torch.zeros((1, 4, chunks * t_l, 1, 1), dtype=torch.float32)
+    step_noises = [torch.zeros_like(initial_latents) for _ in range(4)]
+    checked = 0
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+    ):
+        nonlocal checked
+        del timestep, temporal_offset, step_idx, intermediate_tensors
+        if kv_context is not None:
+            for layer in range(layers_count):
+                kv_context.append(
+                    layer,
+                    torch.full_like(model_input, kv_context.task[1]),
+                    torch.full_like(model_input, kv_context.task[1]),
+                )
+            for source in kv_context.sources:
+                # Every source version must be a clean pass (step index 5 ==
+                # num_denoise_steps, the extra t=0 forward) frozen by the
+                # planner.
+                assert source[1] == 5, source
+                checked += 1
+        return torch.zeros_like(model_input)
+
+    result, metrics = run_noisy_chunk_pipeline(
+        predict_noise=fake_predict_noise,
+        scheduler=_StubChunkScheduler(),
+        timesteps=torch.tensor([900.0, 700.0, 500.0, 300.0, 100.0]),
+        shape=shape,
+        chunks=chunks,
+        cond_frames=t_l,
+        gap=1,
+        seed=0,
+        device=torch.device("cpu"),
+        schedule="serial",
+        initial_latents=initial_latents,
+        step_noises=step_noises,
+        kv_history_chunks=2,
+    )
+
+    del result
+    assert checked > 0
+    assert metrics["serial_semantics"] == "clean"
+    assert metrics["kv_evicted_versions"] == chunks * (4 + 2) * 2
+
+
+def test_chunk_kv_world_two_matches_whole_transformer(monkeypatch) -> None:
+    """The two-stage layer-split KV run must reproduce the single-process result.
+
+    The rank split only partitions layers, and every random draw is shared
+    through initial_latents and step_noises, so the final latent is expected
+    to be bit-identical across world sizes -- the chunk-pipeline counterpart
+    of WaveServe's "vertical and horizontal produce identical latents" check.
+    """
+    chunks, t_l = 2, 2
+    shape = (1, 4, t_l, 1, 1)
+    initial_latents = torch.randn((1, 4, chunks * t_l, 1, 1), generator=torch.Generator().manual_seed(11))
+    step_noises = [
+        torch.randn(initial_latents.shape, generator=torch.Generator().manual_seed(101 + step)) for step in range(2)
+    ]
+    common = dict(
+        scheduler=_StubChunkScheduler(),
+        timesteps=torch.tensor([900.0, 500.0, 100.0]),
+        shape=shape,
+        chunks=chunks,
+        cond_frames=t_l,
+        gap=1,
+        seed=0,
+        device=torch.device("cpu"),
+        schedule="stepwise",
+        initial_latents=initial_latents,
+        step_noises=step_noises,
+        kv_history_chunks=2,
+    )
+
+    # Two threads with rank-aware stubs and clone-forwarding queues: the two
+    # stages actually exchange the tensors they produced, like the real P2P
+    # wait, so a dropped or swapped payload breaks the bit-equality check.
+    # (timesteps len 3 → step_noises len 2 = last_denoise; stepwise uses the
+    # latest-version planner, so this also exercises the pre-existing path.)
+    exchange = {0: queue.Queue(), 1: queue.Queue()}
+    rank_state = threading.local()
+
+    split_stages = False
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+    ):
+        del timestep, temporal_offset, step_idx, intermediate_tensors
+        if kv_context is not None:
+            version = torch.full_like(model_input, kv_context.task[0] * 10 + kv_context.task[1])
+            kv_context.append(0, version, version)
+        # Only the split two-stage run hands intermediates to the peer via the
+        # payload; the whole-transformer baseline returns the noise tensor.
+        if split_stages and getattr(rank_state, "rank", 0) == 0:
+            return IntermediateTensors({"hidden_states": torch.zeros_like(model_input)})
+        return torch.zeros_like(model_input)
+
+    _patch_cpu_chunk_pp_runtime(monkeypatch, world_size=1)
+    whole, _ = run_noisy_chunk_pipeline(predict_noise=fake_predict_noise, **common)
+    split_stages = True
+
+    class _ThreadedPP:
+        world_size = 2
+        device_group = None
+        cpu_group = None
+
+        @property
+        def rank_in_group(self):
+            return rank_state.rank
+
+        def isend_tensor_dict(self, payload, dst=None):
+            del dst
+            exchange[rank_state.rank].put({key: value.clone() for key, value in payload.items()})
+            return [_CompletedWork()]
+
+        def irecv_tensor_dict(self, src=None):
+            del src
+            payload = exchange[1 - rank_state.rank].get()
+            return payload, [_CompletedWork()], [lambda: None]
+
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.chunk_pipeline_parallel.get_pp_group", lambda: _ThreadedPP())
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.chunk_pipeline_parallel.dist.barrier", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.chunk_pipeline_parallel.dist.all_gather_object",
+        lambda out, payload, group=None: out.__setitem__(slice(None), [payload] * len(out)),
+    )
+
+    results = {}
+
+    def run_rank(rank):
+        rank_state.rank = rank
+        results[rank] = run_noisy_chunk_pipeline(predict_noise=fake_predict_noise, **common)
+
+    threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Only rank zero holds the final latents; rank one returns placeholder zeros.
+    torch.testing.assert_close(results[0][0], whole, rtol=0, atol=0)

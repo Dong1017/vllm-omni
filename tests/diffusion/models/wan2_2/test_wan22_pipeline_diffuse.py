@@ -648,6 +648,114 @@ def test_chunk_pipeline_publishes_precomputed_denoise_timesteps(monkeypatch) -> 
     assert [normalized for _, _, normalized in recorded] == pytest.approx([0.9, 0.5, 0.1, 0.0])
 
 
+def test_select_dit_routes_steps_by_boundary_timestep() -> None:
+    """CausalWan DMD routes each step to the tower its timestep belongs to."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    # The stub scheduler already exposes num_train_timesteps=1000.
+    assert [pipeline._select_dit(torch.tensor(t)) for t in CAUSALWAN_DMD_TIMESTEPS] == [
+        high,
+        low,
+        low,
+        low,
+        low,
+        low,
+        low,
+        low,
+    ]
+    # The clean pass (t=0) also runs on the low-noise tower.
+    assert pipeline._select_dit(torch.tensor(0.0)) is low
+    assert pipeline._select_dit(1000.0) is high
+
+
+def test_select_dit_falls_back_to_single_tower() -> None:
+    """FastWan's single-tower checkpoint keeps routing to its only transformer."""
+    pipeline = _make_pipeline()
+    only = _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = only, None
+    pipeline.boundary_ratio = 0.875
+    assert pipeline._select_dit(torch.tensor(100.0)) is only
+    assert pipeline._select_dit(torch.tensor(1000.0)) is only
+
+
+def test_diffuse_chunks_accepts_eight_step_causalwan_schedule(monkeypatch) -> None:
+    """The CausalWan 8-step DMD schedule runs through the chunk pipeline."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    high.start_layer, high.end_layer = 0, 1
+    low.start_layer, low.end_layer = 0, 1
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    timesteps = torch.tensor(CAUSALWAN_DMD_TIMESTEPS)
+    latents = torch.zeros((1, 4, 2, 1, 1), dtype=torch.float32)
+    routed: list[tuple[int, object]] = []
+    towers: list[object] = []
+    step_noises_used: list[object] = []
+
+    def fake_run_noisy_chunk_pipeline(**kwargs):
+        assert len(kwargs["timesteps"]) == 8
+        # One shared re-noising tensor per transition (8 steps → 7).
+        assert len(kwargs["step_noises"]) == 7
+        step_noises_used.append([t.shape for t in kwargs["step_noises"]])
+        model_input = kwargs["initial_latents"]
+        for step_idx in range(9):
+            timestep = kwargs["timesteps"][step_idx : step_idx + 1] if step_idx < 8 else timesteps.new_zeros(1)
+            kwargs["predict_noise"](model_input, timestep, 0, step_idx)
+        return kwargs["initial_latents"], {}
+
+    def fake_predict_noise(**kwargs):
+        towers.append(kwargs["current_model"])
+        return torch.zeros_like(kwargs["hidden_states"])
+
+    def record(step_idx, timestep=None, normalized_timestep=None, **kwargs):
+        del kwargs
+        routed.append((step_idx, normalized_timestep))
+
+    pipeline.predict_noise = fake_predict_noise  # type: ignore[method-assign]
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.run_noisy_chunk_pipeline",
+        fake_run_noisy_chunk_pipeline,
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
+    req = SimpleNamespace(
+        num_reqs=1,
+        sampling_params_list=[
+            SimpleNamespace(
+                extra_args={"chunk_frames": 5, "chunk_conditioning": "latest_kv", "kv_history_chunks": 1},
+                num_outputs_per_prompt=1,
+                seed=1,
+            )
+        ],
+    )
+
+    result = pipeline._diffuse_chunks(
+        req,
+        latents,
+        timesteps,
+        torch.zeros(1, 2, 8),
+        torch.float32,
+        torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert result is latents
+    # 8 denoise steps route their towers through _select_dit (step 0 → high,
+    # the rest → low); the t=0 clean pass is synthetic and does not consume a
+    # re-noising tensor.
+    assert len(step_noises_used[0]) == 7
+    assert towers == [high] + [low] * 8
+    assert [(step_idx, normalized) for step_idx, normalized in routed][-1] == (8, 0.0)
+    assert [normalized for _, normalized in routed] == pytest.approx(
+        [t / 1000.0 for t in CAUSALWAN_DMD_TIMESTEPS] + [0.0]
+    )
+
+
 def _make_gate_loading_pipeline():
     pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
