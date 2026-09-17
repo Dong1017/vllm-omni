@@ -20,12 +20,20 @@ ChunkStep = tuple[int, int]
 
 
 def plan_chunk_pipeline(
-    chunks: int, gap: int, world: int, schedule: str = "stepwise", *, kv: bool = False
+    chunks: int,
+    gap: int,
+    world: int,
+    schedule: str = "stepwise",
+    *,
+    kv: bool = False,
+    num_denoise_steps: int = 3,
 ) -> list[tuple[ChunkStep | None, ...]]:
     """Plan stage work using only results completed before the current slot."""
     if chunks < 1 or gap not in (1, 2) or world not in (1, 2):
         raise ValueError("Chunk pipeline requires positive chunks, gap 1/2 and one/two stages")
-    steps = 4 if kv else 3
+    if num_denoise_steps < 1:
+        raise ValueError("Chunk pipeline requires a positive number of denoise steps")
+    steps = num_denoise_steps + 1 if kv else num_denoise_steps
     if schedule == "serial":
         jobs = [(chunk, step) for chunk in range(chunks) for step in range(steps)]
     elif schedule == "stepwise":
@@ -65,9 +73,11 @@ def plan_chunk_pipeline(
 def plan_latest_kv_sources(slots, history_chunks: int):
     """Freeze latest completed versions BEFORE a slot, separately per layer stage.
 
-    A serial replay uses these same versions, even if newer versions have already
-    been computed. This isolates scheduling from a change in attention inputs.
-    Step 3 is a forward at t=0 on the final clean sample; it does not denoise.
+    Stepwise history therefore concatenates the highest finished denoise or
+    clean step of each history chunk; the serial schedule does not call this
+    planner (it uses ``plan_clean_kv_sources``). Every history chunk in the
+    window must have a finished version on the reading rank. The extra final
+    step is a forward at t=0 on the clean sample; it does not denoise.
     """
     if history_chunks < 1:
         raise ValueError("KV history must contain at least one chunk")
@@ -77,13 +87,41 @@ def plan_latest_kv_sources(slots, history_chunks: int):
         for rank, task in enumerate(tasks):
             if task is not None:
                 chunk, _ = task
-                sources[rank][task] = tuple(
-                    (c, latest[rank][c]) for c in range(max(0, chunk - history_chunks), chunk) if c in latest[rank]
-                )
+                window = range(max(0, chunk - history_chunks), chunk)
+                missing = [c for c in window if c not in latest[rank]]
+                if missing:
+                    raise RuntimeError(
+                        f"Task {task} on rank {rank} is scheduled before history chunks {missing} "
+                        "have a finished version on that rank"
+                    )
+                sources[rank][task] = tuple((c, latest[rank][c]) for c in window)
         for rank, task in enumerate(tasks):
             if task is not None:
                 chunk, step = task
                 latest[rank][chunk] = step
+    return sources
+
+
+def plan_clean_kv_sources(slots, history_chunks: int, clean_step: int):
+    """Serial Self Forcing: each chunk concatenates predecessors' clean KV only.
+
+    Serial ordering guarantees every chunk in the window has run its clean pass
+    (task (chunk, clean_step)) before the reading chunk starts, so the sources
+    do not depend on slot completion. The clean pass publishes its KV and does
+    not denoise.
+    """
+    if history_chunks < 1:
+        raise ValueError("KV history must contain at least one chunk")
+    if clean_step < 0:
+        raise ValueError("Clean KV step must be non-negative")
+    sources = [{} for _ in slots[0]]
+    for tasks in slots:
+        for rank, task in enumerate(tasks):
+            if task is None:
+                continue
+            chunk, _ = task
+            start = max(0, chunk - history_chunks)
+            sources[rank][task] = tuple((c, clean_step) for c in range(start, chunk))
     return sources
 
 
@@ -151,7 +189,9 @@ def run_noisy_chunk_pipeline(
     pp = get_pp_group()
     rank, world = pp.rank_in_group, pp.world_size
     kv = kv_history_chunks is not None
-    slots = plan_chunk_pipeline(chunks, gap, world, schedule, kv=kv)
+    num_denoise_steps = len(timesteps)
+    last_denoise = num_denoise_steps - 1
+    slots = plan_chunk_pipeline(chunks, gap, world, schedule, kv=kv, num_denoise_steps=num_denoise_steps)
     kv_layers = {}
     kv_sources = None
     kv_remaining = None
@@ -160,18 +200,28 @@ def run_noisy_chunk_pipeline(
     kv_evicted = 0
     kv_peak_retained_bytes = 0
     if kv:
-        reference_slots = plan_chunk_pipeline(chunks, gap, world, "stepwise", kv=True)
-        kv_sources = plan_latest_kv_sources(reference_slots, kv_history_chunks)[rank]
-        if initial_latents is None or step_noises is None or len(step_noises) != 2:
-            raise ValueError("KV execution requires the shared full-video initial sample and two re-noising tensors")
+        # The serial execution order is frozen before slots run, so both
+        # semantics select from the same fixed plan; only the source versions
+        # differ (latest finished vs. the clean pass only).
+        if schedule == "serial":
+            kv_sources = plan_clean_kv_sources(slots, kv_history_chunks, num_denoise_steps)[rank]
+        else:
+            reference_slots = plan_chunk_pipeline(
+                chunks, gap, world, "stepwise", kv=True, num_denoise_steps=num_denoise_steps
+            )
+            kv_sources = plan_latest_kv_sources(reference_slots, kv_history_chunks)[rank]
+        if initial_latents is None or step_noises is None or len(step_noises) != last_denoise:
+            raise ValueError(
+                "KV execution requires the shared full-video initial sample and one re-noising tensor per transition"
+            )
         # Each task's stored KV is consumed by the later same-rank tasks that
         # list it in their frozen sources. Zero-consumer tasks free immediately.
         kv_remaining = {task: 0 for task in kv_sources}
         for sources in kv_sources.values():
             for source in sources:
                 kv_remaining[source] += 1
-    if len(timesteps) != 3 or not 1 <= cond_frames <= shape[2]:
-        raise ValueError("Chunk pipeline requires three DMD steps and a valid condition prefix")
+    if num_denoise_steps < 1 or not 1 <= cond_frames <= shape[2]:
+        raise ValueError("Chunk pipeline requires DMD timesteps and a valid condition prefix")
     t_l, length = shape[2], cond_frames
     current, generators, cache, clean_chunks = {}, {}, {}, {}
     records, slot_records = [], []
@@ -188,12 +238,12 @@ def run_noisy_chunk_pipeline(
 
     def has_consumer(task):
         chunk, step = task
-        return not kv and chunk + 1 < chunks and step + gap < 3
+        return not kv and chunk + 1 < chunks and step + gap < num_denoise_steps
 
     def accept_feedback(task, payload):
         chunk, step = task
         current[chunk] = payload["latents"]
-        if step == 2:
+        if step == last_denoise:
             clean_chunks[chunk] = current[chunk]
         if has_consumer(task):
             source = current[chunk][:, :, -length:] if gap == 1 else payload["condition"]
@@ -257,7 +307,7 @@ def run_noisy_chunk_pipeline(
         record = None
         if task is not None:
             chunk, step = task
-            clean_pass = kv and step == 3
+            clean_pass = kv and step == num_denoise_steps
             t = timesteps.new_zeros(()) if clean_pass else timesteps[step]
             if step == 0:
                 initialize_chunk(chunk)
@@ -317,7 +367,7 @@ def run_noisy_chunk_pipeline(
                 clean = model_input if clean_pass else scheduler.predict_clean(prediction, model_input[:, :, -t_l:], t)
                 if kv and not clean_pass:
                     clean = clean.to(prediction.dtype)
-                if step < 2:
+                if step < last_denoise:
                     noise = (
                         step_noises[step][:, :, chunk * t_l : (chunk + 1) * t_l].contiguous()
                         if kv
@@ -459,7 +509,12 @@ def run_noisy_chunk_pipeline(
         metrics.update(
             conditioning="per_layer_latest_kv",
             kv_history_chunks=kv_history_chunks,
-            kv_version_policy="latest completed before logical stepwise slot; serial replays identical versions",
+            serial_semantics="clean" if schedule == "serial" else "replay",
+            kv_version_policy=(
+                "latest completed before logical stepwise slot; serial replays identical versions"
+                if schedule == "stepwise"
+                else "serial uses predecessors' clean-pass KV only (Self Forcing)"
+            ),
             kv_live_versions=max(item["kv_live_versions"] for item in all_metrics),
             kv_evicted_versions=sum(item["kv_evicted_versions"] for item in all_metrics),
             kv_retained_bytes_est=max(item["kv_retained_bytes_est"] for item in all_metrics),
