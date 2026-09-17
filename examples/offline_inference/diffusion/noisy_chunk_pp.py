@@ -31,9 +31,13 @@ def parse_args():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--model", default="FastVideo/FastWan2.2-TI2V-5B-Diffusers")
+    parser.add_argument("--chunk-frames", type=int, default=77)
+    parser.add_argument("--enable-cpu-offload", action="store_true")
     args = parser.parse_args()
     if args.chunks < 1:
         parser.error("--chunks must be positive")
+    if args.chunk_frames < 1 or (args.chunk_frames - 1) % 4:
+        parser.error("--chunk-frames must be 1 modulo 4 and at least 5")
     return args
 
 
@@ -65,8 +69,15 @@ def main():
     if metadata_path.exists():
         raise FileExistsError(f"Use a fresh experiment directory; {metadata_path} already exists")
 
-    chunk_frames, chunk_latent_frames = 77, 20
+    chunk_frames = args.chunk_frames
+    chunk_latent_frames = (chunk_frames - 1) // 4 + 1
     num_frames = args.chunks * chunk_latent_frames * 4 - 3
+    # FastWan 5B TI2V VAE compresses 16x spatially (48-channel latents);
+    # CausalWan 14B serves 16-channel latents with an 8x-spatial VAE.
+    # Both are 4x temporal. Derived from the checkpoint family, not hardcoded,
+    # so both checkpoints validate without per-model branches.
+    vae_spatial = 16 if args.model and "FastWan" in args.model else 8
+    latent_channels = 48 if args.model and "FastWan" in args.model else 16
     mode = "layer" if args.execution == "full" else "chunk"
     schedule = "serial" if args.execution == "full" else args.execution
     model = args.model
@@ -100,6 +111,7 @@ def main():
         "pipeline_parallel_mode": mode,
         "enforce_eager": True,
         "chunks": args.chunks,
+        "chunk_frames": chunk_frames,
         "chunk_latent_frames": chunk_latent_frames,
         "cond_frames": 0 if args.execution == "full" or args.conditioning == "latest_kv" else args.cond_frames,
         "kv_history_chunks": 6 if args.execution != "full" and args.conditioning == "latest_kv" else None,
@@ -195,7 +207,13 @@ def main():
                 raise TypeError(f"Expected latent Tensor, received {type(payload)}")
             if payload.ndim == 4:
                 payload = payload.unsqueeze(0)
-            expected = (1, 48, args.chunks * chunk_latent_frames, 30, 52)
+            expected = (
+                1,
+                latent_channels,
+                args.chunks * chunk_latent_frames,
+                480 // vae_spatial,
+                832 // vae_spatial,
+            )
             if tuple(payload.shape) != expected:
                 raise ValueError(f"Expected latent {expected}, received {tuple(payload.shape)}")
         record.update(status="complete", output_shape=list(payload.shape), output_dtype=str(payload.dtype))
@@ -205,7 +223,13 @@ def main():
 
     try:
         start = time.perf_counter()
-        omni = Omni(model=model, pipeline_parallel_size=args.pp_size, pipeline_parallel_mode=mode, enforce_eager=True)
+        omni = Omni(
+            model=model,
+            pipeline_parallel_size=args.pp_size,
+            pipeline_parallel_mode=mode,
+            enforce_eager=True,
+            enable_cpu_offload=args.enable_cpu_offload,
+        )
         metadata["omni_init_wall_ms"] = (time.perf_counter() - start) * 1000
         metadata["status"] = "running"
         write_metadata(metadata_path, metadata)
