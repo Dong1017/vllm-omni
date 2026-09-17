@@ -309,7 +309,7 @@ def test_chunk_pipeline_dummy_request_uses_t2v_dmd_contract(
             "cfg_img_scale": 1.0,
             "chunk_frames": 1,
             "chunk_cond_frames": 1,
-            "chunk_lag": 1,
+            "chunk_gap": 1,
         }
         get_num_frames.assert_called_once_with("mock_model", False)
     else:

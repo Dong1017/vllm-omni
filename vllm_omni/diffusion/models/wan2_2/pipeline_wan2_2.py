@@ -552,11 +552,13 @@ class Wan22Pipeline(
         return (transformer.start_layer, transformer.end_layer)
 
     def _select_dit(self, timestep) -> WanTransformer3DModel:
-        """Single-step tower lookup kept for one-off calls outside the hot loop.
+        """Single-timestep tower lookup; a test oracle for ``_dit_router``.
 
-        The chunk pipeline uses ``_dit_router`` instead, which precomputes the
-        per-step tower choice from materialized timestep values and avoids a
-        device-to-host synchronization per slot.
+        Production paths never call this: the chunk pipeline uses the
+        precomputed ``_dit_router`` table and the native path resolves the
+        tower inside ``diffuse()``. This method exists so tests can pin the
+        routing semantics (boundary comparison, single-tower fallback)
+        against the table on plain values.
         """
         value = timestep.reshape(-1)[0] if isinstance(timestep, torch.Tensor) else timestep
         t = float(value)

@@ -127,7 +127,7 @@ def main():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "model": model,
         "model_class_name": class_name,
-        "dmd_timesteps": list(dmd_timesteps),
+        "assumed_dmd_timesteps": list(dmd_timesteps),
         "scheduler_shift": scheduler_shift,
         "enable_cpu_offload": args.enable_cpu_offload,
         "kv_source_policy": args.kv_policy if args.conditioning == "latest_kv" else None,

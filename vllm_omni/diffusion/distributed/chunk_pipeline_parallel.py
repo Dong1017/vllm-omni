@@ -20,12 +20,12 @@ ChunkStep = tuple[int, int]
 
 # Request extra_args keys shared by the engine dummy request, the pipeline,
 # the benchmark client and tests. Keep one source of truth; the engine dummy
-# request historically sent "chunk_lag" while the pipeline read "chunk_gap".
+# request historically sent "chunk_lag" while the pipeline read "chunk_gap",
+# so the canonical key is now CHUNK_GAP_KEY everywhere.
 CHUNK_SCHEDULE_KEY = "chunk_schedule"
 CHUNK_FRAMES_KEY = "chunk_frames"
 CHUNK_COND_FRAMES_KEY = "chunk_cond_frames"
 CHUNK_GAP_KEY = "chunk_gap"
-CHUNK_LAG_KEY = "chunk_lag"
 CHUNK_CONDITIONING_KEY = "chunk_conditioning"
 KV_HISTORY_CHUNKS_KEY = "kv_history_chunks"
 KV_SOURCE_POLICY_KEY = "kv_source_policy"
