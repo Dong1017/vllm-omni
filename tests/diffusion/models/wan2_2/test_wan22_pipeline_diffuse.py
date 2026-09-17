@@ -682,6 +682,38 @@ def test_select_dit_falls_back_to_single_tower() -> None:
     assert pipeline._select_dit(torch.tensor(1000.0)) is only
 
 
+def test_dit_router_precomputes_per_step_towers() -> None:
+    """The router materializes every step's tower once, clean pass included.
+
+    The chunk pipeline uses this table instead of reading a CUDA scalar per
+    slot, so the choice must match _select_dit for every denoise step and
+    route the synthetic t=0 clean pass to the low-noise tower.
+    """
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    timesteps = torch.tensor(CAUSALWAN_DMD_TIMESTEPS)
+
+    router = pipeline._dit_router(timesteps, pipeline._request_boundary_timestep())
+    assert len(router) == len(CAUSALWAN_DMD_TIMESTEPS) + 1
+    assert router[: len(CAUSALWAN_DMD_TIMESTEPS)] == [high] + [low] * (len(CAUSALWAN_DMD_TIMESTEPS) - 1)
+    assert router[-1] is low
+
+    # A request-level boundary overrides the engine default.
+    request_router = pipeline._dit_router(timesteps, boundary_timestep=900.0)
+    assert request_router[0] is high  # 1000 >= 900
+    assert request_router[1] is low  # 850 < 900
+    assert request_router[2] is low  # 700 < 900
+
+    # Single-tower checkpoints collapse to their only transformer.
+    pipeline.transformer_2 = None
+    single = pipeline._dit_router(timesteps, pipeline._request_boundary_timestep())
+    assert all(model is high for model in single)
+
+
 def test_diffuse_chunks_accepts_eight_step_causalwan_schedule(monkeypatch) -> None:
     """The CausalWan 8-step DMD schedule runs through the chunk pipeline."""
     from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS

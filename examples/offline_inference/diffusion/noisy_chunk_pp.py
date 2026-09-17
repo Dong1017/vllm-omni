@@ -27,6 +27,13 @@ def parse_args():
     parser.add_argument("--cond-frames", type=int, choices=range(1, 21), default=4)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--conditioning", choices=("latent", "latest_kv"), default="latent")
+    parser.add_argument(
+        "--kv-policy",
+        choices=("latest", "clean"),
+        default="latest",
+        help="KV source policy: latest = replay control (serial+latest replays stepwise "
+        "versions); clean = Self Forcing (serial only, predecessors' clean-pass KV)",
+    )
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -72,12 +79,30 @@ def main():
     chunk_frames = args.chunk_frames
     chunk_latent_frames = (chunk_frames - 1) // 4 + 1
     num_frames = args.chunks * chunk_latent_frames * 4 - 3
-    # FastWan 5B TI2V VAE compresses 16x spatially (48-channel latents);
-    # CausalWan 14B serves 16-channel latents with an 8x-spatial VAE.
-    # Both are 4x temporal. Derived from the checkpoint family, not hardcoded,
-    # so both checkpoints validate without per-model branches.
-    vae_spatial = 16 if args.model and "FastWan" in args.model else 8
-    latent_channels = 48 if args.model and "FastWan" in args.model else 16
+    if args.kv_policy == "clean" and args.execution != "serial":
+        raise ValueError("--kv-policy clean requires --execution serial")
+    # Detect the checkpoint family from model_index.json's _class_name — the
+    # same signal the pipeline itself uses — instead of matching the model
+    # path, so repo IDs and local paths without the family name behave alike.
+    model_index_path = Path(args.model) / "model_index.json"
+    if not model_index_path.exists():
+        raise FileNotFoundError(f"--model must be a local diffusers directory with model_index.json: {args.model}")
+    class_name = json.loads(model_index_path.read_text()).get("_class_name", "")
+    is_fastwan = class_name == "WanDMDPipeline"
+    is_causalwan = class_name == "WanCausalDMDPipeline"
+    if not (is_fastwan or is_causalwan):
+        raise ValueError(f"Unsupported DMD checkpoint class {class_name!r} in {model_index_path}")
+    if is_fastwan:
+        dmd_timesteps = (1000.0, 757.0, 522.0)
+        scheduler_shift = 8.0
+        # FastWan 5B TI2V VAE compresses 16x spatially into 48-channel latents.
+        vae_spatial, latent_channels = 16, 48
+    else:
+        dmd_timesteps = (1000.0, 850.0, 700.0, 550.0, 350.0, 275.0, 200.0, 125.0)
+        scheduler_shift = 12.0
+        # CausalWan 14B serves 16-channel latents with an 8x-spatial VAE.
+        vae_spatial, latent_channels = 8, 16
+    num_inference_steps = len(dmd_timesteps)
     mode = "layer" if args.execution == "full" else "chunk"
     schedule = "serial" if args.execution == "full" else args.execution
     model = args.model
@@ -101,6 +126,11 @@ def main():
         "torch_version": torch.__version__,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "model": model,
+        "model_class_name": class_name,
+        "dmd_timesteps": list(dmd_timesteps),
+        "scheduler_shift": scheduler_shift,
+        "enable_cpu_offload": args.enable_cpu_offload,
+        "kv_source_policy": args.kv_policy if args.conditioning == "latest_kv" else None,
         "prompt": prompt,
         "samples": samples,
         "conditioning": "full_attention" if args.execution == "full" else args.conditioning,
@@ -119,7 +149,7 @@ def main():
         "height": 480,
         "width": 832,
         "num_frames": num_frames,
-        "num_inference_steps": 3,
+        "num_inference_steps": num_inference_steps,
         "seed": 1024,
         "guidance_scale": 1.0,
         "warmup_iterations": args.warmups,
@@ -149,13 +179,17 @@ def main():
             "experiment_iteration": iteration,
         }
         if args.conditioning == "latest_kv":
-            extra_args.update(chunk_conditioning="latest_kv", kv_history_chunks=6)
+            extra_args.update(
+                chunk_conditioning="latest_kv",
+                kv_history_chunks=6,
+                kv_source_policy=args.kv_policy,
+            )
         # New params / extra_args per call; no generator or request state reused.
         sampling = OmniDiffusionSamplingParams(
             height=480,
             width=832,
             num_frames=num_frames,
-            num_inference_steps=3,
+            num_inference_steps=num_inference_steps,
             seed=seed,
             guidance_scale=1.0,
             output_type=output_type,
@@ -277,6 +311,20 @@ def main():
                 }
                 write_metadata(metadata_path, metadata)
                 del latent, saved
+
+            stepwise_latent_artifact = metadata["artifacts"].get(f"{sample_id}:latents")
+            serial_latent_artifact = metadata["artifacts"].get(f"{sample_id}:serial_latents")
+            if stepwise_latent_artifact and serial_latent_artifact:
+                stepwise_latents = torch.load(stepwise_latent_artifact["path"], weights_only=True)
+                serial_latents = torch.load(serial_latent_artifact["path"], weights_only=True)
+                max_abs_diff = float((stepwise_latents - serial_latents).abs().max())
+                parity = {"max_abs_diff": max_abs_diff, "identical": max_abs_diff == 0.0}
+                metadata.setdefault("validation_conclusions", {})[f"{sample_id}:serial_vs_stepwise"] = parity
+                write_metadata(metadata_path, metadata)
+                print(f"LAYER_STEP_PARITY {json.dumps({'sample': sample_id, **parity})}", flush=True)
+                if not parity["identical"]:
+                    raise ValueError(f"serial replay latents diverge from stepwise: max_abs_diff={max_abs_diff}")
+                del stepwise_latents, serial_latents
         metadata["status"] = "complete"
         metadata["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         write_metadata(metadata_path, metadata)

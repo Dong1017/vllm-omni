@@ -1066,7 +1066,7 @@ class DiffusionEngine:
             # Three one-latent chunks exercise both ranks, condition prefixes,
             # and a slot with bidirectional P2P, including the return direction.
             num_frames = 9
-            extra_args.update(chunk_frames=1, chunk_cond_frames=1, chunk_lag=1)
+            extra_args.update(chunk_frames=1, chunk_cond_frames=1, chunk_gap=1)
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(

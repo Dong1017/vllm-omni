@@ -246,16 +246,21 @@ def _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1, peer
         )
 
 
-# Peaks for 6 chunks, 4 steps, H-history conditioning. The stepwise reference
-# freezes sources before each slot (peak 3 at H=1, 6 at H=6); serial consumes
-# only predecessors' clean passes (peak 2 at H=1, 6 at H=6). Each rank executes
-# every task once, so 24 versions are published and evicted per rank (48
-# across PP2).
+# Peaks for 6 chunks, 4 steps, H-history conditioning, default kv_source_policy
+# "latest". Sources are frozen against the stepwise reference plan under both
+# schedules (serial is the replay control), but serial's consumption order
+# releases frozen versions later than stepwise: every chunk runs all its steps
+# before the next chunk starts, so predecessors' later versions stay resident
+# until the reading chunk begins. Stepwise peak 3 at H=1 / 6 at H=6; serial
+# replay peak 5 at H=1 / 9 at H=6. The clean policy's serial peaks (2 at H=1 /
+# 6 at H=6) are covered by the dedicated clean-semantics test. Each rank
+# executes every task once, so 24 versions are published and evicted per rank
+# (48 across PP2).
 _EXPECTED_PEAKS = {
     (1, "stepwise"): 3,
-    (1, "serial"): 2,
+    (1, "serial"): 5,
     (6, "stepwise"): 6,
-    (6, "serial"): 6,
+    (6, "serial"): 9,
 }
 
 
@@ -389,10 +394,10 @@ def test_clean_kv_sources_target_only_clean_passes():
 
 
 def test_chunk_kv_serial_semantics_selects_clean_versions(monkeypatch) -> None:
-    """Serial-conditioned tasks must read the predecessors' clean-pass KV.
+    """With the clean policy, serial tasks read the predecessors' clean-pass KV.
 
-    The replay semantics would freeze the latest finished version before each
-    slot; the clean semantics always point at (chunk, clean_step) instead.
+    The replay policy would freeze the latest finished version before each
+    slot; the clean policy always points at (chunk, clean_step) instead.
     """
     chunks, t_l, layers_count = 3, 2, 3
     shape = (1, 4, t_l, 1, 1)
@@ -435,12 +440,88 @@ def test_chunk_kv_serial_semantics_selects_clean_versions(monkeypatch) -> None:
         initial_latents=initial_latents,
         step_noises=step_noises,
         kv_history_chunks=2,
+        kv_source_policy="clean",
     )
 
     del result
     assert checked > 0
-    assert metrics["serial_semantics"] == "clean"
+    assert metrics["kv_source_policy"] == "clean"
     assert metrics["kv_evicted_versions"] == chunks * (4 + 2) * 2
+
+
+def test_chunk_kv_clean_policy_rejects_stepwise(monkeypatch) -> None:
+    """The clean policy depends on serial ordering; stepwise must reject it."""
+    _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1, peer_payload_shape=(1, 4, 2, 1, 1))
+    with pytest.raises(ValueError, match="clean KV source policy requires the serial schedule"):
+        run_noisy_chunk_pipeline(
+            predict_noise=lambda *args, **kwargs: torch.zeros(1, 4, 2, 1, 1),
+            scheduler=_StubChunkScheduler(),
+            timesteps=torch.tensor([900.0]),
+            shape=(1, 4, 2, 1, 1),
+            chunks=2,
+            cond_frames=2,
+            gap=1,
+            seed=0,
+            device=torch.device("cpu"),
+            schedule="stepwise",
+            initial_latents=torch.zeros((1, 4, 4, 1, 1)),
+            step_noises=[torch.zeros((1, 4, 4, 1, 1))],
+            kv_history_chunks=1,
+            kv_source_policy="clean",
+        )
+
+
+def test_chunk_kv_serial_latest_replays_stepwise_sources(monkeypatch) -> None:
+    """Serial + latest is the replay control: identical sources to stepwise.
+
+    The version consumed by a (chunk, step) task must be the same under both
+    schedules so a serial re-run isolates the schedule's contribution without
+    changing the attention history.
+    """
+    chunks, t_l, layers_count = 3, 2, 2
+    shape = (1, 4, t_l, 1, 1)
+    _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=1, world_size=2, peer_payload_shape=shape)
+    initial_latents = torch.zeros((1, 4, chunks * t_l, 1, 1), dtype=torch.float32)
+    step_noises = [torch.zeros_like(initial_latents) for _ in range(2)]
+    observed = {}
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None
+    ):
+        del timestep, temporal_offset, step_idx, intermediate_tensors
+        if kv_context is not None:
+            observed[kv_context.task] = tuple(kv_context.sources)
+            for layer in range(layers_count):
+                kv_context.append(
+                    layer,
+                    torch.full_like(model_input, kv_context.task[1]),
+                    torch.full_like(model_input, kv_context.task[1]),
+                )
+        return torch.zeros_like(model_input)
+
+    common = dict(
+        predict_noise=fake_predict_noise,
+        scheduler=_StubChunkScheduler(),
+        timesteps=torch.tensor([900.0, 500.0, 100.0]),
+        shape=shape,
+        chunks=chunks,
+        cond_frames=t_l,
+        gap=1,
+        seed=0,
+        device=torch.device("cpu"),
+        initial_latents=initial_latents,
+        step_noises=step_noises,
+        kv_history_chunks=2,
+        kv_source_policy="latest",
+    )
+    _, serial_metrics = run_noisy_chunk_pipeline(schedule="serial", **common)
+    serial_sources = dict(observed)
+    observed.clear()
+    _, stepwise_metrics = run_noisy_chunk_pipeline(schedule="stepwise", **common)
+
+    assert serial_sources == observed
+    assert serial_metrics["kv_source_policy"] == "latest"
+    assert stepwise_metrics["kv_source_policy"] == "latest"
 
 
 def test_chunk_kv_world_two_matches_whole_transformer(monkeypatch) -> None:

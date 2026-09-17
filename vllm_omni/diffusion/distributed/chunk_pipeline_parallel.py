@@ -18,6 +18,30 @@ from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 
 ChunkStep = tuple[int, int]
 
+# Request extra_args keys shared by the engine dummy request, the pipeline,
+# the benchmark client and tests. Keep one source of truth; the engine dummy
+# request historically sent "chunk_lag" while the pipeline read "chunk_gap".
+CHUNK_SCHEDULE_KEY = "chunk_schedule"
+CHUNK_FRAMES_KEY = "chunk_frames"
+CHUNK_COND_FRAMES_KEY = "chunk_cond_frames"
+CHUNK_GAP_KEY = "chunk_gap"
+CHUNK_LAG_KEY = "chunk_lag"
+CHUNK_CONDITIONING_KEY = "chunk_conditioning"
+KV_HISTORY_CHUNKS_KEY = "kv_history_chunks"
+KV_SOURCE_POLICY_KEY = "kv_source_policy"
+COLLECT_PP_METRICS_KEY = "collect_pp_metrics"
+EXPERIMENT_ITERATION_KEY = "experiment_iteration"
+
+# KV source policies, decoupled from the slot schedule:
+# - "latest": each chunk reads the highest finished version of its history
+#   chunks (``plan_latest_kv_sources``). Valid under both schedules; serial
+#   + latest is the replay control that isolates the schedule's contribution.
+# - "clean": each chunk reads only the clean pass of its history chunks
+#   (``plan_clean_kv_sources``). Requires the serial schedule, whose strict
+#   ordering guarantees the clean pass has run; this is the Self Forcing
+#   semantics aligned with the paper.
+KV_SOURCE_POLICIES = ("latest", "clean")
+
 
 def plan_chunk_pipeline(
     chunks: int,
@@ -73,11 +97,13 @@ def plan_chunk_pipeline(
 def plan_latest_kv_sources(slots, history_chunks: int):
     """Freeze latest completed versions BEFORE a slot, separately per layer stage.
 
-    Stepwise history therefore concatenates the highest finished denoise or
-    clean step of each history chunk; the serial schedule does not call this
-    planner (it uses ``plan_clean_kv_sources``). Every history chunk in the
-    window must have a finished version on the reading rank. The extra final
-    step is a forward at t=0 on the clean sample; it does not denoise.
+    The history of each chunk concatenates the highest finished denoise or
+    clean step of its history chunks as of the slot's position in the plan.
+    Valid under both schedules: under stepwise this is the algorithm as
+    designed, under serial it is the replay control (identical versions to
+    stepwise, no parallelism). Every history chunk in the window must have a
+    finished version on the reading rank. The extra final step is a forward
+    at t=0 on the clean sample; it does not denoise.
     """
     if history_chunks < 1:
         raise ValueError("KV history must contain at least one chunk")
@@ -178,6 +204,7 @@ def run_noisy_chunk_pipeline(
     initial_latents: torch.Tensor | None = None,
     step_noises: list[torch.Tensor] | None = None,
     kv_history_chunks: int | None = None,
+    kv_source_policy: str = "latest",
 ) -> tuple[torch.Tensor, dict]:
     """Run local layers and exchange activations/state in a common direction order.
 
@@ -200,15 +227,26 @@ def run_noisy_chunk_pipeline(
     kv_evicted = 0
     kv_peak_retained_bytes = 0
     if kv:
-        # The serial execution order is frozen before slots run, so both
-        # semantics select from the same fixed plan; only the source versions
-        # differ (latest finished vs. the clean pass only).
-        if schedule == "serial":
+        if kv_source_policy not in KV_SOURCE_POLICIES:
+            raise ValueError(f"KV source policy must be one of {KV_SOURCE_POLICIES}")
+        if kv_source_policy == "clean" and schedule != "serial":
+            raise ValueError(
+                "The clean KV source policy requires the serial schedule: only its strict "
+                "ordering guarantees every history chunk has run its clean pass"
+            )
+        # The "latest" policy always freezes sources against the stepwise
+        # reference plan: under stepwise that is the algorithm as designed,
+        # under serial it makes the run a replay control whose attention
+        # history is identical to the stepwise schedule's. The "clean" policy
+        # reads the serial plan's own completion order instead.
+        if kv_source_policy == "clean":
             kv_sources = plan_clean_kv_sources(slots, kv_history_chunks, num_denoise_steps)[rank]
         else:
-            reference_slots = plan_chunk_pipeline(
-                chunks, gap, world, "stepwise", kv=True, num_denoise_steps=num_denoise_steps
-            )
+            reference_slots = slots
+            if schedule != "stepwise":
+                reference_slots = plan_chunk_pipeline(
+                    chunks, gap, world, "stepwise", kv=True, num_denoise_steps=num_denoise_steps
+                )
             kv_sources = plan_latest_kv_sources(reference_slots, kv_history_chunks)[rank]
         if initial_latents is None or step_noises is None or len(step_noises) != last_denoise:
             raise ValueError(
@@ -509,11 +547,12 @@ def run_noisy_chunk_pipeline(
         metrics.update(
             conditioning="per_layer_latest_kv",
             kv_history_chunks=kv_history_chunks,
-            serial_semantics="clean" if schedule == "serial" else "replay",
+            kv_source_policy=kv_source_policy,
             kv_version_policy=(
-                "latest completed before logical stepwise slot; serial replays identical versions"
-                if schedule == "stepwise"
-                else "serial uses predecessors' clean-pass KV only (Self Forcing)"
+                "each chunk reads the highest finished version of its history chunks "
+                "(serial + latest is the replay control of the stepwise schedule)"
+                if kv_source_policy == "latest"
+                else "each chunk reads only the clean pass of its history chunks (Self Forcing)"
             ),
             kv_live_versions=max(item["kv_live_versions"] for item in all_metrics),
             kv_evicted_versions=sum(item["kv_evicted_versions"] for item in all_metrics),

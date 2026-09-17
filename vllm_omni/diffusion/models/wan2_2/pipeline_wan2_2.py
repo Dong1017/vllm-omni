@@ -22,7 +22,16 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_noisy_chunk_pipeline
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import (
+    CHUNK_COND_FRAMES_KEY,
+    CHUNK_CONDITIONING_KEY,
+    CHUNK_FRAMES_KEY,
+    CHUNK_GAP_KEY,
+    CHUNK_SCHEDULE_KEY,
+    KV_HISTORY_CHUNKS_KEY,
+    KV_SOURCE_POLICY_KEY,
+    run_noisy_chunk_pipeline,
+)
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -187,8 +196,6 @@ def create_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
     prefix: str = "",
-    *,
-    replicate_for_chunk_pipeline: bool = False,
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -233,8 +240,6 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix
-    if replicate_for_chunk_pipeline:
-        kwargs["replicate_for_chunk_pipeline"] = True
 
     return WanTransformer3DModel(**kwargs)
 
@@ -547,10 +552,15 @@ class Wan22Pipeline(
         return (transformer.start_layer, transformer.end_layer)
 
     def _select_dit(self, timestep) -> WanTransformer3DModel:
+        """Single-step tower lookup kept for one-off calls outside the hot loop.
+
+        The chunk pipeline uses ``_dit_router`` instead, which precomputes the
+        per-step tower choice from materialized timestep values and avoids a
+        device-to-host synchronization per slot.
+        """
         value = timestep.reshape(-1)[0] if isinstance(timestep, torch.Tensor) else timestep
         t = float(value)
-        ratio = self.boundary_ratio if self.boundary_ratio is not None else 0.875
-        boundary = ratio * self.scheduler.config.num_train_timesteps
+        boundary = self._request_boundary_timestep()
         if t < boundary and self.transformer_2 is not None:
             return self.transformer_2
         if self.transformer is not None:
@@ -559,12 +569,36 @@ class Wan22Pipeline(
             return self.transformer_2
         raise RuntimeError("No transformer available")
 
-    def _diffuse_chunks(self, req, latents, timesteps, prompt_embeds, dtype, generator):
+    def _request_boundary_timestep(self) -> float:
+        """Engine-configured boundary wins; fall back to the Wan2.2 default."""
+        if self.boundary_ratio is not None:
+            return self.boundary_ratio * self.scheduler.config.num_train_timesteps
+        return 0.875 * self.scheduler.config.num_train_timesteps
+
+    def _dit_router(self, timesteps: torch.Tensor, boundary_timestep: float):
+        """Precompute the per-step tower choice from materialized timestep values.
+
+        Index i selects the tower for denoise step i; the extra clean pass
+        (t=0, index len(timesteps)) always routes to the low-noise tower.
+        No device-to-host sync per slot: the values are materialized once.
+        """
+        values = tuple(float(value) for value in timesteps.detach().cpu().flatten().tolist())
+        if self.transformer_2 is None:
+            if self.transformer is None:
+                raise RuntimeError("No transformer available")
+            return [self.transformer] * (len(values) + 1)
+        if self.transformer is None:
+            return [self.transformer_2] * (len(values) + 1)
+        return [self.transformer_2 if value < boundary_timestep else self.transformer for value in values] + [
+            self.transformer_2
+        ]
+
+    def _diffuse_chunks(self, req, latents, timesteps, prompt_embeds, dtype, generator, boundary_timestep=None):
         params = req.sampling_params_list[0]
         if req.num_reqs != 1 or params.num_outputs_per_prompt != 1:
             raise ValueError("Chunk pipeline mode currently accepts one video request at a time")
         extra = params.extra_args or {}
-        chunk_frames = int(extra.get("chunk_frames", 77))
+        chunk_frames = int(extra.get(CHUNK_FRAMES_KEY, 77))
         scale = self.vae_scale_factor_temporal
         if chunk_frames < 1 or (chunk_frames - 1) % scale:
             raise ValueError("chunk_frames must be positive and 1 modulo the VAE temporal scale")
@@ -572,14 +606,14 @@ class Wan22Pipeline(
         if latents.shape[2] % chunk_t:
             raise ValueError("Total output latent frames must be divisible by the chunk latent length")
         chunks = latents.shape[2] // chunk_t
-        length = int(extra.get("chunk_cond_frames", min(4, chunk_t)))
-        gap = int(extra.get("chunk_gap", extra.get("chunk_lag", 1)))
-        schedule = extra.get("chunk_schedule", "stepwise")
+        length = int(extra.get(CHUNK_COND_FRAMES_KEY, min(4, chunk_t)))
+        gap = int(extra.get(CHUNK_GAP_KEY, 1))
+        schedule = extra.get(CHUNK_SCHEDULE_KEY, "stepwise")
         if isinstance(generator, list):
             generator = generator[0]
         seed = params.seed if params.seed is not None else generator.initial_seed() if generator is not None else 0
         shape = (*latents.shape[:2], chunk_t, *latents.shape[3:])
-        use_kv = extra.get("chunk_conditioning") == "latest_kv"
+        use_kv = extra.get(CHUNK_CONDITIONING_KEY) == "latest_kv"
         step_noises = None
         if use_kv:
             step_noises = [
@@ -597,6 +631,12 @@ class Wan22Pipeline(
             normalized_timesteps = tuple(
                 float(value) / float(num_train_timesteps) for value in timesteps.detach().cpu().flatten().tolist()
             )
+        # Resolve the effective boundary once per request (engine config wins,
+        # mirroring the native path) and precompute the per-step tower choice
+        # so the slot loop never reads a CUDA scalar.
+        if boundary_timestep is None:
+            boundary_timestep = self._request_boundary_timestep()
+        tower_per_step = self._dit_router(timesteps, boundary_timestep)
 
         def predict_noise(model_input, timestep, temporal_offset, step_idx, intermediate_tensors=None, kv_context=None):
             self._current_timestep = timestep[0]
@@ -608,7 +648,7 @@ class Wan22Pipeline(
                 normalized = normalized_timesteps[step_idx] if step_idx < len(normalized_timesteps) else 0.0
                 self.record_denoise_step(step_idx, normalized_timestep=normalized)
             return self.predict_noise(
-                current_model=self._select_dit(timestep[0]),
+                current_model=tower_per_step[step_idx],
                 hidden_states=model_input.to(dtype),
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
@@ -632,7 +672,8 @@ class Wan22Pipeline(
             layer_range=self._active_layer_range(),
             initial_latents=latents if use_kv else None,
             step_noises=step_noises,
-            kv_history_chunks=int(extra.get("kv_history_chunks", 6)) if use_kv else None,
+            kv_history_chunks=int(extra.get(KV_HISTORY_CHUNKS_KEY, 6)) if use_kv else None,
+            kv_source_policy=extra.get(KV_SOURCE_POLICY_KEY, "latest"),
         )
         return result
 
@@ -1117,7 +1158,9 @@ class Wan22Pipeline(
         if DEBUG_PERF or self.chunk_pipeline_mode or self._collect_pp_metrics:
             _t_denoise_start = time.perf_counter()
         if self.chunk_pipeline_mode:
-            latents = self._diffuse_chunks(req, latents, timesteps, prompt_embeds, dtype, generator)
+            latents = self._diffuse_chunks(
+                req, latents, timesteps, prompt_embeds, dtype, generator, boundary_timestep=boundary_timestep
+            )
         else:
             latents = self.diffuse(
                 latents=latents,
