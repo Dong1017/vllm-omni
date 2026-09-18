@@ -6,9 +6,11 @@ Three layers, each independently testable and evolvable (see README.md):
 
 - ``scheduler``: pure-function slot planning (USP2 slot model + noisy
   dependency rules).
-- ``kv_manager``: clean/noisy KV lifecycle over the AR-Diffusion paged
-  KV stack, producer-aware.
-- ``kv_connector``: asynchronous cross-stage KV transport.
+- ``kv_manager``: clean/noisy KV *policy* -- storage is delegated to the
+  AR-Diffusion paged KV stack (``ar_diffusion.kv_cache``).
+- ``kv_connector``: KV transfer semantics aligned with the vLLM
+  ``KVConnectorBase_V1`` lifecycle; transports are adapted, not reinvented.
+- ``adapters``: per-model-family declarations (wan first).
 
 Both prior experiment branches (noisy-chunk-pp-layer-step on Dong1017 and
 ShengDev forks) are subsumed here; their production paths stay frozen

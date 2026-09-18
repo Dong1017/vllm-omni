@@ -129,7 +129,23 @@ class NoisyKVConnector:
 - 两分支现有 112 测试迁移为：调度纯函数测试（CPU）+ KV manager 单测 + 2×H200 双模型
   冒烟（FastWan/CausalWan × serial-replay/serial-clean/stepwise）。
 
-## 6. 已知风险
+## 6. 复用映射（v2 修订：只写策略，不重建基础设施）
+
+盘点后确认仓库已有完整基座，noisy_pp 是**薄策略层**：
+
+| 能力 | 复用的现成实现 | noisy_pp 里只写 |
+|---|---|---|
+| KV 存储/paging/slot | `ar_diffusion/kv_cache/manager.py`（`ARDiffusionKVCache`，648 行，vLLM paged 栈封装）+ `paged.py` + `state.py`（多 branch session） | clean/noisy 分池策略（branch 命名 `clean_{producer}` / `noisy_{producer}`）、refcount retire、latest/clean 版本解析 |
+| KV 传输 | vLLM `KVConnectorBase_V1` 生命周期 hook（`start_load_kv`/`wait_for_layer_load`/`save_kv_layer`/`get_finished`）；`vllm_omni/distributed/omni_connectors/kv_transfer_manager.py`（ZMQ rank-aware） | 版本寻址语义（VersionRef）、retire 安全门（`drained`）、stream-ordering 契约 |
+| 传输组装方式 | `diffusion_kv/kv_connector.py`（Mooncake 经 `KVConnectorFactory`） | ——（参照模式） |
+| tensor 布局 | `diffusion_kv/layout.py` / `paged.py` 的 `pool_write_chunk` | wan per-layer post-RoPE 视图映射（若 layout 覆盖则零新增） |
+| 采样契约 | —— | `adapters/wan.py`（自 noisy-chunk-pp 分支平移：高噪/边界/交接公式 + 塔路由） |
+
+因此 `kv_manager.py` 重写为 `ARDiffusionKVState/ARCache` 之上的策略类（无自建存储）；
+`kv_connector.py` 声明 `NoisyKVTransfer` 适配协议（指向既有引擎），`LocalNoisyKVConnector`
+覆盖 world==1 与 CPU 测试。
+
+## 7. 已知风险
 
 1. **异步传输正确性**：同步 wait 的"消费前到位"保证移到 Future 契约，ready 事件
    在 CUDA stream 上的语义要小心（event record ≠ 同步）。
