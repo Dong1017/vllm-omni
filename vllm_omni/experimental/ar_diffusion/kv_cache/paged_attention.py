@@ -32,7 +32,7 @@ def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     keeps the CPU running ahead (the caching host allocator keeps the pinned
     source alive until the copy's stream event completes).
     """
-    if torch.device(device).type != "cuda" or t.device.type != "cpu":
+    if torch.device(device).type not in ("cuda", "npu") or t.device.type != "cpu":
         return t.to(device=device)
     return t.pin_memory().to(device=device, non_blocking=True)
 
@@ -506,6 +506,37 @@ def ar_diffusion_paged_attention(
         query_flat = query.reshape(batch * q_len, *query.shape[2:])
     else:
         query_flat = query
+
+    if query_flat.is_npu:
+        # NPU: gather the visible blocks on device, then run the fused
+        # npu_fusion_attention kernel over the packed (contiguous) window.
+        # Mirrors the ROCm gather path; the reference implementation below is
+        # the correctness oracle but pays per-block gathers and fp32 einsum.
+        import torch_npu
+
+        positions = torch.arange(int(max_seq_len), device=query_flat.device)
+        block_size = key_cache.shape[1]
+        logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+        offsets = positions % block_size
+        physical_blocks = block_table[0, logical_blocks].long()
+        gathered_k = key_cache[physical_blocks, offsets]
+        gathered_v = value_cache[physical_blocks, offsets]
+        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+        packed_k = gathered_k[valid]
+        packed_v = gathered_v[valid]
+        kv_len = int(max_seq_len)
+        out = torch_npu.npu_fusion_attention(
+            query_flat.contiguous(),
+            packed_k.contiguous(),
+            packed_v.contiguous(),
+            head_num=query_flat.shape[1],
+            input_layout="TND",
+            scale=float(softmax_scale),
+            keep_prob=1.0,
+        )[0]
+        if batched:
+            return out.reshape(query.shape)
+        return out
 
     if not query_flat.is_cuda:
         out = _reference_paged_attention(
