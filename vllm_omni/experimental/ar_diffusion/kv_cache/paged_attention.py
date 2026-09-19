@@ -521,16 +521,24 @@ def ar_diffusion_paged_attention(
         physical_blocks = block_table[0, logical_blocks].long()
         gathered_k = key_cache[physical_blocks, offsets]
         gathered_v = value_cache[physical_blocks, offsets]
-        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        packed_k = gathered_k[valid]
-        packed_v = gathered_v[valid]
-        kv_len = int(max_seq_len)
+        # Flatten to (max_seq_len, H, D) so the kv-length mask packs rows.
+        gathered_k = gathered_k.reshape(int(max_seq_len), *key_cache.shape[2:])
+        gathered_v = gathered_v.reshape(int(max_seq_len), *value_cache.shape[2:])
+        kv_len = int(seq_lens[0].item())
+        packed_k = gathered_k[:kv_len]
+        packed_v = gathered_v[:kv_len]
+        # TND layout: per-sequence lengths and their cu_seqlens prefixes.
+        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
+        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
+        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
         out = torch_npu.npu_fusion_attention(
             query_flat.contiguous(),
             packed_k.contiguous(),
             packed_v.contiguous(),
             head_num=query_flat.shape[1],
             input_layout="TND",
+            actual_seq_qlen=actual_seq_q,
+            actual_seq_kvlen=actual_seq_kv,
             scale=float(softmax_scale),
             keep_prob=1.0,
         )[0]
