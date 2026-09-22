@@ -298,6 +298,18 @@ class ARDiffusionPagedForwardContext:
         window inside the attention custom op instead of at the compiled boundary.
         """
         if not self.staging_enabled:
+            # NPU eager dispatch of the fused write+attend custom op rejects
+            # None for a tensor argument declared mutable, so hand back
+            # zero-size buffers there; the op treats an empty stage buffer
+            # like None (fresh allocation). Other devices keep the upstream
+            # None contract.
+            k_pool = self.kv_cache._k_pools[layer_idx]
+            if k_pool.device.type == "npu":
+                v_pool = self.kv_cache._v_pools[layer_idx]
+                return (
+                    torch.empty(0, device=k_pool.device, dtype=k_pool.dtype),
+                    torch.empty(0, device=v_pool.device, dtype=v_pool.dtype),
+                )
             return None, None
         return self.kv_cache.history_staging[layer_idx]
 
@@ -599,7 +611,7 @@ def ar_diffusion_paged_attention(
         if n_blocks * block_size != int(max_seq_len):
             raise ValueError("the contiguous K/V gather path requires max_seq_len to be block-aligned")
         block_ids = block_table[0, :n_blocks].to(torch.long)
-        if stage_key is None or stage_value is None:
+        if stage_key is None or stage_value is None or stage_key.numel() == 0:
             # Fresh allocations on purpose: a module-level cached buffer that is first
             # allocated inside a CUDA-graph-trees warm-up run lives in the graph pool
             # untracked ("tensor(s) in the cudagraph pool not tracked as outputs").
