@@ -99,6 +99,24 @@ def test_vertical_diagonal_example():
     assert all(s.owner == 4 for s in clean_srcs)
 
 
+def test_vertical_serial_same_topology_no_chunk_overlap():
+    """serial vs latest share S×G; serial never overlaps two chunks."""
+    common = dict(chunks=3, num_denoise_steps=2, stages=3, layer_groups=1, kv_history_chunks=6)
+    serial = build_stage_plan(StageSchedule(**common, ordering=Ordering.SERIAL))
+    latest = build_stage_plan(StageSchedule(**common, ordering=Ordering.INTERLEAVED))
+    world = 3
+    assert serial.num_slots == 3 * world  # N concatenated single-chunk waves
+    assert latest.num_slots == 3 + world - 1  # diagonal
+    for t in range(serial.num_slots):
+        chunks = {task[0] for task in (serial.task(t, r) for r in range(world)) if task is not None}
+        assert len(chunks) <= 1
+    # Next chunk only starts after previous clean (step 2) finished.
+    assert serial.task(world, 0) == (1, 0)
+    assert serial.completion_slot((0, 2), 0) == world - 1
+    for src in serial.sources((1, 0), 0):
+        assert src.version[1] == 2  # clean only under serial
+
+
 def test_rejects_intermediate_s():
     with pytest.raises(ValueError, match="stages must be 1"):
         StageSchedule(

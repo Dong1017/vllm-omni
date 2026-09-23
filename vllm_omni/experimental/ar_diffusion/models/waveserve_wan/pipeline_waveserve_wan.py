@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -107,6 +107,9 @@ class WaveServeWanPipeline(nn.Module):
     """Chunk Latest-KV pipeline under experimental ar_diffusion."""
 
     supports_request_batch = True
+    # Engine startup dummy forces num_inference_steps=2, which conflicts with
+    # vertical S=T+1; skip the engine dummy (not a measurement warmup).
+    dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -197,7 +200,9 @@ class WaveServeWanPipeline(nn.Module):
         history = int(extra.get("kv_history_chunks", 0) or 0)
         if self.stage_parallel_size > 1 and history < 1:
             history = self.max_history_chunks
-        ordering = Ordering.SERIAL if str(extra.get("chunk_schedule", "serial")) == "serial" else Ordering.INTERLEAVED
+        schedule_name = str(extra.get("chunk_schedule", "serial"))
+        # S>1: serial = one chunk at a time; anything else = diagonal Latest-KV.
+        ordering = Ordering.SERIAL if schedule_name == "serial" else Ordering.INTERLEAVED
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):
             if explicit_denoise:

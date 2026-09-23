@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Experimental WaveServe Wan 1.3B serial-vs-vertical benchmark (not a recipe).
+"""Experimental WaveServe Wan 1.3B serial-vs-latest benchmark (not a recipe).
 
-Runs the same ``chunks x denoise steps`` workload through the experimental
-``WaveServeWanPipeline`` in two stage regimes:
+Same topology ``S = T+1``, ``G``; only chunk schedule differs:
 
-* ``serial``: ``S = 1``, ``G = pp_world`` — layer splitting only, one chunk at a
-  time (the pre-existing chunk+layer PP behaviour).
-* ``vertical``: ``S = T+1``, ``G = 1`` — one denoise stage per rank, chunk
-  pipelined across stages with Latest-KV.
+* ``serial``: one chunk finishes every cell before the next starts.
+* ``latest``: diagonal Latest-KV pipeline.
 
-Per-slot CPU wall time is measured on rank 0 across every stage rank, so the
-number is the schedule's *rank-slot* time rather than an end-to-end request
-latency (the engine admits one request at a time on this path).
+Performance stats match the CausalWan / noisy_chunk_pp harness:
 
-The engine owns multi-GPU execution through the ``mp`` diffusion executor
-(``external_launcher`` is not implemented for diffusion), so this script runs
-as a SINGLE process; do not wrap it in torchrun.
+* ``request_ms`` — wall around one ``Omni.generate`` (excludes artifact I/O).
+* ``dit_ms`` — ``stage_gen_time_ms`` from the request metrics (DiT/denoise wall).
+* Aggregation — median over ``--repeat`` timed requests (no warmup discard).
 
-Example (4 GPUs, vertical needs stages = denoise_steps + 1 = world):
+Engine startup dummy is skipped via ``WaveServeWanPipeline.dummy_run_num_frames = 0``
+(required for ``S = T+1``); that is not a measurement warmup.
+
+Single-process only (mp diffusion executor). Do not wrap in torchrun.
 
     python tools/ar_diffusion_waveserve_bench.py \
         --model /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev \
-        --world-size 4 --chunks 7 --denoise-steps 3 --warmup 1 --repeat 3
+        --world-size 4 --chunks 7 --denoise-steps 3 --repeat 3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import sys
 import tempfile
@@ -43,10 +40,6 @@ if str(REPO_ROOT) not in sys.path:
 
 MODEL_ID = "Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev"
 
-# The model repo's model_index.json says WanPipeline, which auto-detects to the
-# production wan2_2_ti2v pipeline. The vertical slice needs the experimental
-# pipeline + AR-Diffusion engine instead, so each regime renders its own deploy
-# YAML overriding model_class_name / engine_backend / stage geometry.
 _DEPLOY_YAML = """\
 pipeline: wan2_2_ti2v
 async_chunk: false
@@ -76,130 +69,106 @@ def _parse_args() -> argparse.Namespace:
         "--world-size",
         type=int,
         default=None,
-        help="Total GPUs for the engine (mp executor). Default: denoise_steps + 1.",
+        help="Total GPUs (mp executor). Default: denoise_steps + 1.",
     )
     parser.add_argument("--chunks", type=int, default=7)
     parser.add_argument("--denoise-steps", type=int, default=4)
-    parser.add_argument("--history", type=int, default=6, help="Latest-KV history chunks (vertical only).")
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--regimes", default="serial,vertical")
-    parser.add_argument(
-        "--gpus-per-stage",
-        type=int,
-        default=1,
-        help="Layer groups G inside a stage (vertical) / PP world (serial).",
-    )
+    parser.add_argument("--history", type=int, default=6)
+    parser.add_argument("--repeat", type=int, default=3, help="Timed requests per regime (all counted).")
+    parser.add_argument("--regimes", default="serial,latest")
+    parser.add_argument("--gpus-per-stage", type=int, default=1)
     parser.add_argument("--json-out", type=Path, default=None)
-    parser.add_argument(
-        "--slot-times-file",
-        type=Path,
-        default=None,
-        help="Rank-0 slot times land here (the stage loop runs in an mp worker "
-        "process, so the parent reads them back via this file).",
-    )
     return parser.parse_args()
 
 
-def _slot_times(path: Path | None) -> list[float]:
-    """Read and clear the per-slot wall times recorded by the stage executor."""
-    from vllm_omni.experimental.ar_diffusion import stage_executor as se
+def _median(values: list[float]) -> float:
+    return statistics.median(values) if values else float("nan")
 
-    times = list(se.SLOT_TIMES)
-    se.SLOT_TIMES.clear()
-    if path is not None and path.exists():
-        times.extend(float(line) for line in path.read_text().split() if line.strip())
-        path.unlink()
-    return times
+
+def _dit_ms(output) -> float | None:
+    metrics = getattr(output, "metrics", None) or {}
+    stage_metrics = metrics.get("stage_metrics") or {}
+    if not stage_metrics:
+        # Fallback: some paths expose a flat stage_gen_time_ms.
+        flat = metrics.get("stage_gen_time_ms")
+        if flat is not None:
+            return float(flat)
+        return None
+    first = next(iter(stage_metrics.values()))
+    ms = float((first or {}).get("stage_gen_time_ms") or 0.0)
+    return ms if ms > 0 else None
 
 
 def _run_regime(args: argparse.Namespace, regime: str, world: int) -> dict:
     from vllm_omni import Omni
-    from vllm_omni.experimental.ar_diffusion import stage_executor as se
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    stages = args.denoise_steps + 1
+    layer_groups = args.gpus_per_stage
+    history = args.history
     if regime == "serial":
-        stages, layer_groups, history = 1, world, 0
-    elif regime == "vertical":
-        stages, layer_groups, history = args.denoise_steps + 1, args.gpus_per_stage, args.history
+        chunk_schedule = "serial"
+    elif regime == "latest":
+        chunk_schedule = "latest"
     else:
-        raise ValueError(f"unknown regime {regime!r}")
+        raise ValueError(f"unknown regime {regime!r}; expected serial or latest")
 
     if stages * layer_groups != world:
         raise SystemExit(
             f"regime={regime} needs stages*layer_groups == world; got {stages}*{layer_groups} != {world}"
         )
 
-    deploy_yaml = _DEPLOY_YAML.format(world=world, stages=stages, history=max(1, history or 1))
+    deploy_yaml = _DEPLOY_YAML.format(world=world, stages=stages, history=max(1, history))
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", prefix=f"waveserve_{regime}_", delete=False) as fh:
         fh.write(deploy_yaml)
         deploy_path = fh.name
-    engine_args = {
-        "model": args.model,
-        "deploy_config": deploy_path,
-    }
 
-    slot_file = args.slot_times_file
-    if slot_file is not None:
-        slot_file.parent.mkdir(parents=True, exist_ok=True)
-        slot_file.unlink(missing_ok=True)
-        os.environ["AR_DIFFUSION_SLOT_TIMES_FILE"] = str(slot_file)
-    se.SLOT_TIMES.clear()
-    omni = Omni(**engine_args)
+    omni = Omni(model=args.model, deploy_config=deploy_path)
     try:
-        totals: list[float] = []
-        slots: list[float] = []
-        meta: dict = {}
-        for index in range(args.warmup + args.repeat):
-            _slot_times(slot_file)  # clear before each measured request
+        request_ms: list[float] = []
+        dit_ms: list[float] = []
+        for index in range(args.repeat):
             params = OmniDiffusionSamplingParams(
                 extra_args={
                     "num_chunks": args.chunks,
                     "num_denoise_steps": args.denoise_steps,
                     "kv_history_chunks": history,
-                    "chunk_schedule": "serial",
+                    "chunk_schedule": chunk_schedule,
                     "reset": True,
                 }
             )
             started = time.perf_counter()
             outputs = omni.generate("a cat walking on grass", sampling_params_list=[params])
-            elapsed = time.perf_counter() - started
-            recorded = _slot_times(slot_file)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
             if not outputs:
                 raise RuntimeError(f"regime={regime} produced no output")
-            if index < args.warmup:
-                continue
-            totals.append(elapsed)
-            slots.extend(recorded)
-            if not meta:
-                result = outputs[0]
-                meta = {
-                    "stage_id": getattr(result, "stage_id", None),
-                    "finished": bool(getattr(result, "finished", False)),
-                    "metrics": getattr(result, "metrics", None) or {},
-                }
+            request_ms.append(elapsed_ms)
+            gen = _dit_ms(outputs[0])
+            if gen is None:
+                raise RuntimeError(f"regime={regime} request {index} missing stage_gen_time_ms")
+            dit_ms.append(gen)
     finally:
         omni.close()
 
-    if not totals:
-        raise SystemExit(f"regime={regime} collected no measurement (warmup={args.warmup})")
-
-    per_slot = statistics.median(slots) * 1000.0 if slots else float("nan")
-    schedule_slots = _expected_slots(args.chunks, args.denoise_steps, stages, layer_groups, history)
+    schedule_slots = _expected_slots(args.chunks, args.denoise_steps, stages, layer_groups, history, chunk_schedule)
     return {
         "regime": regime,
         "stages": stages,
         "layer_groups": layer_groups,
         "history": history,
-        "measured_requests": len(totals),
-        "slot_samples": len(slots),
-        "median_total_s": round(statistics.median(totals), 4),
-        "min_total_s": round(min(totals), 4),
-        "median_slot_ms": round(per_slot, 3),
+        "chunk_schedule": chunk_schedule,
         "schedule_slots": schedule_slots,
-        "schedule_gpu_slots": schedule_slots * world,
-        "schedule_gpu_slot_ms": round(per_slot * schedule_slots * world, 1),
-        "metrics": meta.get("metrics", {}),
+        "timed_iterations": len(request_ms),
+        "request_ms": round(_median(request_ms), 3),
+        "dit_ms": round(_median(dit_ms), 3),
+        "min_request_ms": round(min(request_ms), 3),
+        "min_dit_ms": round(min(dit_ms), 3),
+        "all_request_ms": [round(x, 3) for x in request_ms],
+        "all_dit_ms": [round(x, 3) for x in dit_ms],
+        "performance": {
+            "request_ms": round(_median(request_ms), 3),
+            "dit_ms": round(_median(dit_ms), 3),
+        },
     }
 
 
@@ -209,6 +178,7 @@ def _expected_slots(
     stages: int,
     layer_groups: int,
     history: int,
+    chunk_schedule: str,
 ) -> int:
     from vllm_omni.experimental.ar_diffusion.stage_schedule import (
         Ordering,
@@ -216,13 +186,14 @@ def _expected_slots(
         build_stage_plan,
     )
 
+    ordering = Ordering.SERIAL if chunk_schedule == "serial" else Ordering.INTERLEAVED
     schedule = StageSchedule(
         chunks=chunks,
         num_denoise_steps=denoise_steps,
         stages=stages,
         layer_groups=layer_groups,
-        ordering=Ordering.SERIAL,
-        kv_history_chunks=max(1, history) if stages > 1 else history,
+        ordering=ordering,
+        kv_history_chunks=max(1, history),
     )
     return build_stage_plan(schedule).num_slots
 
@@ -232,30 +203,42 @@ def main() -> None:
     world = args.world_size or (args.denoise_steps + 1)
     regimes = [item.strip() for item in args.regimes.split(",") if item.strip()]
 
-    results = []
-    for regime in regimes:
-        results.append(_run_regime(args, regime, world))
+    results = [_run_regime(args, regime, world) for regime in regimes]
 
-    print("REGIME       S  G  slots  slot_ms  gpu_slots  gpu_slot_ms  wall_s  min_wall_s")
+    print("REGIME       S  G  slots  request_ms    dit_ms  min_req  min_dit")
     for row in results:
         print(
             f"{row['regime']:<10} {row['stages']:>2} {row['layer_groups']:>2} "
-            f"{row['schedule_slots']:>6} {row['median_slot_ms']:>8.3f} "
-            f"{row['schedule_gpu_slots']:>9} {row['schedule_gpu_slot_ms']:>11.1f} "
-            f"{row['median_total_s']:>7.3f} {row['min_total_s']:>10.3f}"
+            f"{row['schedule_slots']:>6} {row['request_ms']:>11.1f} "
+            f"{row['dit_ms']:>9.1f} {row['min_request_ms']:>8.1f} {row['min_dit_ms']:>8.1f}"
         )
-    if len(results) >= 2:
-        base = results[0]
-        for row in results[1:]:
-            speedup = base["median_total_s"] / row["median_total_s"] if row["median_total_s"] else float("nan")
-            slot_speedup = base["median_slot_ms"] / row["median_slot_ms"] if row["median_slot_ms"] else float("nan")
-            print(
-                f"{row['regime']} vs {base['regime']}: "
-                f"end_to_end x{speedup:.2f}, per_slot x{slot_speedup:.2f}"
-            )
+
+    by_name = {row["regime"]: row for row in results}
+    comparisons: dict[str, dict[str, float]] = {}
+    if "serial" in by_name and "latest" in by_name:
+        serial, latest = by_name["serial"], by_name["latest"]
+        comparisons["latest_vs_serial"] = {
+            "request_ms_speedup": round(serial["request_ms"] / latest["request_ms"], 3),
+            "dit_ms_speedup": round(serial["dit_ms"] / latest["dit_ms"], 3),
+        }
+        print(
+            "latest vs serial: "
+            f"request x{comparisons['latest_vs_serial']['request_ms_speedup']:.2f}, "
+            f"dit x{comparisons['latest_vs_serial']['dit_ms_speedup']:.2f}"
+        )
+
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps({"world": world, "runs": results}, indent=2))
+        payload = {
+            "world": world,
+            "chunks": args.chunks,
+            "denoise_steps": args.denoise_steps,
+            "timed_iterations": args.repeat,
+            "aggregation": "median over timed requests (no warmup)",
+            "runs": results,
+            "comparisons": comparisons,
+        }
+        args.json_out.write_text(json.dumps(payload, indent=2))
         print(f"WROTE_JSON={args.json_out}")
 
 

@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pure-function stage timetable, Latest-KV visibility, and transfer plan.
 
-No torch. ``S ∈ {1, T+1}`` only. ``S = 1`` is the traditional layer-split
-schedule (serial or interleaved); ``S = T+1`` is the vertical Latest-KV slice.
+No torch. ``S ∈ {1, T+1}`` only.
+
+* ``S = 1``: traditional layer-split (``SERIAL`` / ``INTERLEAVED``).
+* ``S = T+1``: one stage per denoise/clean step. ``SERIAL`` keeps a single
+  chunk in flight (Self Forcing baseline on the same topology); non-serial
+  uses the diagonal Latest-KV pipeline (multiple chunks overlapped).
 """
 
 from __future__ import annotations
@@ -172,6 +176,7 @@ def _plan_s1_slots(schedule: StageSchedule) -> tuple[tuple[ChunkStep | None, ...
 
 
 def _plan_vertical_slots(schedule: StageSchedule) -> tuple[tuple[ChunkStep | None, ...], ...]:
+    """Diagonal Latest-KV: chunk ``c`` and chunk ``c+1`` overlap across ranks."""
     n = schedule.chunks
     s = schedule.stages
     g = schedule.layer_groups
@@ -185,6 +190,29 @@ def _plan_vertical_slots(schedule: StageSchedule) -> tuple[tuple[ChunkStep | Non
             if 0 <= chunk < n:
                 row[rank] = (chunk, rank // g)
         slots.append(tuple(row))
+    return tuple(slots)
+
+
+def _plan_vertical_serial_slots(schedule: StageSchedule) -> tuple[tuple[ChunkStep | None, ...], ...]:
+    """Same ``S×G`` topology as Latest-KV, but one chunk finishes every cell first.
+
+    Implemented as ``N`` concatenated single-chunk vertical waves so layer-group
+    PP within a stage still fills, while chunk ``c+1`` never overlaps chunk ``c``.
+    """
+    unit = _plan_vertical_slots(
+        StageSchedule(
+            chunks=1,
+            num_denoise_steps=schedule.num_denoise_steps,
+            stages=schedule.stages,
+            layer_groups=schedule.layer_groups,
+            ordering=Ordering.INTERLEAVED,
+            kv_history_chunks=schedule.kv_history_chunks,
+        )
+    )
+    slots: list[tuple[ChunkStep | None, ...]] = []
+    for chunk in range(schedule.chunks):
+        for row in unit:
+            slots.append(tuple((chunk, task[1]) if task is not None else None for task in row))
     return tuple(slots)
 
 
@@ -334,6 +362,8 @@ def _assert_invariants(plan: StagePlan) -> None:
 def build_stage_plan(schedule: StageSchedule) -> StagePlan:
     if schedule.stages == 1:
         slots = _plan_s1_slots(schedule)
+    elif schedule.ordering is Ordering.SERIAL:
+        slots = _plan_vertical_serial_slots(schedule)
     else:
         slots = _plan_vertical_slots(schedule)
     completions = _completions(slots, schedule)

@@ -22,23 +22,49 @@ from vllm_omni.experimental.ar_diffusion.stage_schedule import (
     rank_work,
 )
 
-#: Wall time of each slot executed on the rank that owns rank 0 of the stage
-#: pipeline. Experimental telemetry only; a harness clears it per request.
+#: Wall time of each *active* slot (rank has work) on rank 0.
+#: Experimental telemetry only; a harness clears it per request.
 SLOT_TIMES: list[float] = []
 
-#: Optional file (one float seconds per line) where rank 0 appends slot times.
-#: Needed because the stage loop runs in an mp worker process, so the parent
-#: cannot read ``SLOT_TIMES`` directly.
-_SLOT_TIMES_FILE = os.environ.get("AR_DIFFUSION_SLOT_TIMES_FILE") or None
+#: End-to-end wall of one ``run_stage_pipeline`` call on rank 0 (seconds).
+PIPELINE_TIMES: list[float] = []
 
-logger = init_logger(__name__)
+
+def _slot_times_file() -> str | None:
+    return os.environ.get("AR_DIFFUSION_SLOT_TIMES_FILE") or None
+
+
+def _pipeline_times_file() -> str | None:
+    return os.environ.get("AR_DIFFUSION_PIPELINE_TIMES_FILE") or None
+
+
+def _cuda_sync() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        return
 
 
 def _record_slot(delta: float) -> None:
     SLOT_TIMES.append(delta)
-    if _SLOT_TIMES_FILE:
-        with open(_SLOT_TIMES_FILE, "a") as fh:
+    path = _slot_times_file()
+    if path:
+        with open(path, "a") as fh:
             fh.write(f"{delta}\n")
+
+
+def _record_pipeline(delta: float) -> None:
+    PIPELINE_TIMES.append(delta)
+    path = _pipeline_times_file()
+    if path:
+        with open(path, "a") as fh:
+            fh.write(f"{delta}\n")
+
+
+logger = init_logger(__name__)
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -190,6 +216,7 @@ def run_stage_pipeline(
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
     pending_hidden: Any | None = None
+    pipeline_started = time.perf_counter()
     while (ctx.inflight or ctx.pending) and slot < limit:
         slot_started = time.perf_counter()
         ctx.admit_pending(slot)
@@ -239,11 +266,16 @@ def run_stage_pipeline(
         # ② Next slot's sources: wait only the inbound versions slot+1 reads.
         kv.evict(slot)
         kv.await_ready(slot)
-        if spec.rank == 0:
+        if spec.rank == 0 and tasks:
+            # Active slots only — idle bubbles would dominate SERIAL medians.
+            _cuda_sync()
             _record_slot(time.perf_counter() - slot_started)
         slot += 1
     # Teardown: land anything the narrowed waits skipped.
     kv.drain()
+    if spec.rank == 0:
+        _cuda_sync()
+        _record_pipeline(time.perf_counter() - pipeline_started)
 
 
 @contextmanager
