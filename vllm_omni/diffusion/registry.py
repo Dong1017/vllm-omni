@@ -66,11 +66,6 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
-    "WanCausalDMDPipeline": (
-        "wan2_2",
-        "pipeline_wan2_2",
-        "Wan22Pipeline",
-    ),
     "WanVACEPipeline": (
         "wan2_2",
         "pipeline_wan2_2_vace",
@@ -562,7 +557,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanDMDPipeline": "get_wan22_post_process_func",
-    "WanCausalDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
@@ -640,7 +634,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanDMDPipeline": "get_wan22_pre_process_func",
-    "WanCausalDMDPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",

@@ -1561,7 +1561,6 @@ stages:
             (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
             (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
             (None, {"_class_name": "WanDMDPipeline"}, "wan2_2_ti2v"),
-            (None, {"_class_name": "WanCausalDMDPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(

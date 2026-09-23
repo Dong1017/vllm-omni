@@ -208,15 +208,10 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
 
-    def forward(self, hidden_states: torch.Tensor, temporal_offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
-        if temporal_offset < 0 or temporal_offset % p_t:
-            raise ValueError("temporal_offset must be nonnegative and divisible by the temporal patch size")
-        start = temporal_offset // p_t
-        if start + ppf > self.max_seq_len:
-            raise ValueError("Chunk temporal positions exceed the configured RoPE range")
 
         split_sizes = [
             self.attention_head_dim - 2 * (self.attention_head_dim // 3),
@@ -227,11 +222,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
         freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
 
-        freqs_cos_f = freqs_cos[0][start : start + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_sin_f = freqs_sin[0][start : start + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
@@ -1006,7 +1001,6 @@ class WanTransformer3DModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
-        temporal_offset: int = 0,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -1015,11 +1009,11 @@ class WanTransformer3DModel(nn.Module):
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width, temporal_offset)
+        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
         if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
             rotary_emb = self._cached_rope_emb
         else:
-            freqs_cos, freqs_sin = self.rope(hidden_states, temporal_offset=temporal_offset)
+            freqs_cos, freqs_sin = self.rope(hidden_states)
             rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
             self._hidden_states_shape = hidden_states.shape
             self._cached_rope_emb = rotary_emb

@@ -106,7 +106,6 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
     pipeline.is_dmd = False
-    pipeline.is_causalwan_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None

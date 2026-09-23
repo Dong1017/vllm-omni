@@ -10,7 +10,6 @@ real multi-GPU NCCL collectives.
 from __future__ import annotations
 
 from typing import Literal
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -305,122 +304,6 @@ class TestDiffuseWrapper:
         assert _DiffusePP.diffuse.__name__ == "diffuse"
         assert _DiffusePP.diffuse.__doc__ == "Original diffuse docstring."
 
-
-class TestDMDStep:
-    """DMD updates use the last-rank-to-first channel without touching scheduler.step."""
-
-    pytestmark = _UNIT_MARKS
-
-    @staticmethod
-    def _group(monkeypatch, *, first: bool, last: bool, world_size: int = 2):
-        group = Mock(is_first_rank=first, is_last_rank=last, world_size=world_size)
-        monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: world_size)
-        monkeypatch.setattr(pp_module, "get_pp_group", lambda: group)
-        return group
-
-    def test_single_rank_runs_update_without_communication(self, monkeypatch):
-        monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 1)
-        get_group = Mock(side_effect=AssertionError("Single-rank DMD must not communicate"))
-        monkeypatch.setattr(pp_module, "get_pp_group", get_group)
-        pipeline = TestSyncPPSend._make_pipeline()
-        latents, noise = torch.ones(2, 3), torch.full((2, 3), 0.25)
-        updated = latents - noise
-        update = Mock(return_value=updated)
-
-        assert pipeline.dmd_step_maybe_with_pp(noise, latents, update) is updated
-
-        update.assert_called_once_with(noise, latents)
-        get_group.assert_not_called()
-        assert pipeline._pp_send_work == []
-
-    def test_first_rank_receives_lazily_without_predict_clean(self, monkeypatch):
-        group = self._group(monkeypatch, first=True, last=False)
-        pipeline = TestSyncPPSend._make_pipeline()
-        received = torch.full((2, 3), 0.75)
-        recv_work = FakeWork()
-        group.irecv_tensor_dict.return_value = ({"latents": received}, [recv_work], [])
-        update = Mock(side_effect=AssertionError("First rank has no prediction for predict_clean"))
-
-        result = pipeline.dmd_step_maybe_with_pp(None, torch.ones(2, 3), update)
-
-        assert isinstance(result, AsyncLatents)
-        assert not recv_work.waited
-        group.irecv_tensor_dict.assert_called_once_with(src=1)
-        group.isend_tensor_dict.assert_not_called()
-        update.assert_not_called()
-        torch.testing.assert_close(result._resolve(), received)
-        assert recv_work.waited
-
-    def test_last_rank_updates_once_and_keeps_send_pending(self, monkeypatch):
-        group = self._group(monkeypatch, first=False, last=True)
-        pipeline = TestSyncPPSend._make_pipeline()
-        latents, noise = torch.ones(2, 3), torch.full((2, 3), 0.25)
-        updated = latents - noise
-        update = Mock(return_value=updated)
-        send_work = FakeWork()
-        group.isend_tensor_dict.return_value = [send_work]
-
-        assert pipeline.dmd_step_maybe_with_pp(noise, latents, update) is updated
-
-        update.assert_called_once_with(noise, latents)
-        group.isend_tensor_dict.assert_called_once_with({"latents": updated}, dst=0)
-        group.irecv_tensor_dict.assert_not_called()
-        assert pipeline._pp_send_work == [send_work]
-        assert not send_work.waited
-        pipeline._sync_pp_send()
-        assert send_work.waited
-        assert pipeline._pp_send_work == []
-
-    def test_middle_rank_preserves_latents_without_update_or_return_channel(self, monkeypatch):
-        group = self._group(monkeypatch, first=False, last=False, world_size=3)
-        pipeline = TestSyncPPSend._make_pipeline()
-        latents = torch.ones(2, 3)
-        update = Mock(side_effect=AssertionError("Middle rank has no prediction for predict_clean"))
-
-        assert pipeline.dmd_step_maybe_with_pp(None, latents, update) is latents
-
-        update.assert_not_called()
-        group.isend_tensor_dict.assert_not_called()
-        group.irecv_tensor_dict.assert_not_called()
-
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-    @pytest.mark.parametrize("first", [True, False], ids=["first-rank", "last-rank"])
-    def test_diffuse_resolves_final_dmd_latents_and_flushes_sends(self, monkeypatch, first, dtype):
-        group = self._group(monkeypatch, first=first, last=not first)
-        # Conversion through torch.as_tensor can take the numpy array protocol,
-        # which cannot preserve a received bf16 tensor. Resolve it directly.
-        updated = torch.full((2, 3), 0.75, dtype=dtype)
-        recv_work, send_work = FakeWork(), FakeWork()
-        postprocess = Mock()
-        group.irecv_tensor_dict.return_value = ({"latents": updated}, [recv_work], [postprocess])
-        group.isend_tensor_dict.return_value = [send_work]
-        update = Mock(return_value=updated)
-
-        class _DMDDiffusePP(PipelineParallelMixin, CFGParallelMixin):
-            def diffuse(self, prediction, latents):
-                return self.dmd_step_maybe_with_pp(prediction, latents, update)
-
-        pipeline = _DMDDiffusePP()
-        if first:
-            # The first rank can still have the final intermediate-tensor send
-            # pending when it posts the last rank's DMD latent receive.
-            pipeline._pp_send_work = [send_work]
-        noise = None if first else torch.full((2, 3), 0.25)
-        latents = torch.ones(2, 3)
-
-        result = pipeline.diffuse(noise, latents)
-
-        assert result is updated
-        assert result.dtype == dtype
-        assert result.data_ptr() == updated.data_ptr()
-        assert send_work.waited
-        assert pipeline._pp_send_work == []
-        if first:
-            assert recv_work.waited
-            postprocess.assert_called_once_with()
-            update.assert_not_called()
-        else:
-            update.assert_called_once_with(noise, latents)
 
 
 class TestVaeDecodeGuard:

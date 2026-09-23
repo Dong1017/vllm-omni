@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
@@ -286,30 +285,6 @@ class PipelineParallelMixin:
             latents = super().scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
-            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
-        elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
-        return latents
-
-    def dmd_step_maybe_with_pp(
-        self,
-        noise_pred: torch.Tensor | None,
-        latents: torch.Tensor,
-        update_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    ) -> torch.Tensor | AsyncLatents:
-        """Run a DMD update where the full prediction lives and return it to rank 0.
-
-        ``update_fn`` performs predict-clean and any re-noising for this step.
-        Non-last PP ranks have no noise prediction and must not call it. Send
-        completion and final AsyncLatents resolution use the existing diffuse
-        wrapper, just as for the ordinary scheduler path.
-        """
-        if get_pipeline_parallel_world_size() == 1:
-            return update_fn(noise_pred, latents)
-
-        pp_group = get_pp_group()
-        if pp_group.is_last_rank:
-            latents = update_fn(noise_pred, latents)
             self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
         elif pp_group.is_first_rank:
             latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
