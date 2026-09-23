@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+    from vllm_omni.experimental.ar_diffusion.kv_cache.versioned import ARDiffusionVersionedKVSpec
+    from vllm_omni.experimental.ar_diffusion.stage_executor import ARDiffusionStageContext
 
 
 @dataclass(frozen=True)
@@ -179,4 +181,18 @@ class SupportsARDiffusionWarmup(Protocol):
 
     def ar_diffusion_warmup_requests(self, session_id: str) -> Iterable[OmniDiffusionRequest]:
         """Yield requests for compiled shapes, each carrying ``session_id``."""
+        ...
+
+
+@runtime_checkable
+class SupportsARDiffusionStagePipeline(Protocol):
+    """Chunk-stage Latest-KV pipeline (vertical slice). Mutually exclusive with tick KV."""
+
+    def ar_diffusion_versioned_kv_spec(self) -> ARDiffusionVersionedKVSpec:
+        ...
+
+    def bind_ar_diffusion_stage_context(
+        self,
+        ctx: ARDiffusionStageContext,
+    ) -> AbstractContextManager[None]:
         ...

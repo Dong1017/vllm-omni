@@ -20,13 +20,18 @@ from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionPipeline,
+    SupportsARDiffusionStagePipeline,
     SupportsARDiffusionWarmup,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.versioned import VersionedKVCache, VersionedKVState
+from vllm_omni.experimental.ar_diffusion.models import register_experimental_diffusion_models
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
+
+register_experimental_diffusion_models()
 
 logger = init_logger(__name__)
 
@@ -62,7 +67,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
         self.kv_cache: ARDiffusionKVCache | None = None
+        self.versioned_kv_cache: VersionedKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
+        self._ar_diffusion_stage_capability: SupportsARDiffusionStagePipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
@@ -97,6 +104,44 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
         return int(torch.cuda.mem_get_info(self.device)[0])
 
+    def _stage_config(self) -> dict:
+        raw = getattr(self.od_config, "ar_diffusion_stage_config", None)
+        if raw is None:
+            model_config = getattr(self.od_config, "model_config", None)
+            if isinstance(model_config, dict):
+                raw = model_config.get("ar_diffusion_stage_config")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _preallocate_versioned_kv(self, *, available_bytes: int | None = None) -> None:
+        capability = self.pipeline
+        spec = capability.ar_diffusion_versioned_kv_spec()
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        if stages < 1 or pp_world % stages != 0:
+            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
+        layer_groups = pp_world // stages
+        max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
+        self._ar_diffusion_stage_capability = capability
+        self.versioned_kv_cache = VersionedKVCache(
+            spec,
+            dtype=self.od_config.dtype,
+            device=self.device,
+            layer_groups=layer_groups,
+            max_batch_size=max_batch_size,
+            gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
+            available_bytes=available_bytes,
+        )
+        logger.info(
+            "AR-Diffusion versioned KV: capacity=%d layers=%d H=%d G=%d R=%d S=%d",
+            self.versioned_kv_cache.capacity,
+            spec.num_layers,
+            spec.max_history_chunks,
+            layer_groups,
+            max_batch_size,
+            stages,
+        )
+
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
         if bool(getattr(self.od_config, "step_execution", False)) and not supports_step_execution(self.pipeline):
@@ -104,6 +149,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
             )
+        if isinstance(self.pipeline, SupportsARDiffusionStagePipeline):
+            self._preallocate_versioned_kv(available_bytes=available_bytes)
+            return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
             raise ValueError(
@@ -305,11 +353,42 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     suppress_errors=True,
                 )
 
+    def _make_stage_context(self):
+        from vllm_omni.experimental.ar_diffusion.stage_executor import (
+            ARDiffusionStageContext,
+            StageRunSpec,
+            StageTopology,
+            resolve_pp_rank_and_group,
+        )
+
+        if self.versioned_kv_cache is None:
+            raise RuntimeError("versioned KV cache is not initialized")
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        topology = StageTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
+        rank, pp_group = resolve_pp_rank_and_group()
+        return ARDiffusionStageContext(
+            spec=StageRunSpec(
+                topology=topology,
+                max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
+                rank=rank,
+                pp_group=pp_group,
+            ),
+            kv=VersionedKVState(self.versioned_kv_cache),
+        )
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
+        if self.versioned_kv_cache is not None and self._ar_diffusion_stage_capability is not None:
+            started = time.perf_counter()
+            with self._ar_diffusion_stage_capability.bind_ar_diffusion_stage_context(self._make_stage_context()):
+                output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            self._perf_e2e_times.append(time.perf_counter() - started)
+            return output
         if self.kv_cache is None:
             return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         if self._ar_diffusion_capability is None:
@@ -333,7 +412,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Reject request batching until batch-aware AR state binding exists."""
+        """Latest-KV stage pipelines batch same-step requests; timeline KV stays single-seq."""
+        if self.versioned_kv_cache is not None and self._ar_diffusion_stage_capability is not None:
+            with self._ar_diffusion_stage_capability.bind_ar_diffusion_stage_context(self._make_stage_context()):
+                return super().execute_model_batch(scheduler_output, od_config)
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

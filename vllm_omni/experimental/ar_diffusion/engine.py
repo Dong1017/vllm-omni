@@ -6,11 +6,14 @@ from __future__ import annotations
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.experimental.ar_diffusion.models import register_experimental_diffusion_models
 
 logger = init_logger(__name__)
 
 #: Import path of the runner the AR-Diffusion engine routes its workers to.
 AR_DIFFUSION_MODEL_RUNNER_CLS = "vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner"
+
+register_experimental_diffusion_models()
 
 
 class ARDiffusionEngine(DiffusionEngine):

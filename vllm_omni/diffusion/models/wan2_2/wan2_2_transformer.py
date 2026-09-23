@@ -447,7 +447,6 @@ class WanSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         attn_metadata: AttentionMetadata | None = None,
-        chunk_kv=None,
     ) -> torch.Tensor:
         # Fused QKV projection
         qkv, _ = self.to_qkv(hidden_states)
@@ -479,12 +478,6 @@ class WanSelfAttention(nn.Module):
             freqs_cos, freqs_sin = rotary_emb
             query = self.rotary_embedding(query, freqs_cos, freqs_sin)
             key = self.rotary_embedding(key, freqs_cos, freqs_sin)
-
-        if chunk_kv is not None:
-            if self.to_gate_compress is not None:
-                raise ValueError("Chunk KV requires an attention backend supporting unequal query and KV lengths")
-            context, layer_idx = chunk_kv
-            key, value = context.append(layer_idx, key, value)
 
         # Compute attention using unified attention layer
         hidden_states = self.attn(query, key, value, attn_metadata)
@@ -750,7 +743,6 @@ class WanTransformerBlock(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         vsa_dit_seq_shape: tuple[int, int, int] | None = None,
         preserve_vsa_all_blocks: bool = False,
-        chunk_kv=None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -777,7 +769,7 @@ class WanTransformerBlock(nn.Module):
         if preserve_vsa_all_blocks:
             self_attn_extra["preserve_vsa_all_blocks"] = True
         self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask, extra=self_attn_extra)
-        attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata, chunk_kv=chunk_kv)
+        attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -1015,7 +1007,6 @@ class WanTransformer3DModel(nn.Module):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         temporal_offset: int = 0,
-        kv_context=None,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -1100,7 +1091,7 @@ class WanTransformer3DModel(nn.Module):
         # Preserve the post-patch (T, H, W) grid so VSA can partition
         # the flattened DiT sequence into spatiotemporal blocks.
         vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
-        for layer_idx, block in enumerate(self.blocks[self.start_layer : self.end_layer], self.start_layer):
+        for block in self.blocks[self.start_layer : self.end_layer]:
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1109,7 +1100,6 @@ class WanTransformer3DModel(nn.Module):
                 hidden_states_mask,
                 vsa_dit_seq_shape,
                 self.preserve_vsa_all_blocks,
-                chunk_kv=(kv_context, layer_idx) if kv_context is not None else None,
             )
 
         if not self.is_last_stage:
