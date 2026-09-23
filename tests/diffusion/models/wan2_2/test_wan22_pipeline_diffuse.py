@@ -95,10 +95,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.vae = _StubVae()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
-    pipeline.od_config = SimpleNamespace(
-        flow_shift=5.0,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-    )
+    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
     pipeline._sample_solver = "unipc"
     pipeline._flow_shift = 5.0
     pipeline.vae_scale_factor_temporal = 4
@@ -309,13 +306,13 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
     assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
 
 
-@pytest.mark.parametrize("decoded", [None, torch.empty(0)], ids=["none", "empty-tensor"])
-def test_forward_keeps_legacy_output_on_non_owner_vae_rank(decoded: torch.Tensor | None) -> None:
-    # Non-owner VAE ranks can return None or an empty tensor. Exercise the full
-    # forward path through typed-media dispatch and per-request output splitting;
-    # neither placeholder may be wrapped as video media or require a tensor shape.
+def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
+    # Distributed VAE decode uses broadcast_result=False, so non-owner ranks get
+    # an empty placeholder instead of the full video. Wrapping that as typed media
+    # would fail split_diffusion_output_by_request's batch check on every non-owner
+    # rank, so the pipeline must keep the placeholder on the legacy output field.
     pipeline = _make_pipeline()
-    pipeline.vae.decode = lambda latents, return_dict=False: (decoded,)  # type: ignore[assignment]
+    pipeline.vae.decode = lambda latents, return_dict=False: (torch.empty(0),)  # type: ignore[assignment]
     pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
 
     batch = DiffusionRequestBatch(
@@ -337,11 +334,8 @@ def test_forward_keeps_legacy_output_on_non_owner_vae_rank(decoded: torch.Tensor
 
     assert len(outputs) == 1
     assert outputs[0].media is None
-    if decoded is None:
-        assert outputs[0].output is None
-    else:
-        assert outputs[0].output is not None
-        assert outputs[0].output.numel() == 0
+    assert outputs[0].output is not None
+    assert outputs[0].output.numel() == 0
 
 
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
@@ -475,7 +469,6 @@ class _StubDMDScheduler:
 
 
 def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
-    monkeypatch.setattr("vllm_omni.diffusion.distributed.pipeline_parallel.get_pipeline_parallel_world_size", lambda: 1)
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()

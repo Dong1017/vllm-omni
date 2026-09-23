@@ -178,9 +178,7 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
 
 
 def create_transformer_from_config(
-    config: dict,
-    quant_config: QuantizationConfig | None = None,
-    prefix: str = "",
+    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -727,6 +725,7 @@ class Wan22Pipeline(
 
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)
+
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
@@ -937,7 +936,7 @@ class Wan22Pipeline(
             # owning rank and keep the placeholder on the legacy output field, so
             # the media batch-dimension check in split_diffusion_output_by_request
             # does not trip on every non-owner rank.
-            if decoded is not None and decoded.dim() == 5:
+            if decoded.dim() == 5:
                 output = None
                 media = DiffusionMediaOutput(
                     video=VideoMediaOutput(

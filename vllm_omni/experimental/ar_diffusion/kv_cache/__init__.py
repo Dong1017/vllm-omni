@@ -11,6 +11,12 @@ request adapter / pool builders) · ``state`` (the model-facing ARDiffusionKVSta
 """
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
+    ARDiffusionKVCache,
+    ARDiffusionRequestAdapter,
+    build_kv_manager,
+    compute_num_blocks,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
@@ -27,11 +33,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.versioned import (
-    ARDiffusionVersionedKVSpec,
-    VersionedKVCache,
-    VersionedKVState,
-)
 
 __all__ = [
     "ARDiffusionKVCache",
@@ -40,11 +41,8 @@ __all__ = [
     "ARDiffusionPagedLayerContext",
     "ARDiffusionPagedLayerInputs",
     "ARDiffusionRequestAdapter",
-    "ARDiffusionVersionedKVSpec",
     "ChunkWindowManager",
     "ChunkWindowSpec",
-    "VersionedKVCache",
-    "VersionedKVState",
     "allocate_kv_pool_with_views",
     "ar_diffusion_paged_attention",
     "build_kv_manager",
@@ -55,16 +53,3 @@ __all__ = [
     "pool_write_chunk",
     "resident_block_ids",
 ]
-
-
-def __getattr__(name: str):
-    if name in {
-        "ARDiffusionKVCache",
-        "ARDiffusionRequestAdapter",
-        "build_kv_manager",
-        "compute_num_blocks",
-    }:
-        from vllm_omni.experimental.ar_diffusion.kv_cache import manager
-
-        return getattr(manager, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

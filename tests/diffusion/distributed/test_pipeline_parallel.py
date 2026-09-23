@@ -305,7 +305,6 @@ class TestDiffuseWrapper:
         assert _DiffusePP.diffuse.__doc__ == "Original diffuse docstring."
 
 
-
 class TestVaeDecodeGuard:
     pytestmark = _UNIT_MARKS
 

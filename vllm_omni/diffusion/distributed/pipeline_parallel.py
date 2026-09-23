@@ -129,7 +129,7 @@ class PipelineParallelMixin:
                 try:
                     latents = diffuse(self, *args, **kwargs)
                     if isinstance(latents, AsyncLatents):
-                        latents = latents._resolve()
+                        latents = torch.as_tensor(latents)  # avoid copying
                     return latents
                 finally:
                     self._sync_pp_send()

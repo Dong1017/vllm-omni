@@ -890,8 +890,6 @@ class WanTransformer3DModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        self.is_first_stage = is_pipeline_first_stage()
-        self.is_last_stage = is_pipeline_last_stage()
         # Store config for compatibility
         self.config = type(
             "Config",
@@ -926,7 +924,7 @@ class WanTransformer3DModel(nn.Module):
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
-        if self.is_first_stage:
+        if is_pipeline_first_stage():
             self.patch_embedding = Conv3dLayer(
                 in_channels=in_channels,
                 out_channels=inner_dim,
@@ -952,8 +950,9 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
         # with PPMissingLayer so that weight names stay globally consistent.
-        def layer_factory(prefix):
-            return WanTransformerBlock(
+        self.start_layer, self.end_layer, self.blocks = make_layers(
+            num_layers,
+            lambda prefix: WanTransformerBlock(
                 inner_dim,
                 ffn_dim,
                 num_attention_heads,
@@ -962,12 +961,12 @@ class WanTransformer3DModel(nn.Module):
                 cross_attn_norm,
                 quant_config=quant_config,
                 prefix=prefix,
-            )
-
-        self.start_layer, self.end_layer, self.blocks = make_layers(num_layers, layer_factory, prefix="blocks")
+            ),
+            prefix="blocks",
+        )
 
         # 4. Output norm & projection — only on the last PP stage
-        if self.is_last_stage:
+        if is_pipeline_last_stage():
             self.norm_out = AdaLayerNorm(inner_dim, elementwise_affine=False, eps=eps)
             self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         else:
@@ -976,7 +975,7 @@ class WanTransformer3DModel(nn.Module):
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
         self._sp_shard_point = nn.Identity()
-        if self.is_last_stage:
+        if is_pipeline_last_stage():
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
             self.output_scale_shift_prepare = PPMissingLayer()
@@ -1018,7 +1017,7 @@ class WanTransformer3DModel(nn.Module):
             self._hidden_states_shape = hidden_states.shape
             self._cached_rope_emb = rotary_emb
 
-        if self.is_first_stage:
+        if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence. SP sharding happens at
             # _sp_shard_point so downstream block wrappers see local tensors.
             hidden_states = self.patch_embedding(hidden_states)
@@ -1096,7 +1095,7 @@ class WanTransformer3DModel(nn.Module):
                 self.preserve_vsa_all_blocks,
             )
 
-        if not self.is_last_stage:
+        if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
             # predict_noise will broadcast it to the next stage before calling that stage's forward.
             return IntermediateTensors({"hidden_states": hidden_states})

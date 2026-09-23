@@ -11,8 +11,14 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionPipeline,
-    SupportsARDiffusionStagePipeline,
     SupportsARDiffusionWarmup,
+)
+from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
+from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
+from vllm_omni.experimental.ar_diffusion.session import (
+    ARDiffusionSession,
+    ARDiffusionSessionManager,
+    ARDiffusionWorkerLifecycle,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     AR_DIFFUSION_TICK_KEY,
@@ -35,26 +41,5 @@ __all__ = [
     "ARDiffusionTickRequest",
     "ARDiffusionKVCacheSpec",
     "SupportsARDiffusionPipeline",
-    "SupportsARDiffusionStagePipeline",
     "SupportsARDiffusionWarmup",
 ]
-
-
-def __getattr__(name: str):
-    if name == "ARDiffusionEngine":
-        from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
-
-        return ARDiffusionEngine
-    if name == "ARDiffusionOmniTickConsumer":
-        from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
-
-        return ARDiffusionOmniTickConsumer
-    if name in {
-        "ARDiffusionSession",
-        "ARDiffusionSessionManager",
-        "ARDiffusionWorkerLifecycle",
-    }:
-        from vllm_omni.experimental.ar_diffusion import session
-
-        return getattr(session, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
