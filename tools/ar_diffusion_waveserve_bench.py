@@ -15,11 +15,15 @@ Per-slot CPU wall time is measured on rank 0 across every stage rank, so the
 number is the schedule's *rank-slot* time rather than an end-to-end request
 latency (the engine admits one request at a time on this path).
 
-Example (6 GPUs):
+The engine owns multi-GPU execution through the ``mp`` diffusion executor
+(``external_launcher`` is not implemented for diffusion), so this script runs
+as a SINGLE process; do not wrap it in torchrun.
 
-    torchrun --standalone --nproc-per-node=6 tools/ar_diffusion_waveserve_bench.py \
+Example (4 GPUs, vertical needs stages = denoise_steps + 1 = world):
+
+    python tools/ar_diffusion_waveserve_bench.py \
         --model /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev \
-        --chunks 7 --denoise-steps 4 --warmup 1 --repeat 3
+        --world-size 4 --chunks 7 --denoise-steps 3 --warmup 1 --repeat 3
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import json
 import os
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -38,10 +43,41 @@ if str(REPO_ROOT) not in sys.path:
 
 MODEL_ID = "Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev"
 
+# The model repo's model_index.json says WanPipeline, which auto-detects to the
+# production wan2_2_ti2v pipeline. The vertical slice needs the experimental
+# pipeline + AR-Diffusion engine instead, so each regime renders its own deploy
+# YAML overriding model_class_name / engine_backend / stage geometry.
+_DEPLOY_YAML = """\
+pipeline: wan2_2_ti2v
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: WaveServeWanPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      pipeline_parallel_size: {world}
+    model_config:
+      ar_diffusion_stage_config:
+        stage_parallel_size: {stages}
+        max_batch_size: 1
+        max_history_chunks: {history}
+"""
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="Total GPUs for the engine (mp executor). Default: denoise_steps + 1.",
+    )
     parser.add_argument("--chunks", type=int, default=7)
     parser.add_argument("--denoise-steps", type=int, default=4)
     parser.add_argument("--history", type=int, default=6, help="Latest-KV history chunks (vertical only).")
@@ -55,16 +91,25 @@ def _parse_args() -> argparse.Namespace:
         help="Layer groups G inside a stage (vertical) / PP world (serial).",
     )
     parser.add_argument("--json-out", type=Path, default=None)
-    parser.add_argument("--enforce-eager", action="store_true", default=True)
+    parser.add_argument(
+        "--slot-times-file",
+        type=Path,
+        default=None,
+        help="Rank-0 slot times land here (the stage loop runs in an mp worker "
+        "process, so the parent reads them back via this file).",
+    )
     return parser.parse_args()
 
 
-def _slot_times(runner) -> list[float]:
+def _slot_times(path: Path | None) -> list[float]:
     """Read and clear the per-slot wall times recorded by the stage executor."""
     from vllm_omni.experimental.ar_diffusion import stage_executor as se
 
     times = list(se.SLOT_TIMES)
     se.SLOT_TIMES.clear()
+    if path is not None and path.exists():
+        times.extend(float(line) for line in path.read_text().split() if line.strip())
+        path.unlink()
     return times
 
 
@@ -85,19 +130,20 @@ def _run_regime(args: argparse.Namespace, regime: str, world: int) -> dict:
             f"regime={regime} needs stages*layer_groups == world; got {stages}*{layer_groups} != {world}"
         )
 
-    stage_config = {
-        "stage_parallel_size": stages,
-        "max_batch_size": 1,
-        "max_history_chunks": max(1, history or 1),
-    }
+    deploy_yaml = _DEPLOY_YAML.format(world=world, stages=stages, history=max(1, history or 1))
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", prefix=f"waveserve_{regime}_", delete=False) as fh:
+        fh.write(deploy_yaml)
+        deploy_path = fh.name
     engine_args = {
         "model": args.model,
-        "model_config": {"ar_diffusion_stage_config": stage_config},
-        "parallel_config": {"pipeline_parallel_size": world},
-        "enforce_eager": bool(args.enforce_eager),
-        "max_num_seqs": 1,
+        "deploy_config": deploy_path,
     }
 
+    slot_file = args.slot_times_file
+    if slot_file is not None:
+        slot_file.parent.mkdir(parents=True, exist_ok=True)
+        slot_file.unlink(missing_ok=True)
+        os.environ["AR_DIFFUSION_SLOT_TIMES_FILE"] = str(slot_file)
     se.SLOT_TIMES.clear()
     omni = Omni(**engine_args)
     try:
@@ -105,7 +151,7 @@ def _run_regime(args: argparse.Namespace, regime: str, world: int) -> dict:
         slots: list[float] = []
         meta: dict = {}
         for index in range(args.warmup + args.repeat):
-            _slot_times(None)  # clear before each measured request
+            _slot_times(slot_file)  # clear before each measured request
             params = OmniDiffusionSamplingParams(
                 extra_args={
                     "num_chunks": args.chunks,
@@ -118,7 +164,7 @@ def _run_regime(args: argparse.Namespace, regime: str, world: int) -> dict:
             started = time.perf_counter()
             outputs = omni.generate("a cat walking on grass", sampling_params_list=[params])
             elapsed = time.perf_counter() - started
-            recorded = _slot_times(None)
+            recorded = _slot_times(slot_file)
             if not outputs:
                 raise RuntimeError(f"regime={regime} produced no output")
             if index < args.warmup:
@@ -183,35 +229,34 @@ def _expected_slots(
 
 def main() -> None:
     args = _parse_args()
-    world = int(os.environ.get("WORLD_SIZE", "1"))
+    world = args.world_size or (args.denoise_steps + 1)
     regimes = [item.strip() for item in args.regimes.split(",") if item.strip()]
 
     results = []
     for regime in regimes:
         results.append(_run_regime(args, regime, world))
 
-    if int(os.environ.get("RANK", "0")) == 0:
-        print("REGIME       S  G  slots  slot_ms  gpu_slots  gpu_slot_ms  wall_s  min_wall_s")
-        for row in results:
+    print("REGIME       S  G  slots  slot_ms  gpu_slots  gpu_slot_ms  wall_s  min_wall_s")
+    for row in results:
+        print(
+            f"{row['regime']:<10} {row['stages']:>2} {row['layer_groups']:>2} "
+            f"{row['schedule_slots']:>6} {row['median_slot_ms']:>8.3f} "
+            f"{row['schedule_gpu_slots']:>9} {row['schedule_gpu_slot_ms']:>11.1f} "
+            f"{row['median_total_s']:>7.3f} {row['min_total_s']:>10.3f}"
+        )
+    if len(results) >= 2:
+        base = results[0]
+        for row in results[1:]:
+            speedup = base["median_total_s"] / row["median_total_s"] if row["median_total_s"] else float("nan")
+            slot_speedup = base["median_slot_ms"] / row["median_slot_ms"] if row["median_slot_ms"] else float("nan")
             print(
-                f"{row['regime']:<10} {row['stages']:>2} {row['layer_groups']:>2} "
-                f"{row['schedule_slots']:>6} {row['median_slot_ms']:>8.3f} "
-                f"{row['schedule_gpu_slots']:>9} {row['schedule_gpu_slot_ms']:>11.1f} "
-                f"{row['median_total_s']:>7.3f} {row['min_total_s']:>10.3f}"
+                f"{row['regime']} vs {base['regime']}: "
+                f"end_to_end x{speedup:.2f}, per_slot x{slot_speedup:.2f}"
             )
-        if len(results) >= 2:
-            base = results[0]
-            for row in results[1:]:
-                speedup = base["median_total_s"] / row["median_total_s"] if row["median_total_s"] else float("nan")
-                slot_speedup = base["median_slot_ms"] / row["median_slot_ms"] if row["median_slot_ms"] else float("nan")
-                print(
-                    f"{row['regime']} vs {base['regime']}: "
-                    f"end_to_end x{speedup:.2f}, per_slot x{slot_speedup:.2f}"
-                )
-        if args.json_out is not None:
-            args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(json.dumps({"world": world, "runs": results}, indent=2))
-            print(f"WROTE_JSON={args.json_out}")
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps({"world": world, "runs": results}, indent=2))
+        print(f"WROTE_JSON={args.json_out}")
 
 
 if __name__ == "__main__":

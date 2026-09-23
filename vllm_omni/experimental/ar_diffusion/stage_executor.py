@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.versioned import VersionedKVState
 from vllm_omni.experimental.ar_diffusion.stage_schedule import (
@@ -22,6 +25,20 @@ from vllm_omni.experimental.ar_diffusion.stage_schedule import (
 #: Wall time of each slot executed on the rank that owns rank 0 of the stage
 #: pipeline. Experimental telemetry only; a harness clears it per request.
 SLOT_TIMES: list[float] = []
+
+#: Optional file (one float seconds per line) where rank 0 appends slot times.
+#: Needed because the stage loop runs in an mp worker process, so the parent
+#: cannot read ``SLOT_TIMES`` directly.
+_SLOT_TIMES_FILE = os.environ.get("AR_DIFFUSION_SLOT_TIMES_FILE") or None
+
+logger = init_logger(__name__)
+
+
+def _record_slot(delta: float) -> None:
+    SLOT_TIMES.append(delta)
+    if _SLOT_TIMES_FILE:
+        with open(_SLOT_TIMES_FILE, "a") as fh:
+            fh.write(f"{delta}\n")
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -162,6 +179,14 @@ def run_stage_pipeline(
     kv = ctx.kv
     kv.bind_rank(spec.rank, spec.pp_group)
     pp = spec.pp_group
+    logger.info(
+        "[stage_pipeline] start: stages=%d layer_groups=%d rank=%d inflight=%d pending=%d",
+        spec.topology.stages,
+        spec.topology.layer_groups,
+        spec.rank,
+        len(ctx.inflight),
+        len(ctx.pending),
+    )
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
     pending_hidden: Any | None = None
@@ -215,7 +240,7 @@ def run_stage_pipeline(
         kv.evict(slot)
         kv.await_ready(slot)
         if spec.rank == 0:
-            SLOT_TIMES.append(time.perf_counter() - slot_started)
+            _record_slot(time.perf_counter() - slot_started)
         slot += 1
     # Teardown: land anything the narrowed waits skipped.
     kv.drain()
