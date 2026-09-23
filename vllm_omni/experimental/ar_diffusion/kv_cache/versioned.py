@@ -9,7 +9,7 @@ from typing import Any, ClassVar
 
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views, compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerInputs
 from vllm_omni.experimental.ar_diffusion.stage_schedule import (
     ChunkStep,
@@ -297,6 +297,8 @@ class VersionedKVState:
         self._pp_group = pp_group
 
     def begin_request(self, req: str, plan: StagePlan, *, chunk_tokens: int, t0: int = 0) -> None:
+        if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
+            raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:
             raise ValueError("chunk_tokens exceeds max_chunk_tokens")
         self._plans[req] = plan
@@ -326,31 +328,29 @@ class VersionedKVState:
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
         batch: list[list[VersionedLayerContext]] = []
         for req, task in tasks:
+            chunk_tokens = self._chunk_tokens[req]
+            num_chunk_blocks = chunk_tokens // pool.block_size
             plan = self._plans[req]
             srcs = plan.sources(task, self._rank)
             write_key = _version_key(req, task)
             write_slot = pool.alloc(write_key)
+            write_blocks = pool.block_ids(write_slot)[:num_chunk_blocks]
             blocks: list[int] = []
             for src in srcs:
                 src_key = _version_key(req, src.version)
                 if not pool.has(src_key):
                     raise RuntimeError(f"I5: source {src_key} missing at prepare")
-                blocks.extend(pool.block_ids(pool.slot_of(src_key)))
-            blocks.extend(pool.block_ids(write_slot))
+                blocks.extend(pool.block_ids(pool.slot_of(src_key))[:num_chunk_blocks])
+            blocks.extend(write_blocks)
             padded = blocks + [0] * (width - len(blocks))
-            chunk_tokens = self._chunk_tokens[req]
             seq_len = (len(srcs) + 1) * chunk_tokens
             device = pool.k_pools[0].device
             block_table = torch.tensor([padded], dtype=torch.int32, device=device)
             query_start_loc = torch.tensor([0, chunk_tokens], dtype=torch.int32, device=device)
             seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-            video_slots = torch.tensor(
-                [bid * pool.block_size + off for bid in pool.block_ids(write_slot) for off in range(pool.block_size)][
-                    :chunk_tokens
-                ],
-                dtype=torch.long,
-                device=device,
-            )
+            video_slots = compute_slot_mapping(
+                write_blocks, torch.arange(chunk_tokens, dtype=torch.long), pool.block_size
+            ).to(device=device)
             layer_ctxs = [
                 VersionedLayerContext(
                     layer_idx=layer,

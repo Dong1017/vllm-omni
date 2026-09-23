@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 from vllm_omni.experimental.ar_diffusion.kv_cache.versioned import (
     ARDiffusionVersionedKVSpec,
     VersionedKVCache,
@@ -31,7 +32,7 @@ def _cache(**kwargs) -> VersionedKVCache:
         num_kv_heads=2,
         head_size=4,
         block_size=4,
-        max_chunk_tokens=4,
+        max_chunk_tokens=kwargs.get("max_chunk_tokens", 4),
         max_history_chunks=6,
     )
     return VersionedKVCache(
@@ -117,3 +118,75 @@ def test_wait_ready_is_empty_without_kv_history():
     inflight = (Inflight(req="A", t0=0, plan=plan),)
     for slot in range(plan.num_slots):
         assert union_wait_ready(inflight, slot, 0) == frozenset()
+
+
+@pytest.mark.parametrize("stages", [1, 3])
+@pytest.mark.parametrize("chunk", [1, 3])
+@pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
+def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
+    plan = build_stage_plan(
+        StageSchedule(
+            chunks=4,
+            num_denoise_steps=2,
+            stages=stages,
+            layer_groups=2,
+            ordering=Ordering.SERIAL,
+            kv_history_chunks=6,
+        )
+    )
+    cache = _cache(max_chunk_tokens=12)
+    state = VersionedKVState(cache)
+    state.bind_rank(0, None)
+    state.begin_request("A", plan, chunk_tokens=chunk_tokens)
+    task = (chunk, 0)
+    sources = plan.sources(task, 0)
+    assert len(sources) == chunk
+    source_slots = [cache.pool.alloc(("A", *src.version)) for src in sources]
+    # 同一 chunk 的未选版本也驻留，读取仍只能遵守计划。
+    first_chunk, first_step = sources[0].version
+    cache.pool.alloc(("A", first_chunk, (first_step + 1) % 3))
+    contexts = state.prepare((("A", task),))[0]
+    generator = torch.Generator().manual_seed(42)
+    shape = (chunk_tokens, cache.spec.num_kv_heads, cache.spec.head_size)
+    for context in contexts:
+        context.key_pool.zero_()
+        context.value_pool.zero_()
+        unused = torch.ones(context.key_pool.shape[0], dtype=torch.bool)
+        keys, values = [], []
+        for slot in source_slots:
+            start = slot * cache.spec.max_chunk_tokens
+            key = torch.randn(shape, generator=generator)
+            value = torch.randn(shape, generator=generator)
+            context.key_pool[start : start + chunk_tokens] = key
+            context.value_pool[start : start + chunk_tokens] = value
+            unused[start : start + chunk_tokens] = False
+            keys.append(key)
+            values.append(value)
+        query = torch.randn(shape, generator=generator)
+        current_key = torch.randn(shape, generator=generator)
+        current_value = torch.randn(shape, generator=generator)
+        keys.append(current_key)
+        values.append(current_value)
+        unused[context.video_slots] = False
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1),
+            torch.cat(keys).transpose(0, 1),
+            torch.cat(values).transpose(0, 1),
+        ).transpose(0, 1)
+        inputs = context.to_layer_inputs()
+        actual = paged_write_attn(inputs, query, current_key, current_value, None, None, cache.spec.head_size**-0.5)
+        torch.testing.assert_close(actual, expected)
+
+        # 修改预留页和未选版本后，attention 输出不应变化。
+        context.key_pool[unused] = 50
+        context.value_pool[unused] = -100
+        after = paged_write_attn(inputs, query, current_key, current_value, None, None, cache.spec.head_size**-0.5)
+        torch.testing.assert_close(after, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk_tokens", [-4, 0, 3, 5, 16])
+def test_begin_request_rejects_invalid_chunk_length(chunk_tokens):
+    state = VersionedKVState(_cache(max_chunk_tokens=12))
+    with pytest.raises(ValueError, match="chunk_tokens"):
+        state.begin_request("A", _vertical_plan(), chunk_tokens=chunk_tokens)
+    assert state.resident_versions == 0
