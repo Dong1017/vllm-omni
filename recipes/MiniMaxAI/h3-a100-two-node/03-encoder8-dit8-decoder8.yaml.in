@@ -1,0 +1,67 @@
+# 82: encoder TP8 and independent VAE decoder patch8; 83: DiT USP8.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+connectors:
+  cross_host:
+    name: MooncakeStoreConnector
+    extra:
+      host: "__NODE_IP__"
+      metadata_server: "http://__MASTER_IP__:8080/metadata"
+      master: "__MASTER_IP__:50051"
+      segment: 512000000
+      localbuf: 64000000
+      proto: tcp
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3,4,5,6,7"
+    tensor_parallel_size: 8
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    max_model_len: 6144
+    enforce_eager: true
+    output_connectors: {to_stage_1: cross_host}
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder: {parallel_mode: tp}
+        video_vae: {parallel_mode: patch}
+        audio_vae: {parallel_mode: leader}
+    default_sampling_params:
+      max_tokens: 1
+      temperature: 0.0
+      detokenize: false
+
+  - stage_id: 1
+    devices: "0,1,2,3,4,5,6,7"
+    max_num_seqs: 1
+    enforce_eager: true
+    input_connectors: {from_stage_0: cross_host}
+    output_connectors: {to_stage_2: cross_host}
+    enable_distributed_layerwise_offload: true
+    dlo_use_allgather: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      vae_patch_parallel_size: 1
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 2
+
+  - stage_id: 2
+    devices: "0,1,2,3,4,5,6,7"
+    max_num_seqs: 1
+    enforce_eager: true
+    input_connectors: {from_stage_1: cross_host}
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      vae_patch_parallel_size: 8
+    default_sampling_params:
+      seed: 42
