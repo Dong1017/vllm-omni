@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "Usage: NODE_IP=10.90.67.82 bash launch.sh {02|03} {0|1|2} /path/to/MiniMax-H3" >&2
+  echo "Usage: NODE_IP=10.90.67.82 bash launch.sh {02|02dp|03} {0|1|2} /path/to/MiniMax-H3/Ref2VA" >&2
   exit 2
 fi
 
@@ -14,12 +14,14 @@ master_ip=${MASTER_IP:-10.90.67.82}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 case "$topology:$stage_id:$node_ip" in
-  02:0:10.90.67.82|02:1:10.90.67.83|03:0:10.90.67.82|03:1:10.90.67.83|03:2:10.90.67.82) ;;
+  02:0:10.90.67.82|02:1:10.90.67.83|\
+  02dp:0:10.90.67.82|02dp:0:10.90.67.83|02dp:1:10.90.67.83|\
+  03:0:10.90.67.82|03:1:10.90.67.83|03:2:10.90.67.82|03:2:10.90.67.83) ;;
   *) echo "Invalid topology/stage/node placement: $topology/$stage_id/$node_ip" >&2; exit 2 ;;
 esac
 
 case "$topology" in
-  02)
+  02|02dp)
     template="$root/02-encoder8-dit8.yaml.in"
     base_config="$root/../../../vllm_omni/deploy/minimax_h3_disaggregated.yaml"
     ;;
@@ -46,8 +48,11 @@ args=(serve "$model" --omni --trust-remote-code
   --deploy-config "$deploy_config" --stage-id "$stage_id"
   --omni-master-address "$master_ip" --omni-master-port 36000
   --stage-init-timeout 1800 --init-timeout 1800)
-if [[ "$stage_id" == 0 ]]; then
+if [[ "$stage_id" == 0 && "$node_ip" == "$master_ip" ]]; then
   args+=(--host 0.0.0.0 --port 18091)
+  if [[ "$topology" == 02dp ]]; then
+    args+=(--omni-lb-policy round-robin)
+  fi
 else
   args+=(--headless)
 fi
