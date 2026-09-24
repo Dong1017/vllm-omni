@@ -19,14 +19,22 @@ case "$topology:$stage_id:$node_ip" in
 esac
 
 case "$topology" in
-  02) template="$root/02-encoder8-dit8.yaml.in" ;;
-  03) template="$root/03-encoder8-dit8-decoder8.yaml.in" ;;
+  02)
+    template="$root/02-encoder8-dit8.yaml.in"
+    base_config="$root/../../../vllm_omni/deploy/minimax_h3_disaggregated.yaml"
+    ;;
+  03)
+    template="$root/03-encoder8-dit8-decoder8.yaml.in"
+    base_config="$root/../../../vllm_omni/deploy/minimax_h3_disaggregated_decode.yaml"
+    ;;
 esac
 
 run_dir=${RUN_DIR:-"$PWD/h3-a100-run-$topology"}
 mkdir -p "$run_dir"
 deploy_config="$run_dir/deploy-stage${stage_id}.yaml"
-sed -e "s/__NODE_IP__/$node_ip/g" -e "s/__MASTER_IP__/$master_ip/g" "$template" > "$deploy_config"
+sed -e "s|__BASE_CONFIG__|$base_config|g" \
+  -e "s/__NODE_IP__/$node_ip/g" -e "s/__MASTER_IP__/$master_ip/g" \
+  "$template" > "$deploy_config"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

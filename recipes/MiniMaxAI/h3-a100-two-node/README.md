@@ -4,6 +4,12 @@ This experiment uses the already proven Mooncake Store TCP control/data plane.
 Node `10.90.67.82` owns the API and encoder TP8; node `10.90.67.83` owns DiT
 USP8. The three-stage run additionally places an independent VAE decoder
 patch8 on node 82. Both machines use their **local** CUDA devices `0-7`.
+The two-stage YAML inherits the repository's
+`vllm_omni/deploy/minimax_h3_disaggregated.yaml`; the three-stage YAML inherits
+the decoder-split YAML added by this branch. The overlays change placement,
+transport, memory limits, and two-step smoke-test settings. The repository also has a NIXL overlay,
+but these runs use Mooncake Store because it is the transport already tested on
+nodes 82 and 83.
 
 This is a 16-physical-GPU *deployment*, not DiT USP16. The diffusion executor
 currently supports local `mp`; its `ray` and `external_launcher` backends raise
