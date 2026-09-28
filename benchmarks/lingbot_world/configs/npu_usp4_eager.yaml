@@ -12,10 +12,10 @@
 # each rank needs only ~12.0 GiB of KV/scratch/state and the DEFAULT cache
 # geometry (window=9 + sink=9 frames) fits with ~3.2 GiB slack.
 #
-# Serve it under a 4-card canhazgpu reservation (ASCEND_RT_VISIBLE_DEVICES
-# must carry the physical card ids, e.g. 0,1,2,5):
+# Serve it under a four-card reservation (ASCEND_RT_VISIBLE_DEVICES must
+# carry the physical card ids reserved on the host):
 #
-#   vllm-omni serve /dataset/home/dxw/models/lingbot-world-v2-14b-causal-fast-diffusers \
+#   vllm-omni serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
 #     --omni --deploy-config benchmarks/lingbot_world/configs/npu_usp4_eager.yaml \
 #     --port 8000
 
