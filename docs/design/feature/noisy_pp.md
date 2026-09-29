@@ -31,7 +31,7 @@ layer pipeline parallel:
 1. **Latest** (`Ordering.INTERLEAVED`): diagonal overlap across chunks; attention
    may read the newest finished noisy or clean KV version strictly earlier than
    the current slot.
-2. **SERIAL** (`Ordering.SERIAL`): finish one chunk's stages before the next;
+2. **Serial** (`Ordering.SERIAL`): finish one chunk's stages before the next;
    history reads clean KV. Same topology as Latest; used as the Self-Forcing
    baseline.
 
@@ -56,15 +56,15 @@ walks the PP chain; activations move along `next_rank`, while versioned KV moves
 **within a column** (same `g`, higher stage → lower stage) when Latest needs a
 remote history page.
 
-### SERIAL vs Latest
+### Serial vs Latest
 
 | Strategy | Chunk advance | History KV |
 | --- | --- | --- |
-| SERIAL | One chunk completes all stages before the next starts | Clean versions only |
+| Serial | One chunk completes all stages before the next starts | Clean versions only |
 | Latest | Chunks overlap on a diagonal schedule | Newest finished version with completion slot strictly earlier than the consumer |
 
 Both strategies share one visibility rule: pick the highest step version whose
-completion is strictly earlier than the current slot. SERIAL is the degenerate
+completion is strictly earlier than the current slot. Serial is the degenerate
 schedule where “newest” is always clean.
 
 `chunk_schedule` is an **in-generation** choice on one `ChunkPlan`. It is not a
@@ -111,7 +111,9 @@ stage S−1   rank (S−1)G ─────▶ … ─────────�
 
 Layer split for Noisy PP uses `(g, G)` (`get_pp_indices(B, pp_rank % G, G)`),
 not a naive split over `world = S·G`. Production Wan2.2 PP stays on its existing
-`make_layers` path.
+`make_layers` path. Real Wan activations: non-last groups pack
+`{latent, hidden_states}`; stage-last unpatches, advances with FlowEuler, and
+packs `{latent}` to the next stage (or back to rank 0 when `S=1`).
 
 ### Components
 
@@ -134,7 +136,7 @@ ARDiffusionModelRunner
 | Piece | Owns | Does not own |
 | --- | --- | --- |
 | Runner | Pool bind, capacity, fail-closed cleanup | Denoise math, model conditioning |
-| `chunk_schedule` | SERIAL/Latest plan, visibility, transfers, last-use | Tensor addresses, session identity |
+| `chunk_schedule` | Serial/Latest plan, visibility, transfers, last-use | Tensor addresses, session identity |
 | `chunk_executor` | Slot loop, activation P2P, KV exchange timing | Model-specific noise / CFG |
 | NoisyKV | Version storage, peer transfer, eviction | Paged session sink/window policy |
 | Pipeline | Capability declaration, adapter forward | Rank routing / LRU |
@@ -175,7 +177,7 @@ s* = max { s | P_g(c', s) < current_slot }
 ```
 
 Clean version `(c', T)` is the highest step and stops upgrading once finished.
-SERIAL schedules never expose unfinished noisy pages to later chunks.
+Serial schedules never expose unfinished noisy pages to later chunks.
 
 ### Invariants (selected)
 
@@ -210,9 +212,9 @@ YAMLs stay on paged session paths and must not silently switch to
 
 | Combination | Meaning | Status |
 | --- | --- | --- |
-| No session + SERIAL/Latest | WaveServe / Noisy PP offline | Supported (opt-in deploy) |
+| No session + Serial/Latest | WaveServe / Noisy PP offline | Supported (opt-in deploy) |
 | Session + legacy loop | DreamZero / LingBot default | Supported (unchanged) |
-| Session + Chunk SERIAL/Latest | Realtime + diagonal overlap | Designed; not required for #102 |
+| Session + Chunk Serial/Latest | Realtime + diagonal overlap | Designed; not required for #102 |
 
 Capability surface: `SupportsARDiffusionChunkPipeline` with
 `ar_diffusion_noisy_kv_spec()` and `bind_ar_diffusion_chunk_context()`.
@@ -247,13 +249,12 @@ PP size for `S > 1`.
 
 - 1 GPU: `S=1`, real Wan weights, `schedule=serial`
 - 2 GPU: `S=2` (`T=1`), real Wan weights, gather→VAE device pinning
-- Multi-GPU: `S=T+1` SERIAL vs Latest via
+- Multi-GPU: `S=T+1` Serial vs Latest via
   `benchmarks/noisy_pp/waveserve_serial_vs_latest.py`
 - Recipe commands: `recipes/Physis-AI/WaveServe-Wan.md`
 
 ## Limitations and open issues
 
-- Real Wan path currently requires `G = 1` (full DiT per stage rank).
 - No TP × Noisy PP composition yet; WaveServe experimental DiT is PP-oriented.
 - Runner still branches paged session KV vs NoisyKV at preallocate time.
 - Optional Session⊕Chunk resident-clean eviction is specified but not required

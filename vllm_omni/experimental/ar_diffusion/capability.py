@@ -198,7 +198,7 @@ class SupportsARDiffusionWarmup(Protocol):
 
 @runtime_checkable
 class SupportsARDiffusionChunkPipeline(Protocol):
-    """Chunk SERIAL/Latest pipeline (vertical slice). Mutually exclusive with tick KV."""
+    """Chunk Serial/Latest pipeline (vertical slice). Mutually exclusive with tick KV."""
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         ...

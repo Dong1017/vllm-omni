@@ -4,7 +4,7 @@
 
 - Vendor: Physis-AI
 - Model: `Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev` (Wan 2.1 T2V 1.3B, rectified-flow)
-- Task: **Noisy PP** — chunk-autoregressive text-to-video with SERIAL / Latest-KV within one request
+- Task: **Noisy PP** — chunk-autoregressive text-to-video with Serial / Latest-KV within one request
 - Mode: Offline Omni with `deploy/waveserve_wan.yaml` + `ARDiffusionEngine`
 - Tracking: [project #102](https://github.com/JiusiServe/vllm-omni-project-manage/issues/102) (feature, v0.31); [#103](https://github.com/JiusiServe/vllm-omni-project-manage/issues/103) (model quality, v0.32)
 - Maintainer: Community (experimental)
@@ -12,7 +12,7 @@
 ## When to use this recipe
 
 Use this recipe to exercise **Noisy PP** on WaveServe Wan weights through Omni:
-same-request multi-chunk SERIAL (baseline) or Latest-KV diagonal overlap.
+same-request multi-chunk Serial (baseline) or Latest-KV diagonal overlap.
 DreamZero / LingBot default session paths are unchanged; this deploy is opt-in.
 
 This recipe intentionally avoids a model-specific Python example under
@@ -30,7 +30,9 @@ Python API and the noisy_pp bench script.
 ## Notes
 
 - **Noisy PP** topology: `pipeline_parallel_size = S · G` with `S = num_denoise_steps + 1`
-  (denoise stages + clean) and `G = 1` for the current real Wan path.
+  (denoise stages + clean). `G = 1` keeps a full DiT per stage rank; `G > 1`
+  splits layers within each stage (`forward_latent_step` + activation pack
+  `{latent[, hidden_states]}`).
 - Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
 - The test checkpoint was distilled with timestep **shift 5.0**.
 - `chunk_schedule` is a request `extra_args` choice (`serial` | `latest`), not a

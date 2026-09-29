@@ -7,6 +7,10 @@ weight layout / ``load_weights``) and runs real 5D latent steps via
 ``forward_latent_step``. Layer split follows WaveServe ``G`` (not Omni ``S·G``
 PP ranks): during construction we temporarily present PP world size = ``layer_groups``.
 
+``forward_latent_step`` is G-aware: stage-first patches, middle groups resume
+from ``IntermediateTensors``, stage-last unpatches. Activation packs carry
+``latent`` (and ``hidden_states`` between groups) along the PP chain.
+
 Tiny path keeps a small CPU-only stack for unit tests that must not require
 distributed Wan linear layers.
 """
@@ -373,13 +377,17 @@ class StageWanTransformer(nn.Module):
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         kv_contexts: list[Any] | None = None,
-    ) -> torch.Tensor:
-        """One denoise (or clean) pass: 5D latent → velocity/noise pred (5D).
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        """One denoise (or clean) pass over this rank's layer group.
 
-        Uses real ``WanTransformer3DModel`` patch / blocks / unpatch. Self-attn
-        is hooked to NoisyKV when ``kv_contexts`` is provided. Requires ``G``
-        partitioning where this rank owns the full local layer range; for the
-        common WaveServe ``G=1`` case that is the entire DiT.
+        Always needs 5D ``latent`` (RoPE / grid shape). Stage-first patches;
+        non-first resumes from ``intermediate_tensors["hidden_states"]``.
+        Stage-last unpatches to a 5D velocity/noise pred; non-last returns
+        ``IntermediateTensors`` for the next group on the PP chain.
+
+        Self-attn is hooked to NoisyKV when ``kv_contexts`` is provided.
+        ``G=1`` (first and last) is the full DiT path unchanged.
         """
         if self.tiny or self._wan is None:
             raise RuntimeError("forward_latent_step requires the real Wan DiT (non-tiny)")
@@ -390,25 +398,29 @@ class StageWanTransformer(nn.Module):
         p_t, p_h, p_w = self.patch_size
         post_t, post_h, post_w = num_frames // p_t, height // p_h, width // p_w
 
-        if not self.is_stage_first or not self.is_stage_last:
-            raise NotImplementedError(
-                "Real WaveServe latent path currently requires G=1 (full DiT per vertical stage)"
-            )
-
+        # RoPE from 5D latent on every group (same as wan2_2 PP).
         freqs_cos, freqs_sin = wan.rope(latent)
         rotary_emb = (
             freqs_cos[..., 0::2].to(latent.dtype),
             freqs_sin[..., 1::2].to(latent.dtype),
         )
 
-        hidden = wan.patch_embedding(latent)
-        hidden = hidden.flatten(2).transpose(1, 2)
+        if self.is_stage_first:
+            if intermediate_tensors is not None:
+                raise ValueError("stage-first layer group must not receive intermediate_tensors")
+            hidden = wan.patch_embedding(latent)
+            hidden = hidden.flatten(2).transpose(1, 2)
+        else:
+            if intermediate_tensors is None:
+                raise RuntimeError("non-first layer group requires intermediate_tensors[\"hidden_states\"]")
+            hidden = intermediate_tensors["hidden_states"]
 
         if timestep.ndim == 0:
             timestep = timestep.expand(batch_size)
         elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
 
+        # Conditioning on every group: each owns local blocks that need temb.
         temb, timestep_proj, enc, _enc_img = wan.condition_embedder(
             timestep, encoder_hidden_states, None, timestep_seq_len=None
         )
@@ -442,6 +454,9 @@ class StageWanTransformer(nn.Module):
                 hidden = block(hidden, enc, timestep_proj, rotary_emb, None, None, False)
             finally:
                 attn1.forward = orig_forward  # type: ignore[method-assign]
+
+        if not self.is_stage_last:
+            return IntermediateTensors({"hidden_states": hidden})
 
         shift, scale = wan.output_scale_shift_prepare(temb)
         shift = shift.to(hidden.device)

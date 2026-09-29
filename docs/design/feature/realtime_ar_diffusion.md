@@ -241,7 +241,7 @@ or later mix shared plan helpers with model hooks. Runner only binds KV/session.
 
 **Compatibility:** DreamZero and LingBot keep their current paged-session
 `forward` / stepwise paths as the default (implicitly serial inside the model).
-Wiring an optional session around an explicit Chunk SERIAL/Latest backend is
+Wiring an optional session around an explicit Chunk Serial/Latest backend is
 opt-in and must not silently replace those backends. Effective Latest-KV still
 needs vertical PP (`S=T+1`) and a separate deploy; default DreamZero / LingBot
 YAMLs stay on the existing topologies.

@@ -72,3 +72,68 @@ def test_waveserve_tiny_forward_cpu():
     assert len(outputs) == 1
     assert outputs[0].output is not None
     assert not ctx.inflight
+
+
+def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
+    """Non-last groups forward tokens; only stage-last runs FlowEuler."""
+    from vllm.sequence import IntermediateTensors
+
+    from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import (
+        FlowEuler,
+        _LatentChunkAdapter,
+    )
+
+    shape = (1, 4, 1, 2, 2)
+    device = torch.device("cpu")
+    dtype = torch.float32
+    prompt = torch.zeros(1, 8, 16, device=device, dtype=dtype)
+
+    class _FakeTransformer:
+        def __init__(self, *, is_stage_last: bool) -> None:
+            self.is_stage_last = is_stage_last
+
+        def forward_latent_step(self, latent, *, timestep, encoder_hidden_states, kv_contexts=None, intermediate_tensors=None):
+            del timestep, encoder_hidden_states, kv_contexts
+            if not self.is_stage_last:
+                assert intermediate_tensors is None or "hidden_states" in intermediate_tensors.tensors
+                tokens = torch.ones(latent.shape[0], 3, 8, device=latent.device, dtype=latent.dtype)
+                if intermediate_tensors is not None:
+                    tokens = tokens + intermediate_tensors["hidden_states"]
+                return IntermediateTensors({"hidden_states": tokens})
+            # Stage-last: return a 5D pred matching latent shape.
+            return torch.zeros_like(latent)
+
+    sampler = FlowEuler(2, shift=1.0)
+    mid = _LatentChunkAdapter(
+        _FakeTransformer(is_stage_last=False),  # type: ignore[arg-type]
+        sampler=sampler,
+        prompt_embeds=prompt,
+        latent_shape=shape,
+        seed=0,
+        device=device,
+        dtype=dtype,
+    )
+    last = _LatentChunkAdapter(
+        _FakeTransformer(is_stage_last=True),  # type: ignore[arg-type]
+        sampler=sampler,
+        prompt_embeds=prompt,
+        latent_shape=shape,
+        seed=0,
+        device=device,
+        dtype=dtype,
+    )
+
+    tasks = [("r0", (0, 0))]
+    mid_out = mid.forward(tasks, [None], hidden=None)
+    assert set(mid_out) == {"latent", "hidden_states"}
+    packed = mid.pack_activation(mid_out)
+    assert "latent" in packed and "hidden_states" in packed
+
+    last_in = last.unpack_activation(packed)
+    last_out = last.forward(tasks, [None], hidden=last_in)
+    assert set(last_out) == {"latent"}
+    assert 0 not in last.finished.get("r0", {})
+    # Second denoise step finishes the chunk on stage-last.
+    last_out2 = last.forward([("r0", (0, 1))], [None], hidden=last_out)
+    assert 0 in last.finished["r0"]
+    assert last_out2["latent"].shape == shape

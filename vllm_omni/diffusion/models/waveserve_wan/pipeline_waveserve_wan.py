@@ -131,7 +131,13 @@ class _TinyAdapter(ChunkAdapter):
 
 
 class _LatentChunkAdapter(ChunkAdapter):
-    """Real Wan path: 5D latents + FlowEuler; pack/unpack latents on the PP chain."""
+    """Real Wan path: 5D latents + FlowEuler along the PP chain.
+
+    Activation payload is always a dict:
+    - ``{"latent": ...}`` after stage-last (advanced / clean latent)
+    - ``{"latent": ..., "hidden_states": ...}`` after non-last layer groups
+      so the next group can RoPE from latent and resume tokens
+    """
 
     def __init__(
         self,
@@ -162,57 +168,94 @@ class _LatentChunkAdapter(ChunkAdapter):
         gen.manual_seed(self.seed * 1_000_003 + hash(req) % 1_000_000 + chunk * 4096)
         return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
 
+    @staticmethod
+    def _slice_batch(tensor: torch.Tensor, index: int, n_tasks: int) -> torch.Tensor:
+        if tensor.shape[0] == n_tasks:
+            return tensor[index : index + 1]
+        return tensor
+
     def forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
             return hidden
-        # Vertical G=1: one task per slot typically; activation is the 5D latent.
-        outs: list[torch.Tensor] = []
+        outs: list[dict[str, torch.Tensor]] = []
         for i, (req, (chunk, step)) in enumerate(tasks):
             ctx = kv_contexts[i] if i < len(kv_contexts) else None
             live = self._live.setdefault(req, {})
+            inter: IntermediateTensors | None = None
             if hidden is None:
                 latent = live.get(chunk)
                 if latent is None:
                     latent = self._init_noise(req, chunk)
             elif isinstance(hidden, torch.Tensor):
-                # Batched activations along dim0 when microbatch > 1
-                latent = hidden[i : i + 1] if hidden.shape[0] == len(tasks) else hidden
+                latent = self._slice_batch(hidden, i, len(tasks))
+            elif isinstance(hidden, dict):
+                if "latent" not in hidden:
+                    raise KeyError(f"activation dict missing latent; keys={list(hidden)}")
+                latent = self._slice_batch(hidden["latent"], i, len(tasks))
+                hs = hidden.get("hidden_states")
+                if hs is not None:
+                    inter = IntermediateTensors(
+                        {"hidden_states": self._slice_batch(hs, i, len(tasks))}
+                    )
             else:
-                raise TypeError(f"expected 5D latent activation, got {type(hidden)}")
+                raise TypeError(f"expected latent activation dict/tensor, got {type(hidden)}")
 
             if step < self.num_denoise_steps:
                 t = torch.tensor(self.sampler.timesteps[step], device=self.device, dtype=torch.float32)
-                pred = self.transformer.forward_latent_step(
+                out = self.transformer.forward_latent_step(
                     latent,
                     timestep=t,
                     encoder_hidden_states=self.prompt_embeds,
                     kv_contexts=ctx,
+                    intermediate_tensors=inter,
                 )
-                latent = self.sampler.advance(pred, latent, step)
+                if isinstance(out, IntermediateTensors):
+                    # Non-last layer group: forward tokens + carry 5D latent.
+                    live[chunk] = latent
+                    outs.append({"latent": latent, "hidden_states": out["hidden_states"]})
+                    continue
+                # Stage-last: unpatched pred → FlowEuler advance.
+                latent = self.sampler.advance(out, latent, step)
                 if step == self.num_denoise_steps - 1:
                     self.finished.setdefault(req, {})[chunk] = latent.detach()
             else:
                 # Clean KV refresh at t=0; latent already final.
                 t = torch.zeros((), device=self.device, dtype=torch.float32)
-                _ = self.transformer.forward_latent_step(
+                out = self.transformer.forward_latent_step(
                     latent,
                     timestep=t,
                     encoder_hidden_states=self.prompt_embeds,
                     kv_contexts=ctx,
+                    intermediate_tensors=inter,
                 )
+                if isinstance(out, IntermediateTensors):
+                    live[chunk] = latent
+                    outs.append({"latent": latent, "hidden_states": out["hidden_states"]})
+                    continue
                 self.finished.setdefault(req, {})[chunk] = latent.detach()
 
             live[chunk] = latent
-            outs.append(latent)
-        return torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
+            outs.append({"latent": latent})
+        return self._stack_payloads(outs)
+
+    @staticmethod
+    def _stack_payloads(outs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        if len(outs) == 1:
+            return outs[0]
+        keys = outs[0].keys()
+        return {key: torch.cat([out[key] for out in outs], dim=0) for key in keys}
 
     def pack_activation(self, output):
-        if not isinstance(output, torch.Tensor):
-            raise TypeError(f"latent adapter packs tensors, got {type(output)}")
-        return {"latent": output.contiguous()}
+        if isinstance(output, dict):
+            return {k: v.contiguous() for k, v in output.items() if isinstance(v, torch.Tensor)}
+        if isinstance(output, IntermediateTensors):
+            return {k: v.contiguous() for k, v in output.tensors.items()}
+        if isinstance(output, torch.Tensor):
+            return {"latent": output.contiguous()}
+        raise TypeError(f"latent adapter packs dict/tensor, got {type(output)}")
 
     def unpack_activation(self, payload: dict):
-        return payload["latent"]
+        return payload
 
 
 class WaveServeWanPipeline(nn.Module):
@@ -488,9 +531,6 @@ class WaveServeWanPipeline(nn.Module):
             run_chunk_pipeline(ctx=ctx, adapter=adapter)
             out = torch.zeros(len(requests), 3, 8, 16, 16, device=device, dtype=dtype)
             return [DiffusionOutput(output=out[i : i + 1]) for i in range(len(requests))]
-
-        if self.layer_groups != 1:
-            raise NotImplementedError("Real WaveServe path currently requires G=1")
 
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype

@@ -1,4 +1,4 @@
-# WaveServe Wan opt-in deploy for Noisy PP (SERIAL / Latest-KV).
+# WaveServe Wan opt-in deploy for Noisy PP (Serial / Latest-KV).
 #
 # Topology: pipeline_parallel_size = S * G with S = num_denoise_steps + 1
 # (one stage per denoise pass plus a clean KV pass) and G = layer groups
