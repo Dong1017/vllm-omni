@@ -10,18 +10,18 @@ import torch
 
 from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Inflight, Ordering, build_chunk_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
     NoisyKVState,
 )
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import Inflight, Ordering, ChunkSchedule, build_chunk_plan
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind: str) -> None:
+def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind: str, mode: str) -> None:
     backend = "nccl" if device_kind == "cuda" else "gloo"
     if device_kind == "cuda":
         current_omni_platform.set_device(torch.device("cuda", rank))
@@ -73,13 +73,31 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     handles = state.exchange(slot)
     for handle in handles:
         handle.wait()
-    state.await_ready(slot)
-
     expected_bytes = 2 * spec.num_layers * chunk_tokens * spec.num_kv_heads * spec.head_size * 4
+    if mode != "immediate":
+        assert cache.transport.await_ready(frozenset()) == (1 if rank == xfer.dst else 0)
+        torch.distributed.barrier()
+        cache.transport.exchange((), rank=rank, pp_group=pp_group, chunk_tokens_by_request={"A": chunk_tokens})
+        if mode == "discard":
+            if rank == xfer.dst:
+                state.evict(plan.last_use(rank)[xfer.version])
+                assert not pool.has(key)
+                assert key not in cache.transport._pending_recv
+                assert cache.transport.bytes_received == expected_bytes
+            torch.distributed.barrier()
+            state.end_request("A")
+            pp_group.destroy()
+            torch.distributed.destroy_process_group()
+            return
+        assert mode == "delayed"
+        assert cache.transport.await_ready(frozenset({key})) == 0
+    else:
+        state.await_ready(slot)
+
     if rank == xfer.src:
         assert state.bytes_sent == expected_bytes
     else:
-        assert state.bytes_received == expected_bytes
+        assert cache.transport.bytes_received == expected_bytes
         received_slot = pool.slot_of(key)
         start = received_slot * spec.max_chunk_tokens
         for layer in range(spec.num_layers):
@@ -102,9 +120,18 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
 
 
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
-def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int) -> None:
+@pytest.mark.parametrize("mode", ["immediate", "delayed"])
+def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int, mode: str) -> None:
     torch.multiprocessing.spawn(
         _transfer_worker,
-        args=(chunk_tokens, get_distributed_init_method(), "cpu"),
+        args=(chunk_tokens, get_distributed_init_method(), "cpu", mode),
+        nprocs=2,
+    )
+
+
+def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
+    torch.multiprocessing.spawn(
+        _transfer_worker,
+        args=(4, get_distributed_init_method(), "cpu", "discard"),
         nprocs=2,
     )

@@ -9,16 +9,16 @@ from typing import Any, ClassVar
 
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views, compute_slot_mapping
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerInputs
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    ChunkPlan,
     ChunkStep,
     Inflight,
     RequestKVTransfer,
-    ChunkPlan,
     union_transfers,
     union_wait_ready,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views, compute_slot_mapping
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerInputs
 
 VersionKey = tuple[str, int, int]  # req, chunk, step
 
@@ -193,7 +193,6 @@ class NoisyKVTransport:
         ``await_ready``; a rank never blocks on inbound data it does not read
         next slot.
         """
-        self._pending_recv.clear()
         self._send_handles = []
         if pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
             return []
@@ -238,8 +237,12 @@ class NoisyKVTransport:
             self.pool.copy_into(self.pool.slot_of(key), payload)
 
     def discard(self, key: VersionKey) -> None:
-        """Drop an inbound slot the executor already reclaimed."""
-        self._pending_recv.pop(key, None)
+        """Complete an unused inbound transfer before its slot is reclaimed."""
+        pending = self._pending_recv.pop(key, None)
+        if pending is not None:
+            handles, payload = pending
+            _wait_handles(handles)
+            self.bytes_received += _payload_bytes(payload)
 
 
 class NoisyKVCache:
@@ -398,6 +401,7 @@ class NoisyKVState:
                 if last == slot:
                     drop.append(_version_key(req, version))
         for key in drop:
+            self.cache.transport.discard(key)
             self.cache.pool.release(key)
         self.cache.resident_peak = max(self.cache.resident_peak, self.resident_versions)
 
