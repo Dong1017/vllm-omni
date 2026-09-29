@@ -1,0 +1,538 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""WaveServe Wan 2.1 1.3B (rectified-flow) chunk pipeline.
+
+Checkpoint: ``Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev``.
+DiT weights load through shared ``wan2_2.WanTransformer3DModel`` (standard Wan
+layout). Non-tiny path: text encode → 5D latent noise → vertical Chunk
+SERIAL/Latest with real Wan forward + FlowEuler → VAE decode on rank 0.
+Tiny path remains a CPU stub for unit tests only.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any, ClassVar
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
+
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.experimental.ar_diffusion.chunk_executor import (
+    ARDiffusionChunkContext,
+    ChunkAdapter,
+    resolve_pp_rank_and_group,
+    run_chunk_pipeline,
+)
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    ChunkSchedule,
+    Ordering,
+    build_chunk_plan,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+
+
+logger = init_logger(__name__)
+
+HF_MODEL_ID = "Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev"
+# Wan 2.1 1.3B geometry. Tiny mode is for CPU tests only.
+WAN21_1_3B = {
+    "num_layers": 30,
+    "dim": 1536,
+    "num_heads": 12,
+    "ffn_dim": 8960,
+    "in_channels": 16,
+    "patch_size": (1, 2, 2),
+}
+_DEFAULT_LATENT_SHAPE = (1, 16, 3, 60, 104)
+_DEFAULT_SHIFT = 5.0
+
+
+def _as_request_list(req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[OmniDiffusionRequest]:
+    if isinstance(req, DiffusionRequestBatch):
+        return list(req.requests)
+    return [req]
+
+
+class FlowEuler:
+    """Rectified-flow Euler matching Diffusers FlowMatchEulerDiscreteScheduler(shift=...)."""
+
+    def __init__(self, steps: int, shift: float = 1.0) -> None:
+        if steps < 1:
+            raise ValueError("steps must be positive")
+        if shift <= 0:
+            raise ValueError("shift must be positive")
+
+        def warp(sigma: torch.Tensor) -> torch.Tensor:
+            return shift * sigma / (1 + (shift - 1) * sigma)
+
+        shifted = warp(torch.linspace(1.0, float(warp(torch.tensor(1.0 / 1000))), steps, dtype=torch.float64))
+        self.sigmas = [*shifted.float().tolist(), 0.0]
+        self.timesteps = [1000.0 * sigma for sigma in self.sigmas[:-1]]
+
+    def advance(self, prediction: torch.Tensor, sample: torch.Tensor, step: int) -> torch.Tensor:
+        delta = self.sigmas[step + 1] - self.sigmas[step]
+        return (sample.float() + delta * prediction.float()).to(sample.dtype)
+
+
+class _TinyAdapter(ChunkAdapter):
+    """CPU-test stub: abstract tokens through the tiny StageWanTransformer."""
+
+    def __init__(self, transformer: StageWanTransformer, seed_hidden: torch.Tensor) -> None:
+        self.transformer = transformer
+        self.seed_hidden = seed_hidden
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        if not tasks:
+            return hidden
+        outs = []
+        for i, _task in enumerate(tasks):
+            h = hidden
+            if h is None:
+                h = self.seed_hidden
+            elif isinstance(h, torch.Tensor) and h.shape[0] == len(tasks):
+                h = h[i : i + 1]
+            elif isinstance(h, IntermediateTensors) and h["hidden_states"].shape[0] == len(tasks):
+                h = IntermediateTensors({key: value[i : i + 1] for key, value in h.tensors.items()})
+            ctx = kv_contexts[i] if i < len(kv_contexts) else None
+            outs.append(self.transformer(h, kv_contexts=ctx))
+        return self._stack(outs)
+
+    @staticmethod
+    def _stack(outs: list[Any]) -> Any:
+        first = outs[0]
+        if isinstance(first, IntermediateTensors):
+            stacked = {key: torch.cat([out.tensors[key] for out in outs], dim=0) for key in first.tensors}
+            return IntermediateTensors(stacked)
+        if isinstance(first, torch.Tensor):
+            return torch.cat(outs, dim=0)
+        return first
+
+    def pack_activation(self, output):
+        if isinstance(output, IntermediateTensors):
+            return dict(output.tensors)
+        if isinstance(output, torch.Tensor):
+            return {"hidden_states": output}
+        if hasattr(output, "tensors"):
+            return dict(output.tensors)
+        return {"hidden_states": output}
+
+    def unpack_activation(self, payload: dict):
+        if "hidden_states" in payload and len(payload) == 1:
+            return payload["hidden_states"]
+        return IntermediateTensors(payload)
+
+
+class _LatentChunkAdapter(ChunkAdapter):
+    """Real Wan path: 5D latents + FlowEuler; pack/unpack latents on the PP chain."""
+
+    def __init__(
+        self,
+        transformer: StageWanTransformer,
+        *,
+        sampler: FlowEuler,
+        prompt_embeds: torch.Tensor,
+        latent_shape: tuple[int, int, int, int, int],
+        seed: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.transformer = transformer
+        self.sampler = sampler
+        self.prompt_embeds = prompt_embeds
+        self.latent_shape = latent_shape
+        self.seed = seed
+        self.device = device
+        self.dtype = dtype
+        self.num_denoise_steps = len(sampler.timesteps)
+        # req -> chunk -> latent (after last denoise advance)
+        self.finished: dict[str, dict[int, torch.Tensor]] = {}
+        # Per-request current latents keyed by chunk while in flight on this rank
+        self._live: dict[str, dict[int, torch.Tensor]] = {}
+
+    def _init_noise(self, req: str, chunk: int) -> torch.Tensor:
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(self.seed * 1_000_003 + hash(req) % 1_000_000 + chunk * 4096)
+        return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        if not tasks:
+            return hidden
+        # Vertical G=1: one task per slot typically; activation is the 5D latent.
+        outs: list[torch.Tensor] = []
+        for i, (req, (chunk, step)) in enumerate(tasks):
+            ctx = kv_contexts[i] if i < len(kv_contexts) else None
+            live = self._live.setdefault(req, {})
+            if hidden is None:
+                latent = live.get(chunk)
+                if latent is None:
+                    latent = self._init_noise(req, chunk)
+            elif isinstance(hidden, torch.Tensor):
+                # Batched activations along dim0 when microbatch > 1
+                latent = hidden[i : i + 1] if hidden.shape[0] == len(tasks) else hidden
+            else:
+                raise TypeError(f"expected 5D latent activation, got {type(hidden)}")
+
+            if step < self.num_denoise_steps:
+                t = torch.tensor(self.sampler.timesteps[step], device=self.device, dtype=torch.float32)
+                pred = self.transformer.forward_latent_step(
+                    latent,
+                    timestep=t,
+                    encoder_hidden_states=self.prompt_embeds,
+                    kv_contexts=ctx,
+                )
+                latent = self.sampler.advance(pred, latent, step)
+                if step == self.num_denoise_steps - 1:
+                    self.finished.setdefault(req, {})[chunk] = latent.detach()
+            else:
+                # Clean KV refresh at t=0; latent already final.
+                t = torch.zeros((), device=self.device, dtype=torch.float32)
+                _ = self.transformer.forward_latent_step(
+                    latent,
+                    timestep=t,
+                    encoder_hidden_states=self.prompt_embeds,
+                    kv_contexts=ctx,
+                )
+                self.finished.setdefault(req, {})[chunk] = latent.detach()
+
+            live[chunk] = latent
+            outs.append(latent)
+        return torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
+
+    def pack_activation(self, output):
+        if not isinstance(output, torch.Tensor):
+            raise TypeError(f"latent adapter packs tensors, got {type(output)}")
+        return {"latent": output.contiguous()}
+
+    def unpack_activation(self, payload: dict):
+        return payload["latent"]
+
+
+class WaveServeWanPipeline(nn.Module):
+    """Chunk SERIAL/Latest pipeline (AR-Diffusion engine + noisy KV)."""
+
+    supports_request_batch = True
+    # Engine startup dummy forces num_inference_steps=2, which conflicts with
+    # vertical S=T+1; skip the engine dummy (not a measurement warmup).
+    dummy_run_num_frames: ClassVar[int] = 0
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        super().__init__()
+        del prefix
+        self.od_config = od_config
+        stage_cfg = getattr(od_config, "ar_diffusion_stage_config", None) or {}
+        if not isinstance(stage_cfg, dict):
+            stage_cfg = {}
+        model_cfg = getattr(od_config, "model_config", None) or {}
+        if isinstance(model_cfg, dict):
+            stage_cfg = {**stage_cfg, **(model_cfg.get("ar_diffusion_stage_config") or {})}
+        self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
+        tiny = bool(stage_cfg.get("tiny", False))
+        self.tiny = tiny
+        geo = dict(WAN21_1_3B)
+        if tiny:
+            geo.update(num_layers=2, dim=32, num_heads=2, ffn_dim=64)
+        self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
+        pp_rank, _pp_group = resolve_pp_rank_and_group()
+        self.pp_rank = pp_rank
+        model_path = str(getattr(od_config, "model", None) or HF_MODEL_ID)
+        self.model_path = model_path
+        transformer_config: dict[str, Any] | None = None
+        if not tiny:
+            try:
+                from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config
+
+                loaded = load_transformer_config(model_path, local_files_only=True)
+                if not loaded:
+                    loaded = load_transformer_config(model_path, local_files_only=False)
+                transformer_config = loaded or None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("WaveServe: could not load transformer config from %s: %s", model_path, exc)
+        self.transformer = StageWanTransformer(
+            num_layers=int(geo["num_layers"]),
+            dim=int(geo["dim"]),
+            num_heads=int(geo["num_heads"]),
+            ffn_dim=int(geo["ffn_dim"]),
+            in_channels=int(geo["in_channels"]),
+            patch_size=tuple(geo["patch_size"]),
+            layer_groups=self.layer_groups,
+            pp_rank=pp_rank,
+            tiny=tiny,
+            transformer_config=transformer_config,
+        )
+        # Default abstract sizes for tiny; real path overwrites per-request from latent shape.
+        self.block_size = 16 if tiny else 64
+        self.max_chunk_tokens = self.block_size * (2 if tiny else 32)
+        self.tokenizer = None
+        self.text_encoder = None
+        self.vae = None
+        if not tiny:
+            self._init_codec(model_path)
+            # Prefer a page size that divides the default WaveServe latent token count.
+            default_tokens = self.transformer.seq_len_for_latent(_DEFAULT_LATENT_SHAPE)
+            self.block_size = default_tokens
+            self.max_chunk_tokens = default_tokens
+        self._chunk_ctx: ARDiffusionChunkContext | None = None
+        logger.info(
+            "WaveServe Wan pipeline: S=%d G=%d layers=%d local=[%d, %d) tiny=%s codec=%s model=%s",
+            self.stage_parallel_size,
+            self.layer_groups,
+            self.transformer.num_layers,
+            self.transformer.start_layer,
+            self.transformer.end_layer,
+            tiny,
+            self.vae is not None,
+            model_path,
+        )
+
+    def _init_codec(self, model_path: str) -> None:
+        """Load UMT5 + Wan VAE. Prefer rank 0 for VAE decode ownership."""
+        from transformers import AutoTokenizer, UMT5EncoderModel
+
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+            DistributedAutoencoderKLWan,
+        )
+        from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
+
+        dtype = torch.bfloat16
+        try:
+            param = next(self.transformer.parameters())
+            dtype = param.dtype
+            device = param.device
+        except StopIteration:
+            device = torch.device("cpu")
+
+        # Text encoder on every DiT rank (needed each denoise step).
+        prefetch = ("tokenizer", "text_encoder", "vae")
+        self.tokenizer = from_pretrained_with_prefetch(
+            AutoTokenizer.from_pretrained,
+            model_path,
+            subfolder="tokenizer",
+            prefetch_list=prefetch,
+            local_files_only=False,
+        )
+        self.text_encoder = (
+            from_pretrained_with_prefetch(
+                UMT5EncoderModel.from_pretrained,
+                model_path,
+                subfolder="text_encoder",
+                prefetch_list=prefetch,
+                local_files_only=False,
+                torch_dtype=dtype,
+            )
+            .to(device)
+            .eval()
+        )
+        for p in self.text_encoder.parameters():
+            p.requires_grad_(False)
+        self.vae = (
+            from_pretrained_with_prefetch(
+                DistributedAutoencoderKLWan.from_pretrained,
+                model_path,
+                subfolder="vae",
+                prefetch_list=prefetch,
+                local_files_only=False,
+                torch_dtype=dtype,
+            )
+            .to(device)
+            .eval()
+        )
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
+        local_layers = max(1, self.transformer.local_num_layers)
+        return ARDiffusionNoisyKVSpec(
+            num_layers=local_layers,
+            num_kv_heads=self.transformer.num_heads,
+            head_size=self.transformer.head_dim,
+            block_size=self.block_size,
+            max_chunk_tokens=self.max_chunk_tokens,
+            max_history_chunks=max(1, self.max_history_chunks),
+        )
+
+    @contextmanager
+    def bind_ar_diffusion_chunk_context(self, ctx: ARDiffusionChunkContext) -> Iterator[None]:
+        prev = self._chunk_ctx
+        self._chunk_ctx = ctx
+        try:
+            yield
+        finally:
+            self._chunk_ctx = prev
+
+    def load_weights(self, weights):
+        """Load Wan DiT weights via ``wan2_2.WanTransformer3DModel.load_weights``."""
+        return self.transformer.load_weights(weights)
+
+    def _encode_prompt(self, prompt: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        assert self.tokenizer is not None and self.text_encoder is not None
+        from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+
+        max_length = 512
+        text = prompt_clean(prompt)
+        tokens = self.tokenizer(
+            [text],
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        ids = tokens.input_ids.to(device)
+        mask = tokens.attention_mask.to(device)
+        hidden = self.text_encoder(ids, mask).last_hidden_state.to(dtype=dtype)
+        length = int(mask.gt(0).sum().item())
+        return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
+
+    def _plan_for(self, req: OmniDiffusionRequest):
+        extra = (req.sampling_params.extra_args or {}) if req.sampling_params is not None else {}
+        chunks = int(extra.get("num_chunks", extra.get("chunks", 2)))
+        explicit_denoise = (
+            extra.get("num_inference_steps")
+            or extra.get("num_denoise_steps")
+            or getattr(req.sampling_params, "num_inference_steps", None)
+        )
+        denoise = int(explicit_denoise or 4)
+        history = int(extra.get("kv_history_chunks", 0) or 0)
+        if self.stage_parallel_size > 1 and history < 1:
+            history = self.max_history_chunks
+        schedule_name = str(extra.get("chunk_schedule", "serial"))
+        ordering = Ordering.SERIAL if schedule_name == "serial" else Ordering.INTERLEAVED
+        stages = self.stage_parallel_size
+        if stages not in (1, denoise + 1):
+            if explicit_denoise:
+                raise ValueError(f"WaveServe stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
+            denoise = stages - 1
+        schedule = ChunkSchedule(
+            chunks=chunks,
+            num_denoise_steps=denoise,
+            stages=stages,
+            layer_groups=self.layer_groups,
+            ordering=ordering,
+            kv_history_chunks=history,
+        )
+        return build_chunk_plan(schedule), extra, denoise
+
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        assert self.vae is not None
+        # all_gather_object can resurface peer-rank latents on another local
+        # cuda index (e.g. cuda:1 under CUDA_VISIBLE_DEVICES=0,3); pin to VAE.
+        vae_device = next(self.vae.parameters()).device
+        latents = latents.to(device=vae_device, dtype=self.vae.dtype)
+        mean = (
+            torch.tensor(self.vae.config.latents_mean, device=vae_device, dtype=latents.dtype)
+            .view(1, -1, 1, 1, 1)
+        )
+        std = (
+            1.0
+            / torch.tensor(self.vae.config.latents_std, device=vae_device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+        )
+        latents = latents / std + mean
+        video = self.vae.decode(latents, return_dict=False)[0]
+        return video.clamp(-1, 1)
+
+    def _gather_finished(
+        self, finished: dict[str, dict[int, torch.Tensor]], pp_group: Any | None
+    ) -> dict[str, dict[int, torch.Tensor]]:
+        """Union finished-chunk latents across PP ranks onto every rank (object list)."""
+        if not dist.is_initialized() or pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
+            return finished
+        world = int(pp_group.world_size)
+        group = getattr(pp_group, "device_group", None) or pp_group
+        gathered: list[Any] = [None] * world
+        dist.all_gather_object(gathered, finished, group=group)
+        merged: dict[str, dict[int, torch.Tensor]] = {}
+        # Prefer a stable local device for any CPU/foreign-cuda tensors after
+        # object gather (peer ranks may serialize a different cuda index).
+        local_device = next(self.transformer.parameters()).device
+        for part in gathered:
+            if not part:
+                continue
+            for req_id, chunks in part.items():
+                bucket = merged.setdefault(req_id, {})
+                for chunk, latent in chunks.items():
+                    if isinstance(latent, torch.Tensor):
+                        bucket[chunk] = latent.to(local_device, non_blocking=True)
+                    else:
+                        bucket[chunk] = latent
+        return merged
+
+    def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
+        ctx = self._chunk_ctx
+        if ctx is None:
+            raise RuntimeError("WaveServeWanPipeline requires bind_ar_diffusion_chunk_context")
+        requests = _as_request_list(req)
+        pp_rank, pp_group = resolve_pp_rank_and_group()
+
+        if self.tiny:
+            chunk_tokens = self.block_size
+            for item in requests:
+                plan, extra, _denoise = self._plan_for(item)
+                req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "req0")
+                ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
+            param = next(self.parameters())
+            device, dtype = param.device, param.dtype
+            seed_dim = self.transformer.in_features if self.transformer.is_stage_first else self.transformer.dim
+            hidden = torch.zeros(1, chunk_tokens, seed_dim, device=device, dtype=dtype)
+            adapter: ChunkAdapter = _TinyAdapter(self.transformer, seed_hidden=hidden)
+            run_chunk_pipeline(ctx=ctx, adapter=adapter)
+            out = torch.zeros(len(requests), 3, 8, 16, 16, device=device, dtype=dtype)
+            return [DiffusionOutput(output=out[i : i + 1]) for i in range(len(requests))]
+
+        if self.layer_groups != 1:
+            raise NotImplementedError("Real WaveServe path currently requires G=1")
+
+        param = next(self.transformer.parameters())
+        device, dtype = param.device, param.dtype
+        outputs: list[DiffusionOutput] = []
+        for item in requests:
+            plan, extra, denoise = self._plan_for(item)
+            req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "req0")
+            shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
+            if len(shape) != 5:
+                raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
+            shift = float(extra.get("shift", _DEFAULT_SHIFT))
+            seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
+            chunk_tokens = self.transformer.seq_len_for_latent(shape)
+            # Resize noisy KV paging to this request's token count.
+            self.block_size = chunk_tokens
+            self.max_chunk_tokens = chunk_tokens
+            ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
+
+            prompt = item.prompt if isinstance(item.prompt, str) else str(item.prompt or "")
+            prompt_embeds = self._encode_prompt(prompt, device, dtype)
+            sampler = FlowEuler(denoise, shift=shift)
+            adapter = _LatentChunkAdapter(
+                self.transformer,
+                sampler=sampler,
+                prompt_embeds=prompt_embeds,
+                latent_shape=shape,  # type: ignore[arg-type]
+                seed=seed,
+                device=device,
+                dtype=dtype,
+            )
+            run_chunk_pipeline(ctx=ctx, adapter=adapter)
+            finished = self._gather_finished(adapter.finished, pp_group)
+            chunk_map = finished.get(req_id, {})
+            if pp_rank == 0 and chunk_map:
+                ordered = [chunk_map[c] for c in sorted(chunk_map)]
+                # Concatenate along time for multi-chunk video.
+                latents = torch.cat(ordered, dim=2)
+                video = self._decode_latents(latents)
+                outputs.append(DiffusionOutput(output=video))
+            else:
+                # Non-owner ranks still return a typed placeholder for the engine.
+                outputs.append(
+                    DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype))
+                )
+        return outputs
