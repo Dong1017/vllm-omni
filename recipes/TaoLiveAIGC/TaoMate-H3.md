@@ -63,7 +63,7 @@ Per-deployment knobs live under `model_config`:
 | `taomate_h3_cuda_graph_max_entries` | 16 | Resident teacher graphs (least recently used shape evicted); they share one memory pool |
 | `taomate_h3_warmup_requests` | 4 | Requests of the load-time warmup session. Later requests cycle through three audio latent counts (198, 198, 199 per channel), so four requests visit every teacher document shape: the graphs are captured and every phase size has been allocated before the first client connects |
 | `taomate_h3_teacher_graph_text_lengths` | unset | Prompt token counts (`"lo-hi"`) whose teacher graphs are captured during the load-time warmup, three document shapes per count (about 0.5 s and 5 MB each, estimate); these graphs are pinned against LRU eviction by later shapes. A teacher graph is keyed by the prompt's token count, so without this each new prompt length captures inside the stream (about 0.7 s per shape). Needs `taomate_h3_pad_text_tokens` and enough `taomate_h3_cuda_graph_max_entries` |
-| `step_async_output` | false | Generic step-execution knob (read by the worker and the executor, not by the pipeline): pack each streamed chunk's media into shared memory on the worker's background thread and let the engine await it, instead of copying the 42 MB of frames per phase on the step thread. Measured locally at USP2: 4.98 -> 4.78 s per request (ten requests, constant short prompt); prompt updates unaffected |
+| `step_async_output` | false | Separate PR (branch `feat/step-async-output`). Generic step-execution knob (read by the worker and the executor, not by the pipeline): pack each streamed chunk's media into shared memory on the worker's background thread and let the engine await it, instead of copying the 42 MB of frames per phase on the step thread. Measured locally at USP2: 4.98 -> 4.78 s per request (ten requests, constant short prompt); prompt updates unaffected |
 | `taomate_h3_text_encoder_cuda_graph` | false | Replay the text-only prompt encode of a prompt update from a CUDA graph (one graph per token count, captured for `taomate_h3_teacher_graph_text_lengths` at load, exact: the encoder's own modules run with graph-safe indexing). Prompts with images or videos, offloaded encoders and non-encoder ranks keep the eager path |
 | `taomate_h3_adaln_cache` | true | Exact AdaLN projection cache. Its key is a host digest of the timestep embedding (one device-to-host copy per forward); `false` recomputes the few projected rows per layer and removes that synchronization from every student forward |
 | `taomate_h3_cudnn_benchmark` | false | cuDNN autotuning for the fixed-shape VAE convolutions (measured: no change) |
@@ -97,7 +97,7 @@ A `session.interaction` prompt update is applied at the next chunk boundary and 
 effect for the *next five-second request* (the audio teacher and all four phases of a
 request share one prompt), which is TaoMate's just-in-time prompt lock. Every chunk's
 `video.chunk_metadata` carries `num_frames`, `num_audio_samples` and `audio_sample_rate`;
-the stream has an H.264 video track and an AAC audio track. Chunk 1 of a session is
+the stream has an H.264 video track and an AAC audio track (the audio track comes with the separate fMP4 audio PR #8314; without it the stream is video only). Chunk 1 of a session is
 39 frames of latents but 34 frames of pixels: the decoder holds the last five frames of
 each temporal window until the next phase, and flushes them with the final chunk.
 

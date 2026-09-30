@@ -35,6 +35,8 @@ stages:
     # per-token activation scales (validated visually against eager BF16);
     # the layers that map between pixels, tokens and timesteps and the text
     # encoder stay in BF16. The LoRA hooks add their BF16 delta on top.
+    # `method: fp8_per_channel` with an ignore list needs the online-quantization
+    # factory PR #8315 (split out of the TaoMate-H3 PR).
     quantization:
       transformer:
         method: fp8_per_channel
@@ -107,6 +109,8 @@ stages:
       # thread instead of the step thread (about 45 ms per phase at 480x864).
       # Measured locally: 4.98 -> 4.78 s per 4.958 s request with a constant
       # short prompt (ten requests), prompt updates unaffected.
+      # Needs the step_async_output PR (branch tzhouam:feat/step-async-output, split out of the TaoMate-H3 PR); the
+      # knob is ignored until it lands, at about 0.2 s per request.
       step_async_output: true
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.02
