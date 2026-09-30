@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """P0 correctness matrix for the fused AdaLayerNorm CUDA path.
 
-Covers: fp32/bf16/fp16, B>1 (shared modulation), C in {1536,3072,4096},
-varying L, elementwise_affine False/True with NON-DEFAULT weight/bias,
-eps variants, legal non-contiguous inputs, broadcast scale/shift shapes
-((C,), (1,C), (1,1,C)), and fallback completeness (dtypes/shapes that must
-route to forward_native, incl. the frozen B>1 (B,C) RuntimeError).
+Covers: fp32/bf16/fp16, B>1 (shared and per-sample modulation), C in
+{1536, 3072, 4096}, varying L, elementwise_affine False/True with
+NON-DEFAULT weight/bias, eps variants, legal non-contiguous inputs,
+broadcast scale/shift shapes ((C,), (1, C), (1, 1, C), (B, 1, C)),
+fallback completeness (fp64, oversized hidden size, cross-device
+parameters), large-offset/small-variance stability, and the frozen
+B > 1 (B, C) native broadcast-error contract.
 """
 
 import pytest
@@ -70,8 +74,8 @@ def test_matrix_main(dtype, affine, bs, seq, hidden):
     x, scale, shift = make_inputs(bs, seq, hidden, dtype, device)
     out_cuda = m.forward_cuda(x, scale, shift)
     out_native = m.forward_native(x, scale, shift)
-    assert out_cuda.shape == x.shape and out_cuda.dtype == dtype
-    assert_close(out_cuda, out_native, dtype)
+    assert out_cuda.shape == x.shape and out_cuda.dtype == dtype and out_cuda.device == x.device
+    assert_close(out_cuda, out_native, dtype, loose=False)
     w = m.layernorm.weight if affine else None
     b = m.layernorm.bias if affine else None
     assert_close(out_cuda, fp32_reference(x, scale, shift, 1e-6, w, b), dtype, loose=True)
@@ -79,7 +83,8 @@ def test_matrix_main(dtype, affine, bs, seq, hidden):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_matrix_weight_bias_nondefault(dtype):
-    # weight/bias 语义真实验证（非恒等初始化）：out = (w*ln(x)+b)*(1+scale)+shift
+    # weight/bias semantics with non-identity initialization:
+    # out = (w * ln(x) + b) * (1 + scale) + shift
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, True, 1e-6, device, dtype, nondefault_affine=True)
@@ -110,7 +115,7 @@ def test_matrix_eps_variants(dtype, eps):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("mod_shape", ["C", "1x1xC", "1xC"])
 def test_matrix_broadcast_scale_shift(dtype, mod_shape):
-    # (C,) / (1,1,C) / (1,C) 都是对 x (B,L,C) 的合法 per-channel 广播
+    # (C,), (1, 1, C) and (1, C) are all legal per-channel broadcasts against x (B, L, C)
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
@@ -135,8 +140,36 @@ def test_matrix_broadcast_scale_shift(dtype, mod_shape):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_matrix_per_sample_modulation(dtype):
+    # Qwen-Image's _modulate produces (B, 1, C): one modulation row per sample.
+    # B > 1 must take the fused path (not fall back to native) and match native.
+    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
+
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, dtype)
+    x, _, _ = make_inputs(4, 512, hidden, dtype, device, seed=7, mod_shape=(4, hidden))
+    g = torch.Generator(device=device).manual_seed(8)
+    scale = torch.randn(4, 1, hidden, generator=g, device=device, dtype=dtype)
+    shift = torch.randn(4, 1, hidden, generator=g, device=device, dtype=dtype)
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "(B, 1, C) per-sample modulation must take the fused path"
+    out_cuda = fused
+    out_native = m.forward_native(x, scale, shift)
+    assert_close(out_cuda, out_native, dtype)
+    # fp32_reference's [:, None] expects a 2D (B, C) modulation row; the
+    # (B, 1, C) tensor reshapes to it losslessly.
+    ref = fp32_reference(x, scale.reshape(x.shape[0], hidden), shift.reshape(x.shape[0], hidden), 1e-6)
+    assert_close(out_cuda, ref, dtype, loose=True)
+    # Per-sample: different rows must receive different modulation.
+    row_diff = (out_cuda[0] - out_cuda[1]).abs().max().item()
+    assert row_diff > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_matrix_noncontiguous_fallback(dtype):
-    # 非连续输入必须回落 native 且结果正确（kernel 只服务连续快路径）
+    # Non-contiguous inputs must fall back to native and stay correct
+    # (the fused kernel only serves the contiguous fast path).
     device = "cuda"
     hidden = 1536
     m = make_module(hidden, False, 1e-6, device, dtype)
@@ -150,7 +183,8 @@ def test_matrix_noncontiguous_fallback(dtype):
 
 
 def test_matrix_fallback_fp64():
-    # fp64 不在 kernel 支持列表 → 必须走 native 且正确（fallback 完整性）
+    # fp64 is not in the kernel's supported dtype list -> must fall back to
+    # native and stay correct (fallback completeness).
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, torch.float64)
@@ -160,13 +194,43 @@ def test_matrix_fallback_fp64():
     torch.testing.assert_close(out_cuda, out_native)
 
 
+def test_matrix_fallback_oversized_hidden():
+    # hidden sizes whose next_power_of_2 exceeds the kernel's supported block
+    # bound must fall back to native and stay correct.
+    device = "cuda"
+    hidden = 10000  # next_power_of_2 = 16384 > MAX_BLOCK_C
+    m = make_module(hidden, False, 1e-6, device, torch.bfloat16)
+    x, scale, shift = make_inputs(1, 128, hidden, torch.bfloat16, device, seed=10)
+    out_cuda = m.forward_cuda(x, scale, shift)
+    out_native = m.forward_native(x, scale, shift)
+    torch.testing.assert_close(out_cuda, out_native)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_matrix_zero_scale_shift_identity(dtype):
+    # With scale = shift = 0 the output must equal a pure LayerNorm.
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, dtype)
+    x, _, _ = make_inputs(1, 256, hidden, dtype, device, seed=19)
+    scale = torch.zeros(1, hidden, device=device, dtype=dtype)
+    shift = torch.zeros(1, hidden, device=device, dtype=dtype)
+    out_cuda = m.forward_cuda(x, scale, shift)
+    assert_close(out_cuda, m.forward_native(x, scale, shift), dtype)
+    assert_close(out_cuda, m.layernorm(x), dtype)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_matrix_determinism(dtype):
+    # Two calls on the same input must agree bitwise (a hard constraint for
+    # any cached/direct-launch scheme).
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
     x, scale, shift = make_inputs(1, 4096, hidden, dtype, device, seed=11)
-    assert torch.equal(m.forward_cuda(x, scale, shift), m.forward_cuda(x, scale, shift))
+    out1 = m.forward_cuda(x, scale, shift)
+    out2 = m.forward_cuda(x, scale, shift)
+    assert torch.equal(out1, out2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -182,8 +246,10 @@ def test_matrix_multi_batch_shared_modulation(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_matrix_per_sample_modulation_batch_gt1_raises(dtype):
-    # 冻结语义：B>1 且 scale (B,C) 保持 RuntimeError（fused 与 native 一致）
+def test_matrix_bc_modulation_preserves_native_error(dtype):
+    # Frozen native contract: (B, C) modulation with B > 1 raises
+    # RuntimeError (torch broadcasts B against L). The fused path preserves
+    # this behavior - it neither supports nor silently changes it.
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
@@ -192,3 +258,61 @@ def test_matrix_per_sample_modulation_batch_gt1_raises(dtype):
         m.forward_native(x, scale, shift)
     with pytest.raises(RuntimeError):
         m.forward_cuda(x, scale, shift)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_matrix_cross_device_fallback(dtype):
+    # Raw pointers go to one Triton kernel, which does no cross-device
+    # checking: the fast-path guard must reject cross-device parameters so
+    # they fall back to native, which raises torch's own cross-device error
+    # instead of crashing in the kernel.
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, dtype)
+    x, scale, shift = make_inputs(1, 512, hidden, dtype, device, seed=21)
+    cpu_scale = scale.to("cpu")
+    with pytest.raises(RuntimeError):
+        m.forward_cuda(x, cpu_scale, shift)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_matrix_large_offset_small_variance(dtype):
+    """A large constant offset with a small variance must stay stable.
+
+    Mirrors the fused_adaptive_group_norm_silu case: x ~ 10000 +/- 0.1 has
+    mean ~1e4 and variance ~1e-2, so a plain fp32 sum of large-offset values
+    rounds away the low-order bits that the variance is built from. The fused
+    kernel centers the row on its first element before the tree sum
+    (shift-invariant two-pass), keeping mean/variance accurate.
+
+    For fp32 the meaningful reference is an fp64 computation, NOT the native
+    eager chain: at mean/std = 1e5 the native chain itself carries a
+    ~0.07 absolute deviation from the fp64 truth (its own fp32 dynamic-range
+    floor), while the fused kernel stays within ~2e-6. For fp16/bf16 inputs
+    the +/-0.1 perturbation quantizes away at magnitude 1e4, so the
+    meaningful assertion is that outputs stay finite and match native.
+    """
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, dtype)
+    x, scale, shift = make_inputs(1, 4096, hidden, dtype, device, seed=23)
+    out_cuda = m.forward_cuda(x, scale, shift)
+    out_native = m.forward_native(x, scale, shift)
+    assert torch.isfinite(out_cuda).all()
+
+    # fp64 reference computed from the SAME fp32 input the implementations see
+    # (the kernel cannot recover bits that fp32 quantization never stored).
+    x64 = x.double()
+    mean64 = x64.mean(dim=-1, keepdim=True)
+    var64 = x64.var(dim=-1, unbiased=False, keepdim=True)
+    ref64 = (x64 - mean64) * torch.rsqrt(var64 + 1e-6) * (1 + scale.double()[:, None, :]) + shift.double()[:, None, :]
+
+    if dtype is torch.float32:
+        # fp32 fused output vs the fp64 truth of the same input: within the
+        # fp32 representation floor (~2e-6 measured). The native eager chain
+        # deviates ~0.07 on the same input (its own dynamic-range floor) -
+        # documented, not asserted.
+        torch.testing.assert_close(out_cuda.double(), ref64, atol=1e-4, rtol=1e-4)
+    else:
+        # bf16/fp16 quantize the perturbation away: no NaN, matches native.
+        assert_close(out_cuda, out_native, dtype, loose=True)

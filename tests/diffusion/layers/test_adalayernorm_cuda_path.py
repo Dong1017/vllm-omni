@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Candidate-added tests for the fused Triton AdaLayerNorm CUDA path.
 
 Complements (never replaces) the frozen suite: exercises the fused fast path
@@ -9,6 +11,8 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 TOL_STRICT = {"bf16": (2e-2, 2e-2), "fp32": (1e-3, 1e-3)}
 # Matches the frozen suite: the double-rounded golden chain deviates from a
