@@ -29,19 +29,20 @@ def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0):
 
 
 def test_compile_smoke():
-    # torch.compile over the guarded forward_cuda. Dynamo may graph-break on
-    # the data_ptr alignment checks or capture the Triton launch, and the
-    # compiled workload may fall back to native inside the compiled region:
-    # the reviewer concern for this mode is that the compiled workload stays
-    # FUNCTIONAL (no request failure, outputs match native), not that the
-    # Triton path necessarily remains inside the compiled graph.
+    # torch.compile over the guarded forward_cuda: with the is_compiling
+    # guard the compiled region takes the NATIVE chain, so this compares
+    # inductor's own LN+modulation fusion against the eager 3-kernel chain.
+    # Cross-implementation BF16 outputs differ at rounding level (up to a few
+    # ulps at O(1-8) magnitudes), hence the loose tolerance. The smoke
+    # verifies the compiled workload stays functional - no crash, finite
+    # outputs, no request failure.
     m, x, scale, shift = _make()
     compiled = torch.compile(m.forward_cuda, dynamic=False)
     out1 = compiled(x, scale, shift)
     out2 = compiled(x, scale, shift)
     native = m.forward_native(x, scale, shift)
-    torch.testing.assert_close(out1.float(), native.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(out2.float(), native.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out1.float(), native.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(out2.float(), native.float(), atol=5e-2, rtol=2e-2)
 
 
 def test_cuda_graph_capture_replay_smoke():

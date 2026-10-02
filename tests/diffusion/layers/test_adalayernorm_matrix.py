@@ -167,6 +167,68 @@ def test_matrix_per_sample_modulation(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_matrix_chunk_view_modulation(dtype):
+    # Wan2.2-style producer: the modulation projection is (B, 6, C) and the
+    # consumer chunks it along dim=1. The resulting (B, 1, C) views are
+    # NON-CONTIGUOUS (row stride 6*C) - the fused path must consume them
+    # directly via the explicit row stride, without a contiguous copy.
+    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
+
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, dtype)
+    x, _, _ = make_inputs(4, 512, hidden, dtype, device, seed=27)
+    g = torch.Generator(device=device).manual_seed(28)
+    source = torch.randn(4, 6, hidden, generator=g, device=device, dtype=dtype) * 0.1
+    chunks = source.chunk(6, dim=1)
+    scale, shift = chunks[1], chunks[2]
+    assert scale.shape == (4, 1, hidden) and shift.shape == (4, 1, hidden)
+    assert not scale.is_contiguous()
+    assert scale.stride(-1) == 1
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "chunk-view modulation must take the fused path"
+    out_native = m.forward_native(x, scale, shift)
+    assert_close(fused, out_native, dtype)
+    ref = fp32_reference(x, scale.reshape(4, hidden), shift.reshape(4, hidden), 1e-6)
+    assert_close(fused, ref, dtype, loose=True)
+
+
+def test_matrix_3d_modulation_fallback():
+    # Wan2.2 TI2V-style per-token modulation: scale/shift (B, L, C) full 3D.
+    # This is intentionally outside the fused kernel contract - the fast path
+    # must be rejected (None) and forward_cuda must match native.
+    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
+
+    device = "cuda"
+    hidden = 3072
+    m = make_module(hidden, False, 1e-6, device, torch.bfloat16)
+    x, scale, shift = make_inputs(2, 128, hidden, torch.bfloat16, device, seed=29, mod_shape=(2, 128, hidden))
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is None, "(B, L, C) per-token modulation must be rejected"
+    out = m.forward_cuda(x, scale, shift)
+    native = m.forward_native(x, scale, shift)
+    torch.testing.assert_close(out.float(), native.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_matrix_production_widths(dtype):
+    # Real consumer widths: Sana-WM 2240 (BLOCK_C 4096, 45.3% mask) and
+    # Wan2.2 A14B 5120 (BLOCK_C 8192, the max supported block, 16-warp
+    # compiled variant). BF16 + elementwise_affine=False.
+    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
+
+    device = "cuda"
+    for hidden in (2240, 5120):
+        m = make_module(hidden, False, 1e-6, device, dtype)
+        x, scale, shift = make_inputs(1, 512, hidden, dtype, device, seed=31)
+        fused = _adaln_fused_forward(m, x, scale, shift)
+        assert fused is not None, f"hidden={hidden} must take the fused path"
+        out_native = m.forward_native(x, scale, shift)
+        assert_close(fused, out_native, dtype)
+        assert_close(fused, fp32_reference(x, scale, shift, 1e-6), dtype, loose=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_matrix_noncontiguous_fallback(dtype):
     # Non-contiguous inputs must fall back to native and stay correct
     # (the fused kernel only serves the contiguous fast path).

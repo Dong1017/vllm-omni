@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.triton_utils import HAS_TRITON as _HAS_TRITON
+from vllm.triton_utils import tl, triton
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -15,15 +17,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _HAS_MINDIESD = find_spec("mindiesd") is not None
-
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON = True
-except ImportError:  # pragma: no cover - triton is a hard dep on CUDA builds
-    _HAS_TRITON = False
-
 
 # Fast-path bound: one Triton program covers the whole normalized dimension, so
 # BLOCK_C = next_power_of_2(C) grows with the hidden size. The diffusion models
@@ -55,6 +48,8 @@ if _HAS_TRITON:
         eps,
         channels,
         seq_len,
+        scale_row_stride,
+        shift_row_stride,
         has_weight: tl.constexpr,
         has_bias: tl.constexpr,
         is_half: tl.constexpr,
@@ -62,12 +57,14 @@ if _HAS_TRITON:
         per_sample_shift: tl.constexpr,
         block_c: tl.constexpr,
     ):
-        """One program per LayerNorm row (contiguous x): out = ln(x) * (1 + scale) + shift.
+        """One program per LayerNorm row: out = ln(x) * (1 + scale) + shift.
 
         Modulation indexing: rows enumerate the (B, L) positions of a
         contiguous (B, L, C) tensor, so sample_idx = row // seq_len. With
-        per_sample_* the scale/shift tensors are contiguous (B, 1, C) and index
-        as sample_idx * channels; otherwise they are shared (1, C) and index
+        per_sample_* the scale/shift tensors are (B, 1, C) with row stride
+        scale_row_stride/shift_row_stride (a chunk(6, dim=1) view of a
+        (B, 6, C) projection has row stride 6*C) and index as
+        sample_idx * row_stride; otherwise they are shared (1, C) and index
         as 0. (B, C) at B > 1 is a native-path broadcast error and never
         reaches this kernel.
 
@@ -77,14 +74,14 @@ if _HAS_TRITON:
         x - mean cancellation stay accurate where a plain fp32 sum of
         large-offset values loses the low-order bits (the reason
         fused_adaptive_group_norm_silu uses Welford/Chan). Reductions
-        accumulate in fp32 (matches the golden
-        path, which computes F.layer_norm on x.float()). For half-precision
-        outputs the golden chain rounds after every torch op (LN result,
-        1+scale, product, sum), so the kernel replicates exactly those
-        roundings - keeping the output bit-faithful to the frozen semantics.
-        fp32 outputs have no intermediate rounding in the golden path and use
-        a plain fp32 chain. block_c covers the whole normalized dim (masked);
-        it is never autotuned. Non-contiguous x never reaches this kernel
+        accumulate in fp32 (matches the golden path, which computes
+        F.layer_norm on x.float()). For half-precision outputs the golden
+        chain rounds after every torch op (LN result, 1+scale, product, sum),
+        so the kernel replicates exactly those roundings - keeping the output
+        bit-faithful to the frozen semantics. fp32 outputs have no
+        intermediate rounding in the golden path and use a plain fp32 chain.
+        block_c covers the whole normalized dim (masked); it is never
+        autotuned. Non-contiguous last-dim inputs never reach this kernel
         (routed to forward_native upstream).
         """
         row = tl.program_id(0).to(tl.int64)
@@ -107,11 +104,11 @@ if _HAS_TRITON:
         if has_bias:
             xn = xn + tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         if per_sample_scale:
-            s = tl.load(scale_ptr + sample_idx * channels + cols, mask=mask, other=0.0).to(tl.float32)
+            s = tl.load(scale_ptr + sample_idx * scale_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
         else:
             s = tl.load(scale_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         if per_sample_shift:
-            sh = tl.load(shift_ptr + sample_idx * channels + cols, mask=mask, other=0.0).to(tl.float32)
+            sh = tl.load(shift_ptr + sample_idx * shift_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
         else:
             sh = tl.load(shift_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         out_dtype = out_ptr.dtype.element_ty
@@ -161,22 +158,31 @@ if _HAS_TRITON:
         CUDA tensor on x's device with a supported layout and dtype; anything
         else falls back to forward_native, which reproduces torch semantics
         exactly - including the frozen B > 1 (B, C) RuntimeError. Raw pointers
-        go to one kernel, which does no cross-device checking."""
+        go to one kernel, which does no cross-device checking. Runs native
+        under torch.compile so regional compilation is not disrupted."""
+        if torch.compiler.is_compiling():
+            return None
         if not _HAS_TRITON or x.device.type != "cuda" or x.ndim != 3 or x.numel() == 0 or not x.is_contiguous():
             return None
         if x.dtype not in _ADALN_DTYPES:
             return None
         if scale.dtype is not x.dtype or shift.dtype is not x.dtype:
             return None
-        if not (scale.is_cuda and shift.is_cuda and scale.is_contiguous() and shift.is_contiguous()):
+        if not (scale.is_cuda and shift.is_cuda):
             return None
         if scale.device != x.device or shift.device != x.device:
-            return None
-        if x.data_ptr() % 16 or scale.data_ptr() % 16 or shift.data_ptr() % 16:
             return None
         mode_s = _adaln_modulation_mode(scale, x)
         mode_h = _adaln_modulation_mode(shift, x)
         if mode_s is None or mode_h is None:
+            return None
+        # The kernel addresses the modulation rows densely per channel and
+        # strides per sample: the last dim must be unit-stride; other dims
+        # are handled by the explicit row stride (chunk views supported).
+        # 0-dim (scalar) modulation is classified None above and falls back.
+        if scale.stride(-1) != 1 or shift.stride(-1) != 1:
+            return None
+        if x.data_ptr() % 16 or scale.data_ptr() % 16 or shift.data_ptr() % 16:
             return None
         channels = x.shape[-1]
         block_c = triton.next_power_of_2(channels)
@@ -212,6 +218,8 @@ if _HAS_TRITON:
             num_warps = 4 if block_c <= 1024 else (8 if block_c <= 4096 else 16)
             cfg = (block_c, num_warps)
             _ADALN_CONFIGS[block_c] = cfg
+        scale_row_stride = scale.stride(0)
+        shift_row_stride = shift.stride(0)
         # Dummy pointer args for disabled branches: never dereferenced because
         # the loads are constexpr-pruned when has_weight/has_bias is False.
         args = (
@@ -224,6 +232,8 @@ if _HAS_TRITON:
             module.eps,
             channels,
             seq_len,
+            scale_row_stride,
+            shift_row_stride,
             has_weight,
             has_bias,
             is_half,
