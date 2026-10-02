@@ -127,12 +127,6 @@ if _HAS_TRITON:
         # out is always freshly allocated contiguous (B, L, C)
         tl.store(out_ptr + row * channels + cols, y.to(out_dtype), mask=mask)
 
-    # Deterministic per-channel-count launch configs: BLOCK_C = next_pow2(C)
-    # (covers the reduction dim, never autotuned), num_warps from a static
-    # size heuristic. No search is performed.
-    _ADALN_CONFIGS: dict = {}
-    _ADALN_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-
     def _adaln_modulation_mode(t: torch.Tensor, x: torch.Tensor):
         """Classify scale/shift against x (B, L, C) for the fused kernel.
 
@@ -265,6 +259,12 @@ if _HAS_TRITON:
         return out
 
 
+else:
+    # No Triton: the fused fast path is unavailable; forward_cuda falls back
+    # to forward_native below.
+    _adaln_fused_forward = None
+
+
 class AdaLayerNorm(CustomOp):
     """
     AdaLayerNorm:
@@ -284,12 +284,22 @@ class AdaLayerNorm(CustomOp):
         scale: torch.Tensor,
         shift: torch.Tensor,
     ) -> torch.Tensor:
+        if _adaln_fused_forward is None:
+            return self.forward_native(x, scale, shift)
         out = _adaln_fused_forward(self, x, scale, shift)
         if out is not None:
             return out
         return self.forward_native(x, scale, shift)
 
     def forward_hip(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x, scale, shift)
+
+    def forward_musa(
         self,
         x: torch.Tensor,
         scale: torch.Tensor,

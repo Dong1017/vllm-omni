@@ -15,8 +15,8 @@ import torch
 
 from vllm_omni.diffusion.layers.adalayernorm import (
     _FAILED_ADALN_KEYS,
-    _adaln_scale_shift_layernorm_kernel,
     AdaLayerNorm,
+    _adaln_scale_shift_layernorm_kernel,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]

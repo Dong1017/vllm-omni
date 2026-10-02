@@ -53,9 +53,13 @@ def make_inputs(bs, seq, hidden, dtype, device, seed=0):
 @pytest.mark.parametrize("bs,seq,hidden", [(1, 512, 3072), (2, 128, 1536), (1, 3, 1000)])
 def test_fused_fast_path_matches_native(dtype, affine, bs, seq, hidden):
     # hidden=1000 exercises BLOCK_C masking (next_pow2(1000)=1024 > 1000)
+    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
+
     device = "cuda"
     m = make_module(hidden, affine, 1e-6, device, dtype)
     x, scale, shift = make_inputs(bs, seq, hidden, dtype, device)
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "supported inputs must take the fused path so BLOCK_C masking is exercised"
     out = m.forward_cuda(x, scale, shift)
     assert out.shape == x.shape and out.dtype == dtype and out.device == x.device
     assert_close(out, m.forward_native(x, scale, shift), dtype)

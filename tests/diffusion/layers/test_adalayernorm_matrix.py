@@ -296,6 +296,9 @@ def test_matrix_large_offset_small_variance(dtype):
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
     x, scale, shift = make_inputs(1, 4096, hidden, dtype, device, seed=23)
+    # Apply the large constant offset AFTER generation: x ~ 10000 +/- 0.1 is
+    # the cancellation case that motivates the shift-invariant two-pass.
+    x = x * 0.1 + 10000
     out_cuda = m.forward_cuda(x, scale, shift)
     out_native = m.forward_native(x, scale, shift)
     assert torch.isfinite(out_cuda).all()

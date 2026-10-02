@@ -69,6 +69,16 @@ def test_cuda_graph_capture_replay_smoke():
     torch.accelerator.synchronize()
     native = m.forward_native(x, scale, shift)
     torch.testing.assert_close(out_graph.float(), native.float(), atol=2e-2, rtol=2e-2)
+
+    # Replay must consume NEW input values: mutate the captured buffers and
+    # verify the replay output tracks them (a no-op replay would pass the
+    # check above trivially).
+    x2, scale2, shift2 = torch.randn_like(x), torch.randn_like(scale), torch.randn_like(shift)
+    x.copy_(x2)
+    scale.copy_(scale2)
+    shift.copy_(shift2)
     graph.replay()
     torch.accelerator.synchronize()
-    torch.testing.assert_close(out_graph.float(), native.float(), atol=2e-2, rtol=2e-2)
+    native2 = m.forward_native(x, scale, shift)
+    torch.testing.assert_close(out_graph.float(), native2.float(), atol=2e-2, rtol=2e-2)
+    assert not torch.equal(native, native2), "replay must consume the new input"
