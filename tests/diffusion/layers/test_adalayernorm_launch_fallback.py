@@ -12,10 +12,10 @@ other tests in the same session.
 
 import pytest
 import torch
-from triton.runtime.jit import JITFunction
 
 from vllm_omni.diffusion.layers.adalayernorm import (
     _FAILED_ADALN_KEYS,
+    _adaln_scale_shift_layernorm_kernel,
     AdaLayerNorm,
 )
 
@@ -49,7 +49,7 @@ def test_launch_failure_fallback_once(monkeypatch):
         calls["n"] += 1
         raise RuntimeError("simulated synchronous launch failure")
 
-    monkeypatch.setattr(JITFunction, "run", raising_run)
+    monkeypatch.setattr(type(_adaln_scale_shift_layernorm_kernel), "run", raising_run)
 
     # Phase 1: the launch raises synchronously; the caller must receive the
     # correct native result and the failed key must be recorded.
@@ -80,13 +80,13 @@ def test_launch_failure_different_variant_still_eligible(monkeypatch):
     assert key_ps not in _FAILED_ADALN_KEYS
 
     calls = {"n": 0}
-    real_run = JITFunction.run
+    real_run = type(_adaln_scale_shift_layernorm_kernel).run
 
     def counting_run(self, *args, **kwargs):
         calls["n"] += 1
         return real_run(self, *args, **kwargs)
 
-    monkeypatch.setattr(JITFunction, "run", counting_run)
+    monkeypatch.setattr(type(_adaln_scale_shift_layernorm_kernel), "run", counting_run)
     out = m.forward_cuda(x2, ps_scale, ps_shift)
     native = m.forward_native(x2, ps_scale, ps_shift)
     # bf16 outputs across two equivalent implementations (kernel tree-sum vs
