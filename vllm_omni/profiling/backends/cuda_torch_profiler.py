@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from vllm_omni.profiling.discovery import check_size
-from vllm_omni.profiling.intervals import Interval, subtract, total, union
+from vllm_omni.profiling.intervals import Interval, subtract, total, total_event_overlap, union
 from vllm_omni.profiling.provenance import ProvenanceStore, compute_run_id, sha256_file
 from vllm_omni.profiling.schema import (
     MemoryStats,
@@ -176,6 +176,10 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
     sync_us = 0.0
     alloc_us = 0.0
     other_us = 0.0
+    launch_ints: list[Interval] = []
+    sync_ints: list[Interval] = []
+    alloc_ints: list[Interval] = []
+    other_ints: list[Interval] = []
     copy_sum_us = 0.0
     kern_sum_us = 0.0
     device_event_seen = False
@@ -238,12 +242,16 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
             if _LAUNCH_KEYWORD in lname:
                 launch_us += dur
                 launch_count += 1
+                launch_ints.append((float(ts), float(end)))
             elif name in _SYNC_NAMES:
                 sync_us += dur
+                sync_ints.append((float(ts), float(end)))
             elif name.startswith(_ALLOC_PREFIXES):
                 alloc_us += dur
+                alloc_ints.append((float(ts), float(end)))
             else:
                 other_us += dur
+                other_ints.append((float(ts), float(end)))
             ext = (e.get("args") or {}).get("External id")
             parent_name = ext_to_op.get(str(ext)) if ext is not None else None
             agg = runtime_aggs.setdefault((parent_name, name), _Agg(name))
@@ -257,6 +265,7 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
     if wall_min is not None and wall_max is not None:
         workload.wall_ms = (wall_max - wall_min) / 1000.0
     memory = MemoryStats()
+    gap_overlap: dict[str, float] | None = None
     if device_event_seen:
         busy_iv = union(all_ints)
         comm_iv = union(comm_ints)
@@ -269,6 +278,17 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
         if workload.wall_ms is not None:
             timeline.exposed_non_device_busy_ms = workload.wall_ms - timeline.device_busy_ms
         memory.host_device_copy_ms = copy_sum_us / 1000.0
+        # M4.1 时间相关性：各分类 API 区间 ∩ exposed-gap 区间（trace 窗口 - device busy union）。
+        # P0-1：分子逐事件求交（summed 口径），与分母 *_summed_ms 语义一致，
+        # 并发重叠的 runtime 事件不先 union。
+        if workload.wall_ms is not None:
+            gap_iv = subtract([(wall_min, wall_max)], busy_iv)
+            gap_overlap = {
+                "launch": total_event_overlap(launch_ints, gap_iv) / 1000.0,
+                "synchronization": total_event_overlap(sync_ints, gap_iv) / 1000.0,
+                "allocation": total_event_overlap(alloc_ints, gap_iv) / 1000.0,
+                "other": total_event_overlap(other_ints, gap_iv) / 1000.0,
+            }
 
     # ---- operator 聚合：framework 层（aten，device 经 External id 关联）----
     operators: list[OperatorEvidence] = []
@@ -386,6 +406,7 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
             synchronization_summed_ms=sync_us / 1000.0,
             allocation_summed_ms=alloc_us / 1000.0,
             other_summed_ms=other_us / 1000.0,
+            gap_overlap_ms=gap_overlap,
         ),
         memory=memory,
         shapes=shapes,
@@ -403,6 +424,12 @@ def analyze_cuda_torch_profiler(trace_path: Path) -> tuple[OptimizationEvidence,
             "runtime.allocation_summed_ms": [store.ref(rec_rt.id)],
             "runtime.other_summed_ms": [store.ref(rec_rt.id)],
             "runtime.launch_count": [store.ref(rec_rt.id)],
+            # P1-2：gap_overlap 由 runtime 区间（rec_rt）与 device busy 区间（rec_tl）
+            # 共同派生，两条依赖都要绑定
+            "runtime.gap_overlap_ms.launch": [store.ref(rec_rt.id), store.ref(rec_tl.id)],
+            "runtime.gap_overlap_ms.synchronization": [store.ref(rec_rt.id), store.ref(rec_tl.id)],
+            "runtime.gap_overlap_ms.allocation": [store.ref(rec_rt.id), store.ref(rec_tl.id)],
+            "runtime.gap_overlap_ms.other": [store.ref(rec_rt.id), store.ref(rec_tl.id)],
             "memory.host_device_copy_ms": [store.ref(rec_tl.id)],
         },
     )

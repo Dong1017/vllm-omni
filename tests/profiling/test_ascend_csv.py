@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.profiling.backends import analyze_ascend_csv
+from vllm_omni.profiling.diagnosis import diagnose
 from vllm_omni.profiling.schema import OptimizationEvidence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -238,5 +239,14 @@ def test_db_only_dir_fails_explicitly(tmp_path):
 def test_json_dumpable(ascend_dir):
     ev, _ = analyze_ascend_csv(ascend_dir)
     raw = json.loads(ev.to_json())
-    assert raw["schema_version"] == "0.4"
+    assert raw["schema_version"] == "0.5"
     assert raw["run"]["backend"] == "ascend"
+
+
+def test_no_api_timeline_no_gap_overlap_no_bound(ascend_dir):
+    # MVP gate 审计：CSV 无 API 时间轴 -> gap_overlap_ms 必须为 None（不伪造），
+    # 且 runtime 类 *_bound 不得输出（相关性证据缺席）
+    ev, _ = analyze_ascend_csv(ascend_dir)
+    assert ev.runtime.gap_overlap_ms is None
+    classes = {c.class_ for c in diagnose(ev)}
+    assert not classes & {"host_dispatch_bound", "synchronization_bound", "allocation_bound"}

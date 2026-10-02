@@ -5,7 +5,7 @@
 
 import pytest
 
-from vllm_omni.profiling.intervals import subtract, total, union
+from vllm_omni.profiling.intervals import intersect, subtract, total, union
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -54,3 +54,21 @@ def test_subtract_disjoint_removal():
 
 def test_subtract_removal_outside_base():
     assert subtract([(0, 10)], [(15, 20)]) == [(0, 10)]
+
+
+def test_intersect_partial_overlap():
+    assert intersect([(0, 10)], [(5, 15)]) == [(5, 10)]
+
+
+def test_intersect_multiple_pairs():
+    a = [(0, 10), (20, 30)]
+    b = [(5, 25)]
+    assert intersect(a, b) == [(5, 10), (20, 25)]
+
+
+def test_intersect_disjoint_empty():
+    assert intersect([(0, 5)], [(10, 20)]) == []
+
+
+def test_intersect_nested():
+    assert intersect([(0, 100)], [(10, 20), (30, 40)]) == [(10, 20), (30, 40)]

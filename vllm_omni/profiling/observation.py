@@ -19,6 +19,9 @@ OBSERVATION_KINDS = (
     "runtime_sync_heavy",  # synchronize API 占比可观
     "runtime_allocation_heavy",  # malloc/free API 占比可观
     "runtime_other_heavy",  # 其余 API 占比可观（含无法归类的 bucket）
+    "runtime_launch_gap_correlated",  # M4.1：launch API 时间与 exposed gap 时间相关
+    "runtime_sync_gap_correlated",
+    "runtime_allocation_gap_correlated",
     "communication_exposed",  # 未重叠通信占比可观（derived，引用全部输入）
     "communication_present_no_overlap_breakdown",  # 通信总量存在但分解不可得（P1-2：不得称 exposed）
     "compute_activity_dominant",  # 设备上 compute 类活动占主导（观察，非 compute_bound）
@@ -31,12 +34,13 @@ OBSERVE_GAP_RATIO = 0.10
 OBSERVE_CATEGORY_SHARE = 0.20
 OBSERVE_BUSY_RATIO = 0.75
 OBSERVE_COMPUTE_SHARE = 0.75
+OBSERVE_GAP_CORRELATION = 0.30  # 分类 API 时间落在 exposed gap 内的占比（M4.1）
 
 _RUNTIME_CATEGORIES = (
-    ("launch_summed_ms", "runtime_launch_heavy"),
-    ("synchronization_summed_ms", "runtime_sync_heavy"),
-    ("allocation_summed_ms", "runtime_allocation_heavy"),
-    ("other_summed_ms", "runtime_other_heavy"),
+    ("launch_summed_ms", "runtime_launch_heavy", "runtime_launch_gap_correlated"),
+    ("synchronization_summed_ms", "runtime_sync_heavy", "runtime_sync_gap_correlated"),
+    ("allocation_summed_ms", "runtime_allocation_heavy", "runtime_allocation_gap_correlated"),
+    ("other_summed_ms", "runtime_other_heavy", None),
 )
 
 
@@ -103,7 +107,7 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
         )
 
     if api is not None and api > 0:
-        for cat, kind in _RUNTIME_CATEGORIES:
+        for cat, kind, corr_kind in _RUNTIME_CATEGORIES:
             share = _ratio(getattr(ev.runtime, cat), api)
             if share is not None and share >= OBSERVE_CATEGORY_SHARE:
                 add(
@@ -114,6 +118,31 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
                     "(observation only; causal link to the exposed gap requires "
                     "temporal correlation evidence, e.g. M4 timeline tools)",
                     ev.metric_evidence.get(f"runtime.{cat}", []) + ev.metric_evidence.get("runtime.api_summed_ms", []),
+                )
+            # M4.1 时间相关性：该分类 API 时间有多大比例真的落在 exposed gap 区间内。
+            # P1-1：发出观察前机械校验同源——分类时长与 gap_overlap 必须可追溯到
+            # 同一记录，且 gap/wall 同源；校验不过则观察不出（代码即纪律）。
+            cat_short = cat.replace("_summed_ms", "")
+            corr_key = f"runtime.gap_overlap_ms.{cat_short}"
+            in_gap = (ev.runtime.gap_overlap_ms or {}).get(cat_short)
+            corr_ratio = _ratio(in_gap, getattr(ev.runtime, cat))
+            if (
+                corr_kind is not None
+                and corr_ratio is not None
+                and share is not None
+                and share >= OBSERVE_CATEGORY_SHARE
+                and corr_ratio >= OBSERVE_GAP_CORRELATION
+                and _same_source(ev, f"runtime.{cat}", corr_key)
+                and _same_source(ev, "timeline.exposed_non_device_busy_ms", "workload.wall_ms")
+            ):
+                add(
+                    corr_kind,
+                    corr_key,
+                    corr_ratio,
+                    f"{corr_ratio:.1%} of {cat} falls inside the device exposed-gap intervals "
+                    "(temporal correlation from same-source timeline; "
+                    "evidence to upgrade the heavy observation)",
+                    ev.metric_evidence.get(corr_key, []) + ev.metric_evidence.get(f"runtime.{cat}", []),
                 )
 
     if comm_total is not None:

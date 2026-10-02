@@ -60,6 +60,24 @@ Architecture (ckpt-2/ckpt-3 audits): `Evidence → deterministic Observation →
 
 Guarded by: `test_observation.py` (same-source gating, naming discipline, split insufficient cases), `test_diagnosis.py` (the five checkpoint cases, communication-only bound, mechanically-enforced same-source), `test_serialization.py` (migration chain + P0-5 mutation rejection).
 
+## D10. Timeline correlation upgrades heavy observations to bounds (v0.5, M4.1, revised at final review)
+
+ckpt-3 审计 P0-2 留下的缺口：`runtime_launch_heavy` 等 summed 占比观察不能证明该分类 API 时间真的与 exposed gap 相关。M4.1 引入时间相关性证据；最终 review 修订两点口径。
+
+- **Schema**：`RuntimeStats.gap_overlap_ms: dict[str, float] | None` —— 各 runtime 分类 API 与 device exposed-gap 区间（trace 窗口 − device busy union）的交集时长（ms）。仅当 source 自带时间轴（当前：CUDA torch-profiler trace；后续：Ascend 大库 CANN_API 区间）时由 adapter 计算；CSV 类无时间轴 source 保持 `None`，禁止用 summed 值冒充。
+- **P0-1 分子口径**：`overlap = Σ per-event (event ∩ gap-union)`（逐事件求交再求和，summed 语义），与分母 `*_summed_ms`（逐事件时长求和）一致；禁止先把同分类 runtime 区间 union 再求交——并发重叠事件会被合并少算。
+- **P0-2 双条件**：相关性（correlation）与影响（coverage）是两个独立条件，缺一不判：
+  - `correlation = gap_overlap_ms[cat] / <cat>_summed_ms`（分类时间落 gap 的比例）≥ 0.50；
+  - `gap_coverage = gap_overlap_ms[cat] / exposed_non_device_busy_ms`（该分类实际解释的 gap 比例）≥ 0.10。
+  - 大 gap + 极少量 100% 相关的 API 时间 → coverage 不足 → 不构成 `*_bound`（有负例测试）。
+- **观察层**：`runtime_launch_gap_correlated` / `runtime_sync_gap_correlated` / `runtime_allocation_gap_correlated` —— heavy（share ≥ 20%）且 correlation ≥ 30%，且发出前机械校验同源（分类时长与 `runtime.gap_overlap_ms.<cat>` 同记录；gap 与 wall 同记录）。
+- **诊断层**：`host_dispatch_bound` / `synchronization_bound` / `allocation_bound` 恢复输出，证据链三条观察缺一不可，外加三层机械同源校验（分类↔gap_overlap、gap_overlap↔exposed、exposed↔wall）。
+- **metric key**：按分类细分 `runtime.gap_overlap_ms.launch` / `.synchronization` / `.allocation` / `.other`；`metric_evidence` 同时绑定 runtime 区间记录与 device/gap 派生记录（完整依赖，P1-2）。
+- Ascend CSV 路径无 API 时间轴 → 相关性观察缺席 → 三个 bound 仍然不输出（保守行为不变，等 M4 大库 CANN_API 区间接入）。
+- Timeline-domain 前提：记录级 same-source（metric_evidence 交集）是 timeline domain 的代理；成立前提是单 adapter 单文件单 clock（torch profiler 统一时钟），跨文件/跨 clock 混用在 adapter 结构上不可达。
+
+Guarded by: `test_intervals.py`（intersect / total_event_overlap 重叠事件 summed 语义）、`test_cuda_torch_profiler.py`（gap_overlap 数值、正/负升格链、覆盖不足负例）、`test_observation.py`（同源门控、命名纪律）、`test_diagnosis.py`（coverage 负例）、`test_serialization.py`（0.4→0.5 additive migration，历史文件 gap_overlap=None 不编造）。
+
 ## Terminology note: run_id is an analysis identity
 
 `run_id` is content-addressed: `hash(sorted source hashes + backend + parser)`. Two identical captures would produce the same `run_id`. It identifies an **analysis/evidence set**, not a capture instance. If the future Optimization IR needs capture-instance identity, that becomes a separate field — not extended now.

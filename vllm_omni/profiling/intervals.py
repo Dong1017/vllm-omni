@@ -45,3 +45,31 @@ def subtract(base: list[Interval], removal: list[Interval]) -> list[Interval]:
                 nxt.append((max(end, b_start), b_end))
         result = [iv for iv in nxt if iv[1] > iv[0]]
     return result
+
+
+def intersect(a: list[Interval], b: list[Interval]) -> list[Interval]:
+    """两个区间集合的交集（M4.1：API 区间 ∩ exposed-gap 区间）。"""
+    ua, ub = union(a), union(b)
+    out: list[Interval] = []
+    i = j = 0
+    while i < len(ua) and j < len(ub):
+        start = max(ua[i][0], ub[j][0])
+        end = min(ua[i][1], ub[j][1])
+        if end > start:
+            out.append((start, end))
+        if ua[i][1] < ub[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def total_event_overlap(events: list[Interval], against: list[Interval]) -> float:
+    """逐事件求与 against（将 union）的交集时长再求和（summed 口径，P0-1）。
+
+    与 total(intersect(events, against)) 的区别：events 不先 union——
+    并发重叠的 runtime 事件各自与 gap 求交后相加，与分母
+    `*_summed_ms`（逐事件时长求和）保持同一时间语义。
+    """
+    ag = union(against)
+    return sum(total(intersect([ev], ag)) for ev in events)

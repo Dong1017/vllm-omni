@@ -252,3 +252,33 @@ def test_enrich_fills_hotspots_and_diagnosis():
         assert all(":" in eid for eid in h.evidence_ids)
     dev_hs = [h for h in enriched.hotspots if h.kind == "device_task"]
     assert any("runabc123456:ev_000002" in h.evidence_ids for h in dev_hs)
+
+
+def test_gap_correlated_cross_source_never_upgrades():
+    """MVP gate 审计：runtime 分类与 gap_overlap 绑定不同记录 -> 相关观察不产生，
+    规则层同源校验兜底，绝不升格 *_bound。"""
+    ev = _ev("cuda", _refs("workload.wall_ms", "runtime.api_summed_ms", "runtime.launch_summed_ms"))
+    ev.workload.wall_ms = 100.0
+    ev.runtime.api_summed_ms = 60.0
+    ev.runtime.launch_summed_ms = 50.0
+    ev.runtime.gap_overlap_ms = {"launch": 50.0}
+    # gap_overlap 绑到与 runtime.launch_summed_ms 不同的记录（跨源）
+    ev.metric_evidence["runtime.gap_overlap_ms.launch"] = ["run1:ev_000099"]
+    obs = build_observations(ev)
+    assert all(o.kind != "runtime_launch_gap_correlated" for o in obs)
+    assert all(c.class_ != "host_dispatch_bound" for c in diagnose(ev))
+
+
+def test_gap_wall_cross_source_suppresses_correlation():
+    """gap 与 wall 跨源 -> 相关观察被抑制（观察层 Fix 1 纪律同样适用于相关性）。"""
+    ev = _ev("cuda", _refs("workload.wall_ms", "runtime.api_summed_ms", "runtime.launch_summed_ms"))
+    ev.workload.wall_ms = 100.0
+    ev.runtime.api_summed_ms = 60.0
+    ev.runtime.launch_summed_ms = 50.0
+    ev.runtime.gap_overlap_ms = {"launch": 50.0}
+    ev.metric_evidence["runtime.gap_overlap_ms.launch"] = ev.metric_evidence["runtime.launch_summed_ms"]
+    # exposed 与 wall 绑不同记录 -> gap/wall 跨源
+    ev.timeline.exposed_non_device_busy_ms = 40.0
+    ev.metric_evidence["timeline.exposed_non_device_busy_ms"] = ["run1:ev_000098"]
+    obs = build_observations(ev)
+    assert all(o.kind != "runtime_launch_gap_correlated" for o in obs)

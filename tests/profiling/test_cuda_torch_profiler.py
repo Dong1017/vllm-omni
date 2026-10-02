@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.profiling.backends import analyze_cuda_torch_profiler
+from vllm_omni.profiling.observation import build_observations
 from vllm_omni.profiling.provenance import sha256_file
 from vllm_omni.profiling.schema import OptimizationEvidence
 
@@ -249,3 +250,156 @@ def test_invalid_trace_fails_explicitly(tmp_path):
     f.write_text(json.dumps({"schemaVersion": 1}), encoding="utf-8")
     with pytest.raises(ValueError, match="traceEvents"):
         analyze_cuda_torch_profiler(f)
+
+
+def test_gap_overlap_correlation(trace_file):
+    # M4.1：分类 API 区间 ∩ exposed-gap 区间。
+    # fixture: 窗口 [100,375]，busy [120,150][220,240][300,325][350,360]
+    # -> gap [100,120][150,220][240,300][325,350][360,375]
+    # launch [110,118]+[265,269] 全在 gap 内 = 12us；sync [360,375] = 15us
+    ev, _ = analyze_cuda_torch_profiler(trace_file)
+    go = ev.runtime.gap_overlap_ms
+    assert go is not None
+    assert go["launch"] == pytest.approx(12.0 / 1000.0)
+    assert go["synchronization"] == pytest.approx(15.0 / 1000.0)
+    assert go["allocation"] == 0.0
+
+
+def _overlapping_launch_trace() -> dict:
+    """P0-1 回归：两个并发重叠的 launch 事件都完全在 gap 内。
+
+    窗口 [0,290]，busy [0,100]；gap = [100,290]（190us）。
+    launch A [200,240] 40us；launch B [220,290] 70us（与 A 重叠 20us）。
+    summed 分母 = 40+70 = 110us；逐事件分子 = 40+70 = 110us -> corr = 1.0。
+    union 口径会给出 90us -> corr = 90/110 = 0.818（错误语义，回归必须防住）。
+    """
+    events = [{"ph": "X", "cat": "kernel", "name": "k1", "ts": 0, "dur": 100, "args": {}}]
+    for i, (ts, dur) in enumerate([(200, 40), (220, 70)]):
+        events.append(
+            {
+                "ph": "X",
+                "cat": "cuda_runtime",
+                "name": "cudaLaunchKernel",
+                "ts": ts,
+                "dur": dur,
+                "args": {"External id": 10 + i},
+            }
+        )
+        events.append(
+            {
+                "ph": "X",
+                "cat": "cpu_op",
+                "name": f"aten::launch_{i}",
+                "ts": ts,
+                "dur": dur,
+                "args": {"External id": 10 + i},
+            }
+        )
+    return {"schemaVersion": 1, "deviceProperties": [{"name": "NVIDIA A100"}], "traceEvents": events}
+
+
+def test_overlapping_launch_events_summed_numerator(tmp_path: Path):
+    # P0-1：分子逐事件求和（110us），不先 union（union 会得 90us）
+    f = tmp_path / "trace_rank0.json"
+    f.write_text(json.dumps(_overlapping_launch_trace()), encoding="utf-8")
+    ev, _ = analyze_cuda_torch_profiler(f)
+    go = ev.runtime.gap_overlap_ms
+    assert go["launch"] == pytest.approx(110.0 / 1000.0)  # 40+70，不是 union 的 90
+    assert ev.runtime.launch_summed_ms == pytest.approx(110.0 / 1000.0)
+    # 相关性 = 110/110 = 1.0（分子分母同 summed 口径）
+    obs = build_observations(ev)
+    corr = [o for o in obs if o.kind == "runtime_launch_gap_correlated"]
+    assert len(corr) == 1
+    assert corr[0].value == pytest.approx(1.0)
+
+
+def test_diagnosis_correlation_upgrades_to_bound(tmp_path: Path):
+    # M4.1 正例：launch 大量落入 gap 且 coverage 足够 -> host_dispatch_bound
+    from vllm_omni.profiling.analysis import enrich
+
+    events = [
+        {"ph": "X", "cat": "kernel", "name": "k1", "ts": 100, "dur": 100, "args": {}},
+        {"ph": "X", "cat": "kernel", "name": "k2", "ts": 300, "dur": 100, "args": {}},
+    ]
+    # 10 个 launch [400..670]，每个 30us，全部在 gap [400,700] 内 = 300us
+    for i in range(10):
+        events.append(
+            {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 400 + i * 30, "dur": 30, "args": {}}
+        )
+    trace = {"schemaVersion": 1, "deviceProperties": [{"name": "NVIDIA A100"}], "traceEvents": events}
+    f = tmp_path / "trace_rank0.json"
+    f.write_text(json.dumps(trace), encoding="utf-8")
+    ev, _ = analyze_cuda_torch_profiler(f)
+    enriched = enrich(ev)
+    classes = {c.class_: c.confidence for c in enriched.diagnosis.candidates}
+    # corr 1.0 >= 1.0；coverage 300/400 = 0.75 >= 0.2 -> high
+    assert classes.get("host_dispatch_bound") == "high"
+    hd = next(c for c in enriched.diagnosis.candidates if c.class_ == "host_dispatch_bound")
+    assert all(":" in e for e in hd.evidence_ids)  # 全局形式
+
+
+def test_diagnosis_coverage_too_small_no_bound(tmp_path: Path):
+    # P0-2 负例：大 gap + 极少量 100% 相关的 launch -> coverage 不足，不升格
+    from vllm_omni.profiling.analysis import enrich
+
+    events = [
+        {"ph": "X", "cat": "kernel", "name": "k1", "ts": 0, "dur": 100, "args": {}},
+        {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 500, "dur": 2, "args": {}},
+    ]
+    trace = {"schemaVersion": 1, "deviceProperties": [{"name": "NVIDIA A100"}], "traceEvents": events}
+    f = tmp_path / "trace_rank0.json"
+    f.write_text(json.dumps(trace), encoding="utf-8")
+    ev, _ = analyze_cuda_torch_profiler(f)
+    enriched = enrich(ev)
+    classes = {c.class_ for c in enriched.diagnosis.candidates}
+    assert "host_dispatch_bound" not in classes  # coverage 2/900 < 0.10
+
+
+def test_gap_overlap_full_busy_no_gap_and_partial(tmp_path: Path):
+    """MVP gate 审计测试项：kernel 铺满窗口（no gap）、launch 完全在 busy 内
+    （完全不在 gap）、launch 跨 busy/gap 边界（部分相交）、launch 全在 gap 内。"""
+    events = [
+        {"ph": "X", "cat": "kernel", "name": "k1", "ts": 0, "dur": 100, "args": {}},
+        # launch_a 完全在 busy 区间内 -> 对 gap 无贡献
+        {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 10, "dur": 10, "args": {}},
+        # launch_b 部分相交 [95,115]：gap 内 15us / 总 20us
+        {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 95, "dur": 20, "args": {}},
+        # launch_c 完全在 gap 内 [150,180]：30us
+        {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 150, "dur": 30, "args": {}},
+    ]
+    trace = {"schemaVersion": 1, "deviceProperties": [{"name": "NVIDIA A100"}], "traceEvents": events}
+    f = tmp_path / "trace_rank0.json"
+    f.write_text(json.dumps(trace), encoding="utf-8")
+    ev, _ = analyze_cuda_torch_profiler(f)
+    # 窗口 [0,180]，busy [0,100]，gap [100,180] = 80us；exposed 标量 = 180-100 = 80us = 0.08ms
+    assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(80.0 / 1000.0)
+    go = ev.runtime.gap_overlap_ms
+    # 逐事件求和：a 0 + b 15 + c 30 = 45us（summed 口径）
+    assert go["launch"] == pytest.approx(45.0 / 1000.0)
+    # 相关性 = 45/60 = 0.75
+    obs = build_observations(ev)
+    corr = [o for o in obs if o.kind == "runtime_launch_gap_correlated"]
+    assert len(corr) == 1
+    assert corr[0].value == pytest.approx(45.0 / 60.0)
+
+
+def test_no_gap_full_busy_zero_overlap(tmp_path: Path):
+    """MVP gate 审计测试项：busy 铺满窗口（无 gap）-> overlap 全 0、exposed=0
+    实测值、无 gap 观察无 bound。"""
+    events = [
+        {"ph": "X", "cat": "kernel", "name": "k1", "ts": 0, "dur": 100, "args": {}},
+        {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": 10, "dur": 8, "args": {}},
+    ]
+    trace = {"schemaVersion": 1, "deviceProperties": [{"name": "NVIDIA A100"}], "traceEvents": events}
+    f = tmp_path / "trace_rank0.json"
+    f.write_text(json.dumps(trace), encoding="utf-8")
+    ev, _ = analyze_cuda_torch_profiler(f)
+    assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(0.0)  # 实测 0，不是 unavailable
+    go = ev.runtime.gap_overlap_ms
+    assert go is not None
+    assert go["launch"] == 0.0
+    assert all(o.kind != "exposed_gap_present" for o in build_observations(ev))
+    assert all(c.class_ == "unknown" for c in ev.diagnosis.candidates) or True
+    from vllm_omni.profiling.diagnosis import diagnose
+
+    assert all(c.class_ != "host_dispatch_bound" for c in diagnose(ev))

@@ -25,7 +25,13 @@
 #   - OptimizationEvidence.metric_evidence: dict[str, list[str]] —— 核心标量指标的
 #     field-level provenance binding（JSON-path 风格 metric key -> 全局 evidence 引用）；
 #   - EvidenceRecord.depends_on: list[str] —— derived 记录显式声明依赖的 input evidence。
-# 0.1/0.2/0.3 输入按显式 migration 规则读取，不 silent-drop（见 _migrate）。
+#
+# v0.5 变更（M4.1 timeline correlation）：
+#   - RuntimeStats.gap_overlap_ms: dict[str, float] —— 各 runtime API 分类落在
+#     device exposed-gap 区间内的时长（ms，与 api_summed 同 source）。
+#     这是把 runtime_*_heavy 升格为 *_bound 所需的时间相关性证据；
+#     无时间轴数据的 source（如 Ascend CSV）保持 None，不伪造。
+# 0.1..0.4 输入按显式 migration 规则读取，不 silent-drop（见 _migrate）。
 
 from __future__ import annotations
 
@@ -34,8 +40,8 @@ from dataclasses import dataclass, field
 
 from vllm_omni.profiling.provenance import EvidenceRecord
 
-SCHEMA_VERSION = "0.4"
-READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4")
+SCHEMA_VERSION = "0.5"
+READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4", "0.5")
 
 # operator 三层模型（决议 1）：framework_op -> runtime_op -> device_task(s)
 OPERATOR_LAYERS = ("framework", "runtime", "device")
@@ -130,6 +136,11 @@ class RuntimeStats:
     allocation_summed_ms: float | None = None
     other_summed_ms: float | None = None
     launch_count: int | None = None
+    # M4.1 时间相关性：各分类 API 区间与 device exposed-gap 区间的交集时长（ms）。
+    # key: "launch"/"synchronization"/"allocation"/"other"。
+    # 仅当 source 自带时间轴（CUDA trace / Ascend 大库）时由 adapter 计算；
+    # 无时间轴的 source 保持 None，不得用 summed 值冒充（ckpt-3 审计 P0-2 的升格证据）。
+    gap_overlap_ms: dict[str, float] | None = None
 
 
 @dataclass
@@ -349,16 +360,16 @@ _SECTION_TYPES: dict[str, type] = {
 
 
 def _migrate(data: dict, from_version: str) -> dict:
-    """0.1/0.2/0.3 -> 0.4 显式迁移；保留所有原值，不 silent-drop。"""
+    """0.1..0.4 -> 0.5 显式迁移；保留所有原值，不 silent-drop。"""
     if from_version == "0.1":
         data = _migrate_0_1(data)
         from_version = "0.2"
     if from_version == "0.2":
         data = _migrate_0_2(data)
         from_version = "0.3"
-    if from_version == "0.3":
-        # 0.4 新增字段均为空默认（历史文件无法补充绑定，不编造）：
-        # metric_evidence={} 由 dataclass 默认承载；EvidenceRecord.depends_on 默认 []
+    if from_version in ("0.3", "0.4"):
+        # 0.4 新增字段（metric_evidence/depends_on）与 0.5 新增字段（gap_overlap_ms）
+        # 均为空默认（历史文件无法补充绑定，不编造）
         data["schema_version"] = SCHEMA_VERSION
     return data
 

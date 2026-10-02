@@ -177,8 +177,8 @@ def test_deterministic_output_ac08():
 
 
 def test_schema_version_constant():
-    assert SCHEMA_VERSION == "0.4"
-    assert OptimizationEvidence().schema_version == "0.4"
+    assert SCHEMA_VERSION == "0.5"
+    assert OptimizationEvidence().schema_version == "0.5"
 
 
 # ---- writer 侧 validation（P0-4）：非法内存对象无法序列化 ----
@@ -228,7 +228,7 @@ def test_mutated_object_rejected_at_serialization():
 
 def test_migrate_01_operators_gain_layer():
     ev = OptimizationEvidence.from_dict(_v01_evidence_dict())
-    assert ev.schema_version == "0.4"
+    assert ev.schema_version == "0.5"
     fw = next(o for o in ev.operators if o.name == "aten::mm")
     dev = next(o for o in ev.operators if o.name == "gemm_kernel")
     assert fw.layer == "framework"
@@ -284,3 +284,43 @@ def test_migrate_01_keeps_provenance():
     assert ev.provenance[0].id == "ev_000001"
     assert ev.provenance[0].run_id is None
     assert ev.provenance[0].source_sha256 is None
+
+
+def test_migrate_02_gap_overlap_absent_not_fabricated():
+    # 0.2 文件无时间相关性数据 -> gap_overlap_ms 为 None，不编造
+    ev = OptimizationEvidence.from_dict(_v02_evidence_dict())
+    assert ev.schema_version == "0.5"
+    assert ev.runtime.gap_overlap_ms is None
+
+
+def test_gap_overlap_round_trip():
+    ev = OptimizationEvidence()
+    ev.runtime.gap_overlap_ms = {"launch": 12.0 / 1000.0, "synchronization": 0.0}
+    restored = OptimizationEvidence.from_dict(ev.to_dict())
+    assert restored.runtime.gap_overlap_ms == ev.runtime.gap_overlap_ms
+
+
+def test_migrate_04_real_additive():
+    """P1-4：真实 0.4 -> 0.5 additive 迁移：既有值保留，新字段不编造。"""
+    data = {
+        "schema_version": "0.4",
+        "run": {"backend": "cuda", "rank": 0, "run_id": "aa11bb22cc33"},
+        "runtime": {"api_summed_ms": 15.0, "launch_summed_ms": 10.0},
+        "metric_evidence": {"workload.wall_ms": ["aa11bb22cc33:ev_000001"]},
+        "provenance": [
+            {
+                "id": "ev_000001",
+                "source_file": "t.json",
+                "source_type": "torch_profiler_trace",
+                "parser": "p",
+                "unit": "us",
+                "run_id": "aa11bb22cc33",
+            }
+        ],
+    }
+    ev = OptimizationEvidence.from_dict(data)
+    assert ev.schema_version == "0.5"
+    assert ev.runtime.gap_overlap_ms is None  # 0.4 无该字段，迁移不编造
+    assert ev.runtime.api_summed_ms == 15.0  # 既有值保留
+    assert ev.metric_evidence["workload.wall_ms"] == ["aa11bb22cc33:ev_000001"]
+    assert ev.provenance[0].run_id == "aa11bb22cc33"
