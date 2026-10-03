@@ -44,6 +44,8 @@ class AscendArtifacts:
     op_statistic: list[Path] = field(default_factory=list)
     op_summary: list[Path] = field(default_factory=list)
     kernel_details: list[Path] = field(default_factory=list)
+    operator_details: list[Path] = field(default_factory=list)
+    api_statistic: list[Path] = field(default_factory=list)
     profiler_db: list[Path] = field(default_factory=list)
 
 
@@ -68,7 +70,7 @@ def detect_backend(root: Path) -> str | None:
         name = root.name
         if name.endswith((".json", ".json.gz")) and "rank" in name:
             return "cuda"
-        if name in _ASCEND_CSV_NAMES or name == _ASCEND_DB_NAMES[0] or name.startswith(("op_statistic", "op_summary")):
+        if name in _ASCEND_CSV_NAMES or name.endswith(".db") or name.startswith(("op_statistic", "op_summary")):
             return "ascend"
         return None
     cuda_hits = _match(root, _CUDA_TRACE_PATTERNS)
@@ -91,23 +93,62 @@ def detect_backend(root: Path) -> str | None:
     return None
 
 
+def _match_single_file(path: Path, patterns: tuple[str, ...]) -> bool:
+    """单文件输入的模式匹配（rglob 无法作用于文件路径本身）。"""
+    import fnmatch
+
+    return any(fnmatch.fnmatch(path.name, pat) for pat in patterns)
+
+
 def discover(root: Path, backend: str) -> DiscoveryResult:
     root = Path(root)
     if not root.exists():
         raise BackendDetectionError(f"discovery: input path does not exist: {root}")
     result = DiscoveryResult(root=root, backend=backend)
     if backend == "cuda":
-        result.cuda.trace_files = _match(root, _CUDA_TRACE_PATTERNS)
-        result.cuda.sidecar_files = _match(root, _CUDA_SIDECAR_PATTERNS)
-        if not result.cuda.trace_files:
-            raise BackendDetectionError(
-                f"discovery: no torch profiler trace (trace_rank*/stage*_rank*.json[.gz]) under {root}"
-            )
+        if root.is_file():
+            # 单文件输入：文件本身即 trace
+            if _match_single_file(root, _CUDA_TRACE_PATTERNS):
+                result.cuda.trace_files = [root]
+            else:
+                raise BackendDetectionError(
+                    f"discovery: {root.name} does not match torch profiler trace patterns "
+                    "(trace_rank*/stage*_rank*.json[.gz])"
+                )
+        else:
+            result.cuda.trace_files = _match(root, _CUDA_TRACE_PATTERNS)
+            result.cuda.sidecar_files = _match(root, _CUDA_SIDECAR_PATTERNS)
+            if not result.cuda.trace_files:
+                raise BackendDetectionError(
+                    f"discovery: no torch profiler trace (trace_rank*/stage*_rank*.json[.gz]) under {root}"
+                )
     elif backend == "ascend":
+        if root.is_file():
+            # 单文件输入：按文件名归入对应类别
+            name = root.name
+            buckets = {
+                "step_trace_time.csv": "step_trace",
+                "kernel_details.csv": "kernel_details",
+                "operator_details.csv": "operator_details",
+                "api_statistic.csv": "api_statistic",
+            }
+            if _match_single_file(root, ("*.db",)):
+                result.ascend.profiler_db = [root]
+            elif name in buckets:
+                setattr(result.ascend, buckets[name], [root])
+            elif name.startswith("op_statistic"):
+                result.ascend.op_statistic = [root]
+            elif name.startswith("op_summary"):
+                result.ascend.op_summary = [root]
+            else:
+                raise BackendDetectionError(f"discovery: unsupported single Ascend file {name!r}")
+            return result
         result.ascend.step_trace = _match(root, ("step_trace_time.csv",))
         result.ascend.op_statistic = _match(root, ("op_statistic*.csv",))
         result.ascend.op_summary = _match(root, ("op_summary*.csv",))
         result.ascend.kernel_details = _match(root, ("kernel_details.csv",))
+        result.ascend.operator_details = _match(root, ("operator_details*.csv",))
+        result.ascend.api_statistic = _match(root, ("api_statistic*.csv",))
         result.ascend.profiler_db = _match(root, ("analysis.db", "*.db"))
         if not any(
             [
@@ -115,6 +156,8 @@ def discover(root: Path, backend: str) -> DiscoveryResult:
                 result.ascend.op_statistic,
                 result.ascend.op_summary,
                 result.ascend.kernel_details,
+                result.ascend.operator_details,
+                result.ascend.api_statistic,
                 result.ascend.profiler_db,
             ]
         ):

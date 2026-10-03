@@ -5,7 +5,7 @@
 
 import pytest
 
-from vllm_omni.profiling.intervals import intersect, subtract, total, union
+from vllm_omni.profiling.intervals import complement, intersect, subtract, total, total_event_overlap, union
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -72,3 +72,17 @@ def test_intersect_disjoint_empty():
 
 def test_intersect_nested():
     assert intersect([(0, 100)], [(10, 20), (30, 40)]) == [(10, 20), (30, 40)]
+
+
+def test_complement_basic():
+    assert complement((0, 100), [(20, 40)]) == [(0, 20), (40, 100)]
+    assert complement((0, 100), [(0, 50), (50, 100)]) == []
+    # 无序输入先 union（complement 内部契约）
+    assert complement((0, 100), [(60, 80), (10, 20)]) == [(0, 10), (20, 60), (80, 100)]
+
+
+def test_total_event_overlap_summed_semantics():
+    # P0-1：重叠事件逐个计数（summed），不 union
+    assert total_event_overlap([(200, 240), (220, 290)], [(0, 1000)]) == pytest.approx(110.0)
+    assert total_event_overlap([], [(0, 100)]) == 0.0
+    assert total_event_overlap([(0, 10)], []) == 0.0

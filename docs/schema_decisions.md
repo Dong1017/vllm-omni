@@ -78,6 +78,25 @@ ckpt-3 审计 P0-2 留下的缺口：`runtime_launch_heavy` 等 summed 占比观
 
 Guarded by: `test_intervals.py`（intersect / total_event_overlap 重叠事件 summed 语义）、`test_cuda_torch_profiler.py`（gap_overlap 数值、正/负升格链、覆盖不足负例）、`test_observation.py`（同源门控、命名纪律）、`test_diagnosis.py`（coverage 负例）、`test_serialization.py`（0.4→0.5 additive migration，历史文件 gap_overlap=None 不编造）。
 
+## D11. Ascend trace-DB correlation contract (v0.5, M4.1b)
+
+The `ascend_pytorch_profiler_0.db` main DB exposes the three-layer chain over a **single ns capture clock**:
+
+```text
+PYTORCH_API(type=50001, name→STRING_IDS=aten::)  → framework
+CANN_API(name→STRING_IDS=acl*)                   → runtime
+TASK(globalTaskId→COMPUTE_TASK_INFO.name)        → device
+```
+
+All three join on `connectionId` (verified on the real 459MB sample: TASK.connectionId ⊆ CANN_API.connectionId at 297330/297332 distinct keys). Rules:
+
+- Correlation/linkage uses connectionId equality only; no name or timestamp-proximity guessing.
+- Wall comes from `SESSION_TIME_INFO` (absolute session bounds); exposed gap = session window − TASK busy union. The gap window must be the **absolute** session interval — deriving it from the relative wall duration misplaces the window against absolute-interval data (found during checkpoint review: overlap was identically zero).
+- CANN categories use the same keyword rule as the CSV adapter; `gap_overlap_ms` per category via per-event overlap (summed semantics, D10).
+- `rank` comes from `RANK_DEVICE_MAP.rankId`; `device_id`/`device` from `deviceId`/`NPU_INFO`. Multi-rank DBs fail fast.
+- Large-DB safety: gap derivation via one-pass `complement()`; overlap via bisect-stepped `total_event_overlap()` — a quadratic per-removal subtract loop hung on the real ~200k-interval busy union.
+- Conservative degradation: no timeline/tables → no correlation observations, no `*_bound`; the CSV path keeps `gap_overlap_ms=None` (no API timeline there).
+
 ## Terminology note: run_id is an analysis identity
 
 `run_id` is content-addressed: `hash(sorted source hashes + backend + parser)`. Two identical captures would produce the same `run_id`. It identifies an **analysis/evidence set**, not a capture instance. If the future Optimization IR needs capture-instance identity, that becomes a separate field — not extended now.

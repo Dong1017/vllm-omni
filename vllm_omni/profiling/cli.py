@@ -11,7 +11,13 @@ import sys
 from pathlib import Path
 
 from vllm_omni.profiling.analysis import build_all_observations, enrich
-from vllm_omni.profiling.backends import analyze_ascend_csv, analyze_ascend_db, analyze_cuda_torch_profiler
+from vllm_omni.profiling.backends import (
+    UnsupportedProfilerDBError,
+    analyze_ascend_csv,
+    analyze_ascend_db,
+    analyze_ascend_trace_db,
+    analyze_cuda_torch_profiler,
+)
 from vllm_omni.profiling.discovery import BackendDetectionError, detect_backend, discover
 from vllm_omni.profiling.report import write_outputs
 from vllm_omni.profiling.schema import OptimizationEvidence
@@ -51,12 +57,18 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             + result.ascend.op_statistic
             + result.ascend.op_summary
             + result.ascend.kernel_details
+            + result.ascend.operator_details
+            + result.ascend.api_statistic
         )
         if not ascend_files:
             # DB-only 目录：analysis.db 存在时走 profiler DB adapter（T2）
             if result.ascend.profiler_db:
                 for db_path in result.ascend.profiler_db:
-                    ev, _store = analyze_ascend_db(db_path)
+                    # 按 schema 路由：analysis.db -> M2 视图；大库 -> M4.1b timeline correlation
+                    try:
+                        ev, _store = analyze_ascend_db(db_path)
+                    except UnsupportedProfilerDBError:
+                        ev, _store = analyze_ascend_trace_db(db_path)
                     ev = enrich(ev)
                     if ev.run.rank is not None:
                         leaf = f"rank{ev.run.rank}"
@@ -91,7 +103,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print(f"analyzed {worker_dir} (device_id={ev.run.device_id or 'unknown'}) -> {target}")
         db_only = {p.parent for p in result.ascend.profiler_db} - set(worker_dirs)
         for d in sorted(db_only):
-            print(f"note: skipped {d} (analysis.db present, profiler-DB adapter lands at M2-T2)")
+            print(f"note: skipped {d} (no known Ascend DB schema matched)")
         for key in sorted(outputs_local):
             print(f"  wrote {outputs_local[key]}")
         return 0

@@ -70,6 +70,44 @@ def total_event_overlap(events: list[Interval], against: list[Interval]) -> floa
     与 total(intersect(events, against)) 的区别：events 不先 union——
     并发重叠的 runtime 事件各自与 gap 求交后相加，与分母
     `*_summed_ms`（逐事件时长求和）保持同一时间语义。
+    大规模安全：against 先 union，逐事件用 bisect 定位 + 步进，
+    复杂度 O(E log G + 触达区间数)，不在 events 上做二次扫描。
     """
+    import bisect
+
     ag = union(against)
-    return sum(total(intersect([ev], ag)) for ev in events)
+    if not ag:
+        return 0.0
+    starts = [g[0] for g in ag]
+    total = 0.0
+    for s, e in events:
+        if e <= s:
+            continue
+        i = bisect.bisect_right(starts, s) - 1
+        if i < 0:
+            i = 0
+        for gs, ge in ag[i:]:
+            if ge <= s:
+                continue
+            if gs >= e:
+                break
+            total += min(e, ge) - max(s, gs)
+    return total
+
+
+def complement(outer: Interval, intervals: list[Interval]) -> list[Interval]:
+    """outer 内减去 intervals（union 语义）的补区间（一次线性扫描，大规模安全）。"""
+    ivs = union(intervals)
+    out: list[Interval] = []
+    cur = outer[0]
+    for s, e in ivs:
+        if e <= cur:
+            continue
+        if s > cur:
+            out.append((cur, min(s, outer[1])))
+        cur = max(cur, e)
+        if cur >= outer[1]:
+            break
+    if cur < outer[1]:
+        out.append((cur, outer[1]))
+    return [iv for iv in out if iv[1] > iv[0] and iv[0] >= outer[0]]

@@ -6,6 +6,14 @@
 
 from vllm_omni.profiling.backends.ascend_csv import analyze_ascend_csv
 from vllm_omni.profiling.backends.ascend_db import UnsupportedProfilerDBError, analyze_ascend_db
+from vllm_omni.profiling.backends.ascend_trace_db import UnsupportedTraceDBError, analyze_ascend_trace_db
 from vllm_omni.profiling.backends.cuda_torch_profiler import analyze_cuda_torch_profiler
 
-__all__ = ["UnsupportedProfilerDBError", "analyze_ascend_csv", "analyze_ascend_db", "analyze_cuda_torch_profiler"]
+__all__ = [
+    "UnsupportedProfilerDBError",
+    "UnsupportedTraceDBError",
+    "analyze_ascend_csv",
+    "analyze_ascend_db",
+    "analyze_ascend_trace_db",
+    "analyze_cuda_torch_profiler",
+]
