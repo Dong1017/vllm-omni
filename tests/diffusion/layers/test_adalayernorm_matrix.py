@@ -14,7 +14,12 @@ B > 1 (B, C) native broadcast-error contract.
 import pytest
 import torch
 
-from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.adalayernorm import (
+    AdaLayerNorm,
+    _adaln_fused_forward,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 TOL_STRICT = {"bf16": (2e-2, 2e-2), "fp16": (1e-2, 1e-2), "fp32": (1e-3, 1e-3)}
 TOL_LOOSE = {"bf16": (5e-2, 2e-2), "fp16": (2e-2, 1e-2), "fp32": (5e-3, 5e-3)}
@@ -72,7 +77,8 @@ def test_matrix_main(dtype, affine, bs, seq, hidden):
     device = "cuda"
     m = make_module(hidden, affine, 1e-6, device, dtype)
     x, scale, shift = make_inputs(bs, seq, hidden, dtype, device)
-    out_cuda = m.forward_cuda(x, scale, shift)
+    out_cuda = _adaln_fused_forward(m, x, scale, shift)
+    assert out_cuda is not None, "supported matrix inputs must take the fused path"
     out_native = m.forward_native(x, scale, shift)
     assert out_cuda.shape == x.shape and out_cuda.dtype == dtype and out_cuda.device == x.device
     assert_close(out_cuda, out_native, dtype, loose=False)
@@ -89,7 +95,8 @@ def test_matrix_weight_bias_nondefault(dtype):
     hidden = 3072
     m = make_module(hidden, True, 1e-6, device, dtype, nondefault_affine=True)
     x, scale, shift = make_inputs(1, 1024, hidden, dtype, device, seed=13)
-    out_cuda = m.forward_cuda(x, scale, shift)
+    out_cuda = _adaln_fused_forward(m, x, scale, shift)
+    assert out_cuda is not None, "non-default affine parameters must take the fused path"
     out_native = m.forward_native(x, scale, shift)
     assert_close(out_cuda, out_native, dtype)
     ref = fp32_reference(x, scale, shift, 1e-6, m.layernorm.weight, m.layernorm.bias)
@@ -103,9 +110,11 @@ def test_matrix_eps_variants(dtype, eps):
     hidden = 3072
     m = make_module(hidden, False, eps, device, dtype)
     x, scale, shift = make_inputs(1, 512, hidden, dtype, device, seed=3)
-    assert_close(m.forward_cuda(x, scale, shift), m.forward_native(x, scale, shift), dtype)
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "supported eps variants must take the fused path"
+    assert_close(fused, m.forward_native(x, scale, shift), dtype)
     assert_close(
-        m.forward_cuda(x, scale, shift),
+        fused,
         fp32_reference(x, scale, shift, eps),
         dtype,
         loose=True,
@@ -130,7 +139,8 @@ def test_matrix_broadcast_scale_shift(dtype, mod_shape):
     else:
         scale = torch.randn(1, hidden, generator=g, device=device, dtype=dtype)
         shift = torch.randn(1, hidden, generator=g, device=device, dtype=dtype)
-    out_cuda = m.forward_cuda(x, scale, shift)
+    out_cuda = _adaln_fused_forward(m, x, scale, shift)
+    assert out_cuda is not None, f"shared modulation layout {mod_shape} must take the fused path"
     out_native = m.forward_native(x, scale, shift)
     assert_close(out_cuda, out_native, dtype)
     s = scale.float().reshape(1, 1, hidden) if scale.ndim == 1 else scale.float()
@@ -143,8 +153,6 @@ def test_matrix_broadcast_scale_shift(dtype, mod_shape):
 def test_matrix_per_sample_modulation(dtype):
     # Qwen-Image's _modulate produces (B, 1, C): one modulation row per sample.
     # B > 1 must take the fused path (not fall back to native) and match native.
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
@@ -172,8 +180,6 @@ def test_matrix_chunk_view_modulation(dtype):
     # consumer chunks it along dim=1. The resulting (B, 1, C) views are
     # NON-CONTIGUOUS (row stride 6*C) - the fused path must consume them
     # directly via the explicit row stride, without a contiguous copy.
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
@@ -197,8 +203,6 @@ def test_matrix_3d_modulation_fallback():
     # Wan2.2 TI2V-style per-token modulation: scale/shift (B, L, C) full 3D.
     # This is intentionally outside the fused kernel contract - the fast path
     # must be rejected (None) and forward_cuda must match native.
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     device = "cuda"
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, torch.bfloat16)
@@ -215,8 +219,6 @@ def test_matrix_production_widths(dtype):
     # Real consumer widths: Sana-WM 2240 (BLOCK_C 4096, 45.3% mask) and
     # Wan2.2 A14B 5120 (BLOCK_C 8192, the max supported block, 16-warp
     # compiled variant). BF16 + elementwise_affine=False.
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     device = "cuda"
     for hidden in (2240, 5120):
         m = make_module(hidden, False, 1e-6, device, dtype)
@@ -277,7 +279,8 @@ def test_matrix_zero_scale_shift_identity(dtype):
     x, _, _ = make_inputs(1, 256, hidden, dtype, device, seed=19)
     scale = torch.zeros(1, hidden, device=device, dtype=dtype)
     shift = torch.zeros(1, hidden, device=device, dtype=dtype)
-    out_cuda = m.forward_cuda(x, scale, shift)
+    out_cuda = _adaln_fused_forward(m, x, scale, shift)
+    assert out_cuda is not None, "zero modulation must take the fused path"
     assert_close(out_cuda, m.forward_native(x, scale, shift), dtype)
     assert_close(out_cuda, m.layernorm(x), dtype)
 
@@ -290,8 +293,9 @@ def test_matrix_determinism(dtype):
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
     x, scale, shift = make_inputs(1, 4096, hidden, dtype, device, seed=11)
-    out1 = m.forward_cuda(x, scale, shift)
-    out2 = m.forward_cuda(x, scale, shift)
+    out1 = _adaln_fused_forward(m, x, scale, shift)
+    out2 = _adaln_fused_forward(m, x, scale, shift)
+    assert out1 is not None and out2 is not None, "determinism must exercise the fused path"
     assert torch.equal(out1, out2)
 
 
@@ -301,9 +305,12 @@ def test_matrix_multi_batch_shared_modulation(dtype):
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
     x, scale, shift = make_inputs(4, 512, hidden, dtype, device, seed=15)
-    out = m.forward_cuda(x, scale, shift)
+    out = _adaln_fused_forward(m, x, scale, shift)
+    assert out is not None, "multi-batch shared modulation must take the fused path"
+    assert_close(out, m.forward_native(x, scale, shift), dtype)
     for b in range(4):
-        single = m.forward_cuda(x[b : b + 1], scale, shift)
+        single = _adaln_fused_forward(m, x[b : b + 1], scale, shift)
+        assert single is not None
         assert_close(out[b : b + 1], single, dtype)
 
 
@@ -361,7 +368,8 @@ def test_matrix_large_offset_small_variance(dtype):
     # Apply the large constant offset AFTER generation: x ~ 10000 +/- 0.1 is
     # the cancellation case that motivates the shift-invariant two-pass.
     x = x * 0.1 + 10000
-    out_cuda = m.forward_cuda(x, scale, shift)
+    out_cuda = _adaln_fused_forward(m, x, scale, shift)
+    assert out_cuda is not None, "large-offset stability must exercise the fused path"
     out_native = m.forward_native(x, scale, shift)
     assert torch.isfinite(out_cuda).all()
 

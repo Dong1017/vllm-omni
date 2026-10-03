@@ -10,9 +10,12 @@ tolerance scheme as the frozen suite; golden = forward_native real behavior.
 import pytest
 import torch
 
-from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.adalayernorm import (
+    AdaLayerNorm,
+    _adaln_fused_forward,
+)
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 TOL_STRICT = {"bf16": (2e-2, 2e-2), "fp32": (1e-3, 1e-3)}
 # Matches the frozen suite: the double-rounded golden chain deviates from a
@@ -53,14 +56,12 @@ def make_inputs(bs, seq, hidden, dtype, device, seed=0):
 @pytest.mark.parametrize("bs,seq,hidden", [(1, 512, 3072), (2, 128, 1536), (1, 3, 1000)])
 def test_fused_fast_path_matches_native(dtype, affine, bs, seq, hidden):
     # hidden=1000 exercises BLOCK_C masking (next_pow2(1000)=1024 > 1000)
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     device = "cuda"
     m = make_module(hidden, affine, 1e-6, device, dtype)
     x, scale, shift = make_inputs(bs, seq, hidden, dtype, device)
     fused = _adaln_fused_forward(m, x, scale, shift)
     assert fused is not None, "supported inputs must take the fused path so BLOCK_C masking is exercised"
-    out = m.forward_cuda(x, scale, shift)
+    out = fused
     assert out.shape == x.shape and out.dtype == dtype and out.device == x.device
     assert_close(out, m.forward_native(x, scale, shift), dtype)
     assert_close(out, fp32_reference(x, scale, shift, 1e-6), dtype, loose=True)
@@ -92,7 +93,8 @@ def test_1d_scale_shift_fast_path():
     x = torch.randn(1, 256, hidden, generator=g, device=device, dtype=torch.bfloat16)
     scale = torch.randn(hidden, generator=g, device=device, dtype=torch.bfloat16)
     shift = torch.randn(hidden, generator=g, device=device, dtype=torch.bfloat16)
-    out = m.forward_cuda(x, scale, shift)
+    out = _adaln_fused_forward(m, x, scale, shift)
+    assert out is not None, "(C,) scale/shift must take the fused path"
     assert_close(out, m.forward_native(x, scale, shift), torch.bfloat16)
     assert_close(out, fp32_reference(x, scale, shift, 1e-6), torch.bfloat16, loose=True)
 
@@ -168,8 +170,9 @@ def test_fused_determinism_repeat_calls(dtype):
     hidden = 3072
     m = make_module(hidden, False, 1e-6, device, dtype)
     x, scale, shift = make_inputs(1, 1024, hidden, dtype, device, seed=8)
-    out1 = m.forward_cuda(x, scale, shift)
-    out2 = m.forward_cuda(x, scale, shift)
+    out1 = _adaln_fused_forward(m, x, scale, shift)
+    out2 = _adaln_fused_forward(m, x, scale, shift)
+    assert out1 is not None and out2 is not None, "determinism must exercise the fused path"
     assert torch.equal(out1, out2)
 
 
@@ -179,6 +182,7 @@ def test_fused_eps_variants(eps):
     hidden = 3072
     m = make_module(hidden, False, eps, device, torch.bfloat16)
     x, scale, shift = make_inputs(1, 256, hidden, torch.bfloat16, device, seed=9)
-    out = m.forward_cuda(x, scale, shift)
+    out = _adaln_fused_forward(m, x, scale, shift)
+    assert out is not None, "supported eps variants must take the fused path"
     assert_close(out, m.forward_native(x, scale, shift), torch.bfloat16)
     assert_close(out, fp32_reference(x, scale, shift, eps), torch.bfloat16, loose=True)

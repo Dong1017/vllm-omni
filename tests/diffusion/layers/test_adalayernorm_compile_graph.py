@@ -5,18 +5,22 @@
 The serving stack reaches AdaLayerNorm.forward_cuda through CustomOp dispatch
 from compiled diffusion workloads (lazy regional torch.compile on repeated
 blocks) and can capture CUDA graphs around pipeline stages. These smokes
-verify that the supported fused path can be compiled under torch.compile and
-captured/replayed inside a CUDA graph without crashing and with outputs
-matching the native fallback. They are smoke tests, not performance
+verify that torch.compile uses the native chain and leaves the eager fused
+path eligible, and that the fused path can be captured/replayed inside a CUDA
+graph with outputs matching native. They are smoke tests, not performance
 measurements.
 """
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.adalayernorm import (
+    _FAILED_ADALN_KEYS,
+    AdaLayerNorm,
+    _adaln_fused_forward,
+)
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 
 def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0):
@@ -31,7 +35,7 @@ def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0):
 def test_compile_smoke():
     # torch.compile over the guarded forward_cuda: with the is_compiling
     # guard the compiled region takes the NATIVE chain, so this compares
-    # inductor's own LN+modulation fusion against the eager 3-kernel chain.
+    # inductor's own LN+modulation fusion against the eager 4-kernel chain.
     # Cross-implementation BF16 outputs differ at rounding level (up to a few
     # ulps at O(1-8) magnitudes), hence the loose tolerance. The smoke
     # verifies the compiled workload stays functional - no crash, finite
@@ -43,6 +47,20 @@ def test_compile_smoke():
     native = m.forward_native(x, scale, shift)
     torch.testing.assert_close(out1.float(), native.float(), atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(out2.float(), native.float(), atol=5e-2, rtol=2e-2)
+    runtime_key = (
+        x.device.index,
+        x.shape[-1],
+        x.dtype,
+        m.layernorm.weight is not None,
+        m.layernorm.bias is not None,
+        True,
+        True,
+    )
+    assert runtime_key not in _FAILED_ADALN_KEYS, "compile must not cache an eager launch failure"
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "compile must leave the eager fused path eligible"
+    torch.testing.assert_close(fused.float(), native.float(), atol=2e-2, rtol=2e-2)
+    assert runtime_key not in _FAILED_ADALN_KEYS
 
 
 def test_cuda_graph_capture_replay_smoke():
@@ -52,8 +70,6 @@ def test_cuda_graph_capture_replay_smoke():
     # native chain). Warm the JIT on a side stream so capture contains no
     # compile-time allocations, then replay and compare against the native
     # fallback on the same static input buffers.
-    from vllm_omni.diffusion.layers.adalayernorm import _adaln_fused_forward
-
     m, x, scale, shift = _make()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
