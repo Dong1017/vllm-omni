@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -18,7 +19,9 @@ from vllm_omni.profiling.backends import (
     analyze_ascend_trace_db,
     analyze_cuda_torch_profiler,
 )
+from vllm_omni.profiling.backends.ncu_csv import parse_ncu_csv
 from vllm_omni.profiling.discovery import BackendDetectionError, detect_backend, discover
+from vllm_omni.profiling.provenance import ProvenanceStore, compute_run_id
 from vllm_omni.profiling.report import write_outputs
 from vllm_omni.profiling.schema import OptimizationEvidence
 
@@ -110,8 +113,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     result = discover(input_path, backend)
     outputs: dict[str, Path] = {}
     traces = result.cuda.trace_files
+    # final-review fail-fast：多 CUDA trace + 单 NCU capture 的归属未定义
+    if args.ncu_csv and len(traces) > 1:
+        raise BackendDetectionError(
+            f"ncu-csv: {len(traces)} CUDA traces found under {input_path}; "
+            "per-rank/capture association is not defined until M4.2b — "
+            "analyze one trace at a time"
+        )
     for trace in traces:
-        ev, _store = analyze_cuda_torch_profiler(trace)
+        ev, store = analyze_cuda_torch_profiler(trace)
         ev = enrich(ev)
         # 单 rank 输入用标准文件名；多 rank 用带 rank 后缀的文件名，
         # 禁止跨 rank 相加 duration（AC-05），跨 rank 聚合属于后续版本
@@ -120,6 +130,27 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         else:
             rank = ev.run.rank
             target = output_dir / (f"rank{rank}" if rank is not None else "rank_unknown")
+        if getattr(args, "ncu_csv", None):
+            # P0-3：NCU evidence 独立 run_id namespace（由 NCU CSV sha 派生，
+            # 不复用 torch-trace run_id）；record 追加进 ev.provenance，
+            # hardware.provenance_ref 与 metric_evidence 均引用该 namespace
+            hw_sha = hashlib.sha256(Path(args.ncu_csv).read_bytes()).hexdigest()
+            hw_run_id = compute_run_id([hw_sha], backend="cuda", parser="cuda.ncu_csv")
+            hw_store = ProvenanceStore(run_id=hw_run_id)
+            rec_hw = hw_store.add(
+                source_file=Path(args.ncu_csv).name,
+                source_type="ncu_csv",
+                parser="cuda.ncu_csv",
+                unit="mixed",
+                aggregation=None,
+                source_sha256=hw_sha,
+            )
+            hw_ref = hw_store.ref(rec_hw.id)
+            ev.hardware = parse_ncu_csv(Path(args.ncu_csv))
+            ev.hardware.provenance_ref = hw_ref
+            ev.provenance.append(rec_hw)
+            for e in ev.hardware.entries:
+                ev.metric_evidence[f"hardware:{e.scope_id}:{e.metric_name}"] = [hw_ref]
         written = write_outputs(ev, target)
         for name, path in written.items():
             outputs[f"{target.name}/{name}"] = path
@@ -242,6 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--backend", choices=("cuda", "ascend", "auto"), required=True)
     p_analyze.add_argument("--input", required=True, help="profiler output directory or trace file")
     p_analyze.add_argument("--output", required=True, help="output directory for evidence files")
+    p_analyze.add_argument(
+        "--ncu-csv",
+        default=None,
+        help="optional NCU --csv export (long format) to attach as hardware evidence (CUDA path)",
+    )
     p_analyze.set_defaults(func=cmd_analyze)
 
     p_query = sub.add_parser("query", help="query views from an evidence.json")

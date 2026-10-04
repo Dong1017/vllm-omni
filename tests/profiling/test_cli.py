@@ -117,3 +117,133 @@ def test_query_invalid_view_rejected_by_argparse(tmp_path, cuda_dir):
     main(["analyze", "--backend", "cuda", "--input", str(cuda_dir), "--output", str(out)])
     with pytest.raises(SystemExit):
         main(["query", "--evidence", str(out / "evidence.json"), "--view", "made_up_view"])
+
+
+# ---- M4.2a final-review：NCU 接线 / provenance identity / multi-trace fail-fast ----
+
+
+def _write_ncu_csv(path: Path, launch_value: str) -> None:
+    header = (
+        '"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream",'
+        '"Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"'
+    )
+    rows = [
+        f'"0","1234","python","host","ampere_sgemm","0","7","(128, 1, 1)","(1, 1, 1)","0","8.0",'
+        f'"LaunchStats","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","{launch_value}"'
+    ]
+    path.write_text(header + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_ncu_csv_attaches_hardware_provenance(tmp_path):
+    trace = tmp_path / "trace_rank0.json"
+    trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
+    ncu = tmp_path / "ncu.csv"
+    _write_ncu_csv(ncu, "72.5")
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "analyze",
+            "--backend",
+            "cuda",
+            "--input",
+            str(trace.parent),
+            "--output",
+            str(out),
+            "--ncu-csv",
+            str(ncu),
+        ]
+    )
+    assert rc == 0
+    evidence = json.loads((out / "evidence.json").read_text(encoding="utf-8"))
+    hw = evidence["hardware"]
+    assert hw["backend"] == "cuda"
+    assert hw["provenance_ref"]
+    # serialized provenance 实际包含 hardware 记录（P0-3）
+    prov_ids = {r["id"] for r in evidence["provenance"]}
+    hw_ref = hw["provenance_ref"]
+    assert hw_ref.split(":", 1)[1] in prov_ids
+
+
+def test_ncu_csv_metric_evidence_binding(tmp_path):
+    trace = tmp_path / "trace_rank0.json"
+    trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
+    ncu = tmp_path / "ncu.csv"
+    _write_ncu_csv(ncu, "72.5")
+    out = tmp_path / "out"
+    ncu_path = str(ncu)
+    main(
+        [
+            "analyze",
+            "--backend",
+            "cuda",
+            "--input",
+            str(trace.parent),
+            "--output",
+            str(out),
+            "--ncu-csv",
+            ncu_path,
+        ]
+    )
+    evidence = json.loads((out / "evidence.json").read_text(encoding="utf-8"))
+    keys = [k for k in evidence["metric_evidence"] if k.startswith("hardware:")]
+    assert keys, "hardware metric keys must be bound"
+    # 每个 ref 都能 resolve 到 serialized provenance 中的条目
+    prov_ids = {r["id"] for r in evidence["provenance"]}
+    for k, refs in evidence["metric_evidence"].items():
+        if k.startswith("hardware:"):
+            for ref in refs:
+                assert ref.split(":", 1)[1] in prov_ids, (k, ref)
+
+
+def test_two_different_ncu_csv_contents_give_different_refs(tmp_path):
+    trace = tmp_path / "trace_rank0.json"
+    trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
+    ncu_a = tmp_path / "a.csv"
+    ncu_b = tmp_path / "b.csv"
+    _write_ncu_csv(ncu_a, "72.5")
+    _write_ncu_csv(ncu_b, "91.0")
+    refs = []
+    for csv_path in (ncu_a, ncu_b):
+        out = tmp_path / f"out_{csv_path.stem}"
+        main(
+            [
+                "analyze",
+                "--backend",
+                "cuda",
+                "--input",
+                str(trace.parent),
+                "--output",
+                str(out),
+                "--ncu-csv",
+                str(csv_path),
+            ]
+        )
+        evidence = json.loads((out / "evidence.json").read_text(encoding="utf-8"))
+        refs.append(evidence["hardware"]["provenance_ref"])
+    assert refs[0] != refs[1]  # P0-3：不同 NCU 内容 -> 不同 hardware provenance ref
+
+
+def test_hardware_provenance_resolution_invariant(tmp_path):
+    # final-review P0-3 item 5：hardware.provenance_ref 和全部 hardware
+    # metric_evidence refs 的 (run_id, evidence_id) 都在 serialized provenance 中
+    trace = tmp_path / "trace_rank0.json"
+    trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
+    ncu = tmp_path / "ncu.csv"
+    _write_ncu_csv(ncu, "72.5")
+    out = tmp_path / "out"
+    main(["analyze", "--backend", "cuda", "--input", str(trace.parent), "--output", str(out), "--ncu-csv", str(ncu)])
+    evidence = json.loads((out / "evidence.json").read_text(encoding="utf-8"))
+    hw = evidence["hardware"]
+    hw_ref = hw["provenance_ref"]
+    assert hw_ref  # hardware provenance_ref 存在
+    hw_run_id, hw_eid = hw_ref.split(":", 1)
+    prov_by_id = {r["id"]: r for r in evidence["provenance"]}
+    assert hw_eid in prov_by_id, "hardware provenance record must exist"
+    assert prov_by_id[hw_eid]["run_id"] == hw_run_id
+    # 每个 hardware metric_evidence ref 都能 resolve
+    for k, refs in evidence["metric_evidence"].items():
+        if not k.startswith("hardware:"):
+            continue
+        for ref in refs:
+            run_id, eid = ref.split(":", 1)
+            assert eid in prov_by_id, f"ref {ref} does not resolve"

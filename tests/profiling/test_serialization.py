@@ -177,8 +177,8 @@ def test_deterministic_output_ac08():
 
 
 def test_schema_version_constant():
-    assert SCHEMA_VERSION == "0.5"
-    assert OptimizationEvidence().schema_version == "0.5"
+    assert SCHEMA_VERSION == "0.6"
+    assert OptimizationEvidence().schema_version == "0.6"
 
 
 # ---- writer 侧 validation（P0-4）：非法内存对象无法序列化 ----
@@ -228,7 +228,7 @@ def test_mutated_object_rejected_at_serialization():
 
 def test_migrate_01_operators_gain_layer():
     ev = OptimizationEvidence.from_dict(_v01_evidence_dict())
-    assert ev.schema_version == "0.5"
+    assert ev.schema_version == "0.6"
     fw = next(o for o in ev.operators if o.name == "aten::mm")
     dev = next(o for o in ev.operators if o.name == "gemm_kernel")
     assert fw.layer == "framework"
@@ -289,7 +289,7 @@ def test_migrate_01_keeps_provenance():
 def test_migrate_02_gap_overlap_absent_not_fabricated():
     # 0.2 文件无时间相关性数据 -> gap_overlap_ms 为 None，不编造
     ev = OptimizationEvidence.from_dict(_v02_evidence_dict())
-    assert ev.schema_version == "0.5"
+    assert ev.schema_version == "0.6"
     assert ev.runtime.gap_overlap_ms is None
 
 
@@ -319,7 +319,7 @@ def test_migrate_04_real_additive():
         ],
     }
     ev = OptimizationEvidence.from_dict(data)
-    assert ev.schema_version == "0.5"
+    assert ev.schema_version == "0.6"
     assert ev.runtime.gap_overlap_ms is None  # 0.4 无该字段，迁移不编造
     assert ev.runtime.api_summed_ms == 15.0  # 既有值保留
     assert ev.metric_evidence["workload.wall_ms"] == ["aa11bb22cc33:ev_000001"]

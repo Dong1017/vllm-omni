@@ -97,6 +97,26 @@ All three join on `connectionId` (verified on the real 459MB sample: TASK.connec
 - Large-DB safety: gap derivation via one-pass `complement()`; overlap via bisect-stepped `total_event_overlap()` — a quadratic per-removal subtract loop hung on the real ~200k-interval busy union.
 - Conservative degradation: no timeline/tables → no correlation observations, no `*_bound`; the CSV path keeps `gap_overlap_ms=None` (no API timeline there).
 
+## D12. Hardware evidence contract (v0.6, M4.2a)
+
+`OptimizationEvidence.hardware` carries an `ncu --csv` long-format capture as typed evidence:
+
+```text
+HardwareEvidence(backend, source, provenance_ref, entries[])
+HardwareMetricEntry(scope=kernel, metric_name, metric_unit, metric_value,
+                    canonical_value, canonical_unit)
+```
+
+Discipline (inherited from the Yotta feasibility final review, revised at the M4.2a gate):
+
+- The canonical hardware-counter source is the raw NCU `(metric_name, metric_unit, metric_value)` tuple; `metric_unit` is preserved verbatim because ncu auto-scales value/unit and a unitless value is uninterpretable.
+- **Unit scaling uses SI factors per the Nsight Compute CLI spec: byte-family K/M/G = 1000/1e6/1e9 (NOT 1024).** The collector contract for M4.2b explicitly passes `--print-units base` (ncu `--csv` implies it by default; explicit is more stable).
+- `canonical_*` fields hold ONLY unit conversion (SI factors). Unparsable values (`n/a`) and unknown units leave `canonical_*` as None — unavailable, never 0.
+- Metric value is the parsed numeric (thousand separators removed); the raw comma-format string is not preserved.
+- **Unitless interpretation is registry-gated**: an empty unit is interpretable only for metrics in `METRIC_REGISTRY` (the curated 20-counter shortlist with architecture fallbacks); unknown metric + empty unit stays unresolved.
+- **Observations are registry-semantic-driven**: only the saturation family (dram/sm/l1tex/lts throughput, tensor-pipe active, issue-active pct counters) emits `hardware_resource_saturation` at ≥ 80% pct. Hit-rate/occupancy/counters-descriptive families emit nothing (a 90% hit rate is not a problem signal). `compute_bound` / `memory_bound` remain closed until M4.2b validates counters, attribution, and units on a real capture.
+- Kernel→operator attribution is deliberately out of scope for M4.2a.
+
 ## Terminology note: run_id is an analysis identity
 
 `run_id` is content-addressed: `hash(sorted source hashes + backend + parser)`. Two identical captures would produce the same `run_id`. It identifies an **analysis/evidence set**, not a capture instance. If the future Optimization IR needs capture-instance identity, that becomes a separate field — not extended now.

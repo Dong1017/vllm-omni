@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from vllm_omni.profiling.backends.ncu_csv import SATURATION_PCT_METRICS
 from vllm_omni.profiling.schema import OptimizationEvidence
 
 # Observation 的固定类别（what is happening 的词汇表，与 diagnosis taxonomy 分离，P1-3）
@@ -25,6 +26,7 @@ OBSERVATION_KINDS = (
     "communication_exposed",  # 未重叠通信占比可观（derived，引用全部输入）
     "communication_present_no_overlap_breakdown",  # 通信总量存在但分解不可得（P1-2：不得称 exposed）
     "compute_activity_dominant",  # 设备上 compute 类活动占主导（观察，非 compute_bound）
+    "hardware_resource_saturation",  # M4.2a：saturation 族硬件计数器越过观察线（观察，非 *_bound）
     "no_evidence_available",  # 核心指标全缺（P1-1 拆分）
     "no_salient_observation",  # 有指标但无一超过观察阈值（P1-1 拆分）
 )
@@ -35,6 +37,7 @@ OBSERVE_CATEGORY_SHARE = 0.20
 OBSERVE_BUSY_RATIO = 0.75
 OBSERVE_COMPUTE_SHARE = 0.75
 OBSERVE_GAP_CORRELATION = 0.30  # 分类 API 时间落在 exposed gap 内的占比（M4.1）
+OBSERVE_HW_PCT = 80.0  # saturation 族硬件计数器观察线（M4.2a；observation-only）
 
 _RUNTIME_CATEGORIES = (
     ("launch_summed_ms", "runtime_launch_heavy", "runtime_launch_gap_correlated"),
@@ -203,6 +206,29 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
                 f"device busy (union) is {busy_ratio:.1%} of wall",
                 ev.metric_evidence.get("timeline.device_busy_ms", []) + ev.metric_evidence.get("workload.wall_ms", []),
             )
+
+    # ---- M4.2a：硬件计数器观察（deterministic；仅 pct 类越过观察线才产，
+    # 且永远 observation-only——compute_bound/memory_bound 等 *_bound 由
+    # M4.2b 之后的诊断规则在归因链稳定后单独设计）----
+    hw = ev.hardware
+    if hw and hw.entries:
+        for e in hw.entries:
+            if (
+                e.canonical_unit == "pct"
+                and e.canonical_value is not None
+                and e.canonical_value >= OBSERVE_HW_PCT
+                and e.metric_name in SATURATION_PCT_METRICS
+            ):
+                key = f"hardware:{e.scope_id}:{e.metric_name}"
+                add(
+                    "hardware_resource_saturation",
+                    key,
+                    e.canonical_value,
+                    f"{e.metric_name} is {e.canonical_value:.1f}% on {e.scope} "
+                    "(observation only; *_bound classification requires M4.2b "
+                    "counter validation and attribution)",
+                    ev.metric_evidence.get(key, []),
+                )
 
     if not observations:
         # P1-1：区分"无证据"与"有证据但无显著信号"

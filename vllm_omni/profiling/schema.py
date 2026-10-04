@@ -40,8 +40,8 @@ from dataclasses import dataclass, field
 
 from vllm_omni.profiling.provenance import EvidenceRecord
 
-SCHEMA_VERSION = "0.5"
-READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4", "0.5")
+SCHEMA_VERSION = "0.6"
+READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4", "0.5", "0.6")
 
 # operator 三层模型（决议 1）：framework_op -> runtime_op -> device_task(s)
 OPERATOR_LAYERS = ("framework", "runtime", "device")
@@ -207,6 +207,37 @@ class Diagnosis:
 
 
 @dataclass
+class HardwareMetricEntry:
+    """单条硬件计数器证据：(metric_name, metric_unit, metric_value) 原样三元组
+    + canonical_value/canonical_unit 规范化结果（P0 unit 纪律：无 unit 的数值
+    不可解释；规范化只做单位换算，不改语义）。
+    scope 为 kernel 名；scope_id 为稳定的 per-invocation 身份（由 NCU 源字段
+    Process ID/Device/Context/Stream/ID 组合，M4.2a gate P0-1），metric_evidence
+    与观察的 metric_key 均以 scope_id 为准，不用数组位置。"""
+
+    scope: str
+    metric_name: str
+    metric_unit: str | None = None
+    metric_value: str | float | int | None = None
+    canonical_value: float | None = None
+    canonical_unit: str | None = None
+    scope_id: str | None = None
+
+
+@dataclass
+class HardwareEvidence:
+    """一个硬件计数器 capture 的 evidence（当前：NCU CSV；后续：Ascend 硬件）。
+
+    entries 逐条原样保留 NCU 三元组；规范化只在 canonical_* 字段。
+    未识别 unit/value（如 "n/a"）保持 canonical=None —— unavailable 纪律。"""
+
+    backend: str | None = None
+    source: str | None = None  # NCU CSV 文件名（sha256 进 provenance）
+    provenance_ref: str | None = None  # 指向 provenance 记录的全局引用（P1-4 纪律）
+    entries: list[HardwareMetricEntry] = field(default_factory=list)
+
+
+@dataclass
 class BackendMetrics:
     cuda: dict = field(default_factory=dict)
     ascend: dict = field(default_factory=dict)
@@ -226,6 +257,7 @@ class OptimizationEvidence:
     hotspots: list[Hotspot] = field(default_factory=list)
     diagnosis: Diagnosis = field(default_factory=Diagnosis)
     backend_metrics: BackendMetrics = field(default_factory=BackendMetrics)
+    hardware: HardwareEvidence | None = None  # M4.2a：硬件计数器 evidence（None = 未采集）
     provenance: list[EvidenceRecord] = field(default_factory=list)
     # P1-1：核心标量指标 -> 全局 evidence 引用（"run_id:ev_id"）。
     # key 为 schema 内的 metric 路径，如 "timeline.device_busy_ms" / "runtime.api_summed_ms"
@@ -346,6 +378,7 @@ _CHILD_LIST_TYPES: dict[type, dict[str, type]] = {
     },
     Workload: {"stage_times": StageTime},
     Diagnosis: {"candidates": DiagnosisCandidate},
+    HardwareEvidence: {"entries": HardwareMetricEntry},
 }
 _SECTION_TYPES: dict[str, type] = {
     "run": RunInfo,
@@ -356,6 +389,7 @@ _SECTION_TYPES: dict[str, type] = {
     "communication": CommunicationStats,
     "diagnosis": Diagnosis,
     "backend_metrics": BackendMetrics,
+    "hardware": HardwareEvidence,
 }
 
 
@@ -367,8 +401,8 @@ def _migrate(data: dict, from_version: str) -> dict:
     if from_version == "0.2":
         data = _migrate_0_2(data)
         from_version = "0.3"
-    if from_version in ("0.3", "0.4"):
-        # 0.4 新增字段（metric_evidence/depends_on）与 0.5 新增字段（gap_overlap_ms）
+    if from_version in ("0.3", "0.4", "0.5"):
+        # 0.4 metric_evidence/depends_on、0.5 gap_overlap_ms、0.6 hardware
         # 均为空默认（历史文件无法补充绑定，不编造）
         data["schema_version"] = SCHEMA_VERSION
     return data
