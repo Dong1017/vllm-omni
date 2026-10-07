@@ -182,13 +182,15 @@ def render_summary_md(ev: OptimizationEvidence) -> str:
     lines.append(
         f"| exposed non-device-busy gap | {_fmt(gap)} | {_status(gap, derived=is_cuda)} | {gap_src}{gap_note} |"
     )
+    # compute/communication 时间口径按后端标注（AC-06）：CUDA = busy 的 partition
+    # union（subtract 得非重叠分解）；Ascend = step-trace/overlap type 列求和（summed）
+    time_basis = "union" if is_cuda else "summed"
     compute = ev.timeline.compute_ms
-    lines.append(
-        f"| compute (union) | {_fmt(compute)} | {_status(compute)} | {_metric_source(ev, 'timeline.compute_ms')} |"
-    )
+    compute_src = _metric_source(ev, "timeline.compute_ms")
+    lines.append(f"| compute ({time_basis}) | {_fmt(compute)} | {_status(compute)} | {compute_src} |")
     comm = ev.timeline.communication_ms
     comm_src = _metric_source(ev, "timeline.communication_ms")
-    lines.append(f"| communication (union) | {_fmt(comm)} | {_status(comm)} | {comm_src} |")
+    lines.append(f"| communication ({time_basis}) | {_fmt(comm)} | {_status(comm)} | {comm_src} |")
     alloc = ev.runtime.allocation_summed_ms
     alloc_src = _metric_source(ev, "runtime.allocation_summed_ms")
     lines.append(f"| allocation | {_fmt(alloc)} | {_status(alloc)} | {alloc_src} |")

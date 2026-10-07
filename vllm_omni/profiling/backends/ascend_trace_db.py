@@ -20,6 +20,23 @@
 #   四条（D11：同 DB ≠ 自动同 timeline，metric 按输入显式绑定）。
 # 哨兵发现：TASK.connectionId=-1 共 267,873 行（未关联任务），不参与 parent
 #   链（conn 不在 CANN_API）；calls/时长如实进未解析聚合行。
+# M4.1c（Ascend authoritative timeline semantics，2026-10-07 gate 裁定）：
+#   conn=-1 调查（m41b-conn-neg1-investigation.md）证明 raw TASK union 不是
+#   canonical device activity——26.7 万行 conn=-1 是 per-stream capture-session
+#   哨兵，PROFILER 自己的 OVERLAP_ANALYSIS 预分类与 step_trace 精确一致：
+#   type 0=compute / 1=communication / 2=communication not overlapped /
+#   3=free（官方语义，勿按 0..3 顺序猜）。裁定五条：
+#   1) conn=-1 永不 parent 归因、永不进 named operator 的 summed_device_ms；
+#   2) device_busy = OVERLAP_ANALYSIS type0∪type1 的 interval union
+#      （compute/communication 允许重叠，禁止 summed 相加冒充 busy）；
+#   3) type3=Free 是 profiler 定义的 device idle 证据（exposed gap 同源）；
+#   4) type2=Communication(Not Overlapped) 是 communication exposure 证据：
+#      total(type1) = not_overlapped(type2) + overlapped，三者不是 wall partition；
+#   5) SESSION_TIME_INFO 是 capture session 窗口，不自动等同 workload wall；
+#      overlap-analysis 分类窗口与 session 窗口的差值如实记录（真实样本
+#      111.049s vs 124.550s，差 13.5s 为 capture 初始化/未覆盖区间）。
+#   OVERLAP_ANALYSIS 表存在 -> authoritative path；不存在 -> task_union
+#   fallback（排除 conn=-1 后 union），timeline_source 显式标记，不 silent。
 
 from __future__ import annotations
 
@@ -34,9 +51,10 @@ from vllm_omni.profiling.intervals import (
     union,
 )
 from vllm_omni.profiling.intervals import total as intervals_total
-from vllm_omni.profiling.provenance import ProvenanceStore, compute_run_id, sha256_file
+from vllm_omni.profiling.provenance import EvidenceRecord, ProvenanceStore, compute_run_id, sha256_file
 from vllm_omni.profiling.schema import (
     BackendMetrics,
+    CommunicationStats,
     OperatorEvidence,
     OptimizationEvidence,
     RunInfo,
@@ -62,6 +80,16 @@ _TRACE_CATEGORIES = ("launch", "synchronization", "allocation", "other")
 
 _PYTORCH_TYPE_ATEN = 50001  # 实测：type 50001=aten 调用、50002=Enqueue@、50003=profiler 事件
 
+# OVERLAP_ANALYSIS（M4.1c authoritative timeline source，真实 459MB 库勘察）：
+#   列 id/deviceId/startNs/endNs/type；type 语义来自 profiler 官方
+#   Overlap Analysis 定义（与 step_trace_time.csv 精确对照核实，勿增删）。
+_OVERLAP_REQUIRED_COLS = {"startNs", "endNs", "type"}
+_OVERLAP_COMPUTE = 0
+_OVERLAP_COMMUNICATION = 1
+_OVERLAP_COMM_NOT_OVERLAPPED = 2
+_OVERLAP_FREE = 3
+_TASK_SENTINEL_CONN = -1  # conn=-1 TASK = per-stream capture-session 哨兵（非 device work）
+
 
 class UnsupportedTraceDBError(ValueError):
     pass
@@ -83,6 +111,21 @@ def _open_trace_db(path: Path) -> sqlite3.Connection:
             con.close()
             raise UnsupportedTraceDBError(f"unsupported trace DB schema: table {table} missing columns {sorted(miss)}")
     return con
+
+
+def _overlap_table_ready(con: sqlite3.Connection) -> bool:
+    """OVERLAP_ANALYSIS 探测（T26 纪律）：表缺失 -> fallback；表在但缺列 -> 显式
+    unsupported（存在即承诺了 schema，半 schema 不允许静默跳过）。"""
+    existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "OVERLAP_ANALYSIS" not in existing:
+        return False
+    cols = {r[1] for r in con.execute('PRAGMA table_info("OVERLAP_ANALYSIS")')}
+    miss = _OVERLAP_REQUIRED_COLS - cols
+    if miss:
+        raise UnsupportedTraceDBError(
+            f"unsupported trace DB schema: table OVERLAP_ANALYSIS missing columns {sorted(miss)}"
+        )
+    return True
 
 
 def _classify(name: str) -> str:
@@ -183,6 +226,45 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
         session = con.execute("SELECT startTimeNs, endTimeNs FROM SESSION_TIME_INFO").fetchone()
         wall_ns = session[1] - session[0] if session and None not in session else None
 
+        # ---- M4.1c：OVERLAP_ANALYSIS authoritative timeline 探测与读取 ----
+        has_overlap = _overlap_table_ready(con)
+        if has_overlap:
+            rec_overlap = store.add(
+                source_file=db_path.name,
+                source_type="profiler_db",
+                parser=_PARSER,
+                unit="ns",
+                query="sqlite:OVERLAP_ANALYSIS",
+                aggregation="type 0/1 union_intervals; type sums; window span",
+                source_sha256=sha,
+            )
+        ov_intervals: dict[int, list[Interval]] = {}
+        ov_sum_ns: dict[int, int] = {}
+        ov_calls: dict[int, int] = {}
+        ov_unknown: dict[int, int] = {}
+        ov_span: Interval | None = None
+        overlap_rows = 0
+        if has_overlap:
+            for start, end, otype in con.execute("SELECT startNs, endNs, type FROM OVERLAP_ANALYSIS"):
+                if start is None or end is None or end <= start:
+                    continue
+                overlap_rows += 1
+                ov_span = (start, end) if ov_span is None else (min(ov_span[0], start), max(ov_span[1], end))
+                known = otype in (
+                    _OVERLAP_COMPUTE,
+                    _OVERLAP_COMMUNICATION,
+                    _OVERLAP_COMM_NOT_OVERLAPPED,
+                    _OVERLAP_FREE,
+                )
+                if otype in (_OVERLAP_COMPUTE, _OVERLAP_COMMUNICATION, _OVERLAP_FREE):
+                    ov_intervals.setdefault(otype, []).append((start, end))  # int ns（P1-1）
+                if otype in (_OVERLAP_COMPUTE, _OVERLAP_COMMUNICATION, _OVERLAP_COMM_NOT_OVERLAPPED):
+                    ov_sum_ns[otype] = ov_sum_ns.get(otype, 0) + (end - start)
+                    ov_calls[otype] = ov_calls.get(otype, 0) + 1
+                if not known:
+                    # 未收录 type：如实记录计数，不猜测语义、不进 busy/idle（真实库仅 0-3）
+                    ov_unknown[otype] = ov_unknown.get(otype, 0) + 1
+
         string_ids = {i: v for i, v in con.execute("SELECT id, value FROM STRING_IDS")}
 
         # ---- P0-2：CANN 中间链门控。TASK parent 归因必须先证明
@@ -232,23 +314,32 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
             if start is None or end is None:
                 continue
             task_seen = True
-            if end > start:
+            # M4.1c 裁定 1：conn=-1 哨兵是 per-stream capture-session marker，
+            # 不是 device work —— 永不进 busy union（authoritative path 本就
+            # 不用 TASK 做 busy；fallback path 也必须排除）。
+            if end > start and conn_id != _TASK_SENTINEL_CONN:
                 task_ints.append((start, end))  # int ns（P1-1）
-            resolved = string_ids.get(info_name_id)
+            # M4.1c 裁定 1：conn=-1 永不解析 kernel 名、永不进 named operator 的
+            # summed_device_ms / parent 链——强制类型名兜底聚合行（契约化，不只靠
+            # "COMPUTE_TASK_INFO 零命中"的经验观察）。
+            if conn_id == _TASK_SENTINEL_CONN:
+                resolved = None
+            else:
+                resolved = string_ids.get(info_name_id)
             name = resolved if resolved else f"npu_task_type_{task_type}"
-            agg = device_names.setdefault(name, _DeviceAgg())
-            agg.calls += 1
+            dev_agg = device_names.setdefault(name, _DeviceAgg())
+            dev_agg.calls += 1
             if end > start:
-                agg.total_us += (end - start) / 1000.0  # ns -> us
-                agg.durs.append((end - start) / 1000.0)
+                dev_agg.total_us += (end - start) / 1000.0  # ns -> us
+                dev_agg.durs.append((end - start) / 1000.0)
             # P0-2：parent 链必须 TASK.conn ∈ CANN.conn（经 cann_conn_ids 门控），
             # 且同 conn 有 PYTORCH(type=50001) 行；否则计入 unresolved
             fw = conn_to_fw.get(conn_id) if conn_id in cann_conn_ids else None
             if fw:
-                agg.fw_names |= fw
-                agg.resolved += 1
+                dev_agg.fw_names |= fw
+                dev_agg.resolved += 1
             else:
-                agg.unresolved += 1
+                dev_agg.unresolved += 1
 
         # ---- PYTORCH_API：framework 行（type=50001 aten，SQL 聚合）----
         # P0-3：每行 (start,end) 为该次调用的 host inclusive 时长
@@ -263,26 +354,57 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
             )
         ]
 
-        # ---- timeline：wall=SESSION_TIME_INFO；busy=TASK union；gap=session 窗口−busy ----
-        # final-review P0：gap 窗口必须用绝对 session 起止 ns——误用相对时长 wall_ns
-        # 当右端点会与绝对 ns 区间完全错位（overlap 恒 0，checkpoint 审查实测发现）。
+        # ---- timeline（M4.1c 双路径）----
+        # authoritative：OVERLAP_ANALYSIS 存在且有行 -> busy = type0∪type1 interval
+        #   union（裁定 2：compute/communication 允许重叠，禁止 summed 相加冒充
+        #   busy）；exposed/gap = type3 Free（profiler 定义的 device idle，裁定 3）。
+        #   compute_ms/communication_ms 与 CSV 路径同口径（summed），与 busy 的
+        #   union 口径互斥（AC-06）——summed 相加 > busy 正是 overlap 存在的证据。
+        # fallback：OVERLAP_ANALYSIS 缺失 -> busy = TASK union（conn=-1 已排除），
+        #   exposed/gap 仍用 session 窗口；timeline_source 显式标记，不 silent。
+        # 裁定 5：SESSION_TIME_INFO 是 capture session 窗口，不自动等同 workload
+        #   wall——authoritative path 的 workload.wall_ms 用 profiler 分类窗口
+        #   （overlap span，真实样本 111.049s）；session 窗口与差值（13.5s，capture
+        #   初始化/未覆盖，不是 device idle）另记 backend_metrics。
+        # final-review P0（fallback）：gap 窗口必须用绝对 session 起止 ns——误用
+        #   相对时长 wall_ns 当右端点会与绝对 ns 区间完全错位。
         timeline = Timeline()
         workload = Workload()
-        session_iv: Interval = (session[0], session[1]) if session and None not in session else None
+        session_iv: Interval | None = (session[0], session[1]) if session and None not in session else None
         if wall_ns is not None:
-            workload.wall_ms = wall_ns / 1e6
-        busy_iv = union(task_ints) if task_seen else []
-        busy_ns = intervals_total(busy_iv)
-        if task_seen:
-            timeline.device_busy_ms = busy_ns / 1e6
-            if wall_ns is not None:
-                timeline.exposed_non_device_busy_ms = (wall_ns - busy_ns) / 1e6
-        # gap 区间：session 绝对窗口 − busy union（同 ns int 域，complement 一次扫描）
-        gap_iv = complement(session_iv, task_ints) if (task_seen and session_iv) else []
+            workload.wall_ms = wall_ns / 1e6  # fallback/empty：session 是唯一窗口证据
+        gap_known = False
+        if has_overlap and overlap_rows > 0:
+            busy_iv = union(ov_intervals.get(_OVERLAP_COMPUTE, []) + ov_intervals.get(_OVERLAP_COMMUNICATION, []))
+            free_iv = union(ov_intervals.get(_OVERLAP_FREE, []))
+            timeline.device_busy_ms = intervals_total(busy_iv) / 1e6
+            timeline.exposed_non_device_busy_ms = intervals_total(free_iv) / 1e6
+            timeline.compute_ms = ov_sum_ns.get(_OVERLAP_COMPUTE, 0) / 1e6
+            timeline.communication_ms = ov_sum_ns.get(_OVERLAP_COMMUNICATION, 0) / 1e6
+            # workload wall 与 busy/exposed/comm 全部同窗口同 provenance（overlap
+            # span），跨窗口比值（如 busy/session）由 observation 同源校验拒绝
+            assert ov_span is not None  # overlap_rows > 0 蕴含 span 已建立（内部契约）
+            workload.wall_ms = (ov_span[1] - ov_span[0]) / 1e6
+            gap_iv = free_iv
+            gap_known = True
+        elif has_overlap:
+            # OVERLAP_ANALYSIS 在但零行：timeline 不可用——不得回退 TASK union，
+            # 也不得填 0 冒充（AC-03）；gap_unknown -> gap_overlap 保持 None
+            gap_iv = []
+        else:
+            busy_iv = union(task_ints) if task_seen else []
+            busy_ns = intervals_total(busy_iv)
+            if task_seen:
+                timeline.device_busy_ms = busy_ns / 1e6
+                if wall_ns is not None:
+                    timeline.exposed_non_device_busy_ms = (wall_ns - busy_ns) / 1e6
+            # gap 区间：session 绝对窗口 − busy union（同 ns int 域，complement 一次扫描）
+            gap_iv = complement(session_iv, task_ints) if (task_seen and session_iv) else []
+            gap_known = bool(task_seen and session_iv)
 
         # ---- runtime 分类 + gap overlap（M4.1 机制复用：同 ns int 域逐事件求交，ns→ms）----
         gap_overlap: dict[str, float] | None = None
-        if task_seen and wall_ns and api_seen:
+        if gap_known and api_seen:
             gap_overlap = {
                 "launch": total_event_overlap(cat_ints["launch"], gap_iv) / 1e6,
                 "synchronization": total_event_overlap(cat_ints["synchronization"], gap_iv) / 1e6,
@@ -298,6 +420,23 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
             launch_count=cat_calls["launch"] if api_seen else None,
             gap_overlap_ms=gap_overlap,
         )
+
+        # ---- communication exposure（M4.1c 裁定 4，仅 authoritative path）----
+        # 官方语义：Communication(Not Overlapped) = Communication − Overlapped，
+        # 即 total(type1) = not_overlapped(type2) + overlapped(与 compute 重叠)。
+        # 三者是 exposure 分解，不是 wall partition——禁止与 busy/free 求和对照。
+        # section 对象恒存在（schema 契约），unavailable 用字段 None 表达（AC-03）。
+        comm = CommunicationStats()
+        if has_overlap and overlap_rows > 0:
+            total_comm_ms = ov_sum_ns.get(_OVERLAP_COMMUNICATION, 0) / 1e6
+            not_overlapped_ms = ov_sum_ns.get(_OVERLAP_COMM_NOT_OVERLAPPED, 0) / 1e6
+            overlap_ms = total_comm_ms - not_overlapped_ms
+            comm = CommunicationStats(
+                calls=ov_calls.get(_OVERLAP_COMMUNICATION),
+                total_ms=total_comm_ms,
+                overlap_ms=overlap_ms,
+                overlap_ratio=(overlap_ms / total_comm_ms) if total_comm_ms > 0 else None,
+            )
 
         # ---- operators 组装（framework -> runtime -> device；parent 走 connectionId 链）----
         operators: list[OperatorEvidence] = []
@@ -333,12 +472,12 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                 )
             )
         for name in sorted(device_names):
-            agg = device_names[name]
+            dev_agg = device_names[name]
             # P0-1：全部实例 resolve 且指向唯一 framework op 才填 parent；
             # 任一 unresolved 实例 -> None（"部分未知归属"不得归给唯一已知 parent）
             parent_id = None
-            if agg.unresolved == 0 and len(agg.fw_names) == 1:
-                parent_id = framework_id_by_name[next(iter(agg.fw_names))]
+            if dev_agg.unresolved == 0 and len(dev_agg.fw_names) == 1:
+                parent_id = framework_id_by_name[next(iter(dev_agg.fw_names))]
             operators.append(
                 OperatorEvidence(
                     id=f"op_{len(operators) + 1:06d}",
@@ -346,13 +485,38 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                     layer="device",
                     parent_id=parent_id,
                     op_type="npu_task",
-                    calls=agg.calls,
-                    summed_device_ms=agg.total_us / 1000.0 if agg.total_us else None,
-                    avg_device_us=(agg.total_us / agg.calls) if agg.calls else None,
-                    median_device_us=statistics.median(agg.durs) if agg.durs else None,
+                    calls=dev_agg.calls,
+                    summed_device_ms=dev_agg.total_us / 1000.0 if dev_agg.total_us else None,
+                    avg_device_us=(dev_agg.total_us / dev_agg.calls) if dev_agg.calls else None,
+                    median_device_us=statistics.median(dev_agg.durs) if dev_agg.durs else None,
                     evidence_ids=[store.ref(rec_task.id)],
                 )
             )
+
+        # ---- backend_metrics：窗口语义与 timeline source 显式化（M4.1c 裁定 5）----
+        backend_meta: dict = {
+            "db_tables_used": sorted(_TRACE_DB_REQUIRED),
+            "rank_device_map": [f"rankId={r} deviceId={d}" for r, d in rank_rows],
+            # M4.1c：哨兵行不进 busy union、不进 named operator（契约化，非经验观察）
+            "unlinked_task_sentinel": "connectionId=-1 rows stay unattributed, never in busy union",
+            "timeline_source": "overlap_analysis" if has_overlap else "task_union_fallback",
+        }
+        if has_overlap:
+            backend_meta["overlap_analysis_rows"] = overlap_rows
+            if wall_ns is not None:
+                # 裁定 5：session 窗口单独记录，workload.wall_ms 在 authoritative
+                # path 用 overlap 分类窗口（两者不是同一窗口，禁止混用）
+                backend_meta["session_window_ms"] = wall_ns / 1e6
+            if ov_span is not None:
+                backend_meta["overlap_window_ms"] = (ov_span[1] - ov_span[0]) / 1e6
+                if wall_ns is not None:
+                    # 裁定 5：差值是 capture 初始化/未覆盖区间，不是 device idle，
+                    # 不计入 exposed gap（真实样本 13.5s）
+                    backend_meta["outside_overlap_window_ms"] = (wall_ns - (ov_span[1] - ov_span[0])) / 1e6
+            if ov_unknown:
+                backend_meta["overlap_unknown_types"] = {str(k): v for k, v in sorted(ov_unknown.items())}
+            if overlap_rows > 0:
+                backend_meta["communication_not_overlapped_ms"] = ov_sum_ns.get(_OVERLAP_COMM_NOT_OVERLAPPED, 0) / 1e6
 
         ev = OptimizationEvidence(
             run=RunInfo(
@@ -368,6 +532,7 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
             timeline=timeline,
             operators=operators,
             runtime=runtime_stats,
+            communication=comm,
             provenance=store.records,
             # P1-4：metric 按输入显式绑定（同 DB ≠ 自动同 timeline；
             # 全部 metric 同一 ns clock domain 的证据见 SESSION_TIME_INFO 包络勘察）
@@ -377,17 +542,13 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                 rec_pytorch,
                 rec_cann,
                 rec_task,
+                rec_overlap if has_overlap else None,
                 wall_ns is not None,
                 task_seen,
                 api_seen,
+                gap_known,
             ),
-            backend_metrics=BackendMetrics(
-                ascend={
-                    "db_tables_used": sorted(_TRACE_DB_REQUIRED),
-                    "rank_device_map": [f"rankId={r} deviceId={d}" for r, d in rank_rows],
-                    "unlinked_task_sentinel": "connectionId=-1 rows stay unattributed",
-                }
-            ),
+            backend_metrics=BackendMetrics(ascend=backend_meta),
         )
         return ev, store
     finally:
@@ -396,27 +557,42 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
 
 def _trace_metric_evidence(
     store: ProvenanceStore,
-    rec_session: object,
-    rec_pytorch: object,
-    rec_cann: object,
-    rec_task: object,
+    rec_session: EvidenceRecord,
+    rec_pytorch: EvidenceRecord,
+    rec_cann: EvidenceRecord,
+    rec_task: EvidenceRecord,
+    rec_overlap: EvidenceRecord | None,
     has_wall: bool,
     has_task: bool,
     has_api: bool,
+    gap_known: bool,
 ) -> dict[str, list[str]]:
-    """P1-4：metric 按输入显式绑定到对应 provenance 记录（同 DB ≠ 自动同 timeline）。"""
+    """P1-4：metric 按输入显式绑定到对应 provenance 记录（同 DB ≠ 自动同 timeline）。
+    M4.1c：authoritative path 的 timeline/communication 指标绑定 rec_overlap；
+    fallback path 保持 rec_task 绑定；busy source 不同的两条路径不得共用绑定。"""
     s, _pt, cn, tk = (
         store.ref(rec_session.id),
         store.ref(rec_pytorch.id),
         store.ref(rec_cann.id),
         store.ref(rec_task.id),
     )
+    ov = store.ref(rec_overlap.id) if rec_overlap is not None else None
     me: dict[str, list[str]] = {}
-    if has_wall:
-        me["workload.wall_ms"] = [s]
-    if has_task:
-        me["timeline.device_busy_ms"] = [tk]
-        me["timeline.exposed_non_device_busy_ms"] = [s, tk]  # derived: wall(session) - busy(task)
+    if ov is not None:
+        # 裁定 5：wall 与 busy/exposed/comm 同窗口（overlap span），绑定同一记录
+        me["workload.wall_ms"] = [ov]
+        me["timeline.device_busy_ms"] = [ov]
+        me["timeline.exposed_non_device_busy_ms"] = [ov]
+        me["timeline.compute_ms"] = [ov]
+        me["timeline.communication_ms"] = [ov]
+        me["communication.total_ms"] = [ov]
+        me["communication.overlap_ms"] = [ov]
+    else:
+        if has_wall:
+            me["workload.wall_ms"] = [s]
+        if has_task:
+            me["timeline.device_busy_ms"] = [tk]
+            me["timeline.exposed_non_device_busy_ms"] = [s, tk]  # derived: wall(session) - busy(task)
     if has_api:
         for cat in (
             "api_summed_ms",
@@ -427,8 +603,9 @@ def _trace_metric_evidence(
             "launch_count",
         ):
             me[f"runtime.{cat}"] = [cn]
-        # gap overlap：derived，依赖 CANN 区间 + TASK busy 区间 + session 窗口全部输入
-        if has_task:
+        # gap overlap：derived，依赖 CANN 区间 + busy/Free 区间来源的全部输入
+        if gap_known:
+            gap_refs = [cn, ov] if ov is not None else [cn, tk, s]
             for cat in ("launch", "synchronization", "allocation", "other"):
-                me[f"runtime.gap_overlap_ms.{cat}"] = [cn, tk, s]
+                me[f"runtime.gap_overlap_ms.{cat}"] = gap_refs
     return me

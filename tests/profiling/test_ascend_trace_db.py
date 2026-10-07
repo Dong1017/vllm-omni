@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# Ascend 大库 timeline correlation 测试（M4.1b）：fixture 复刻真实
+# Ascend 大库 timeline correlation 测试（M4.1b/M4.1c）：fixture 复刻真实
 # ascend_pytorch_profiler_0.db schema；真实 DB 存在时执行真实验证（CI 跳过）。
 
 import sqlite3
@@ -28,11 +28,18 @@ REAL_DB = Path(
 #   CANN alloc    conn=103 [50_000, 60_000]   全在 gap（10us）
 #   CANN other    conn=104 [100_000, 150_000] 全在 busy（对 gap 零贡献）
 #   TASK: busy 任务 + conn=100/102 对应任务 + 无 COMPUTE_TASK_INFO 的任务
+#         + conn=-1 哨兵（M4.1c：永不进 busy union / 永不解析 kernel 名）
 #   PYTORCH: type=50001 aten::mm(conn=100) x2 / aten::relu(conn=102)；
 #            type=50002 Enqueue@aclnnMul(conn=101)
+#   OVERLAP_ANALYSIS（overlap=True，M4.1c authoritative path，设计值）：
+#     type0 compute [100k,400k]=300us；type1 comm [350k,450k]=100us（与 compute
+#     重叠 50us）；type2 not-overlapped [400k,450k]=50us；type3 free
+#     [0,100k]+[450k,600k]=250us；type9 未知 [900k,950k]（只记录不进 busy/idle）
+#     -> busy=union(0∪1)=[100k,450k]=350us；compute+comm summed=400us>busy
+#     （overlap 证据）；exposed=Free=250us；窗口 span=[0,950k]=950us
 
 
-def _create_fixture_db(path: Path) -> None:
+def _create_fixture_db(path: Path, *, overlap: bool = False, overlap_rows: bool = True) -> None:
     con = sqlite3.connect(path)
     con.executescript(
         """
@@ -96,9 +103,36 @@ def _create_fixture_db(path: Path) -> None:
             (350_000, 400_000, 102, 8),
         ],
     )
+    # M4.1c：conn=-1 哨兵两行（per-stream capture marker）。第一行 globalTaskId=7
+    # 与真实任务 npu_kernel_x 同 gid —— 门控失效就会错误解析进 named operator；
+    # 第二行 gid=NULL 连 COMPUTE_TASK_INFO 都无。两行都覆盖/穿越 busy 区间，
+    # 若进了 busy union 会污染所有 timeline 数字。
+    con.executemany(
+        "INSERT INTO TASK (startNs, endNs, deviceId, connectionId, globalTaskId, taskType) VALUES (?, ?, 8, -1, ?, 37)",
+        [(0, 1_000_000, 7), (10_000, 20_000, None)],
+    )
     # COMPUTE_TASK_INFO：globalTaskId=7 -> npu_kernel_x；gid=8 -> npu_kernel_ambig
     con.execute("INSERT INTO COMPUTE_TASK_INFO VALUES (7, 7, 23)")
     con.execute("INSERT INTO COMPUTE_TASK_INFO VALUES (8, 9, 23)")
+    if overlap:
+        con.executescript(
+            """
+            CREATE TABLE OVERLAP_ANALYSIS (id INTEGER, deviceId INTEGER,
+                startNs INTEGER, endNs INTEGER, type INTEGER);
+            """
+        )
+        if overlap_rows:
+            con.executemany(
+                "INSERT INTO OVERLAP_ANALYSIS (startNs, endNs, type) VALUES (?, ?, ?)",
+                [
+                    (100_000, 400_000, 0),
+                    (350_000, 450_000, 1),
+                    (400_000, 450_000, 2),
+                    (0, 100_000, 3),
+                    (450_000, 600_000, 3),
+                    (900_000, 950_000, 9),
+                ],
+            )
     con.commit()
     con.close()
 
@@ -107,6 +141,13 @@ def _create_fixture_db(path: Path) -> None:
 def db_path(tmp_path: Path) -> Path:
     p = tmp_path / "ascend_pytorch_profiler_0.db"
     _create_fixture_db(p)
+    return p
+
+
+@pytest.fixture()
+def db_overlap_path(tmp_path: Path) -> Path:
+    p = tmp_path / "ascend_pytorch_profiler_0.db"
+    _create_fixture_db(p, overlap=True)
     return p
 
 
@@ -144,6 +185,88 @@ def test_cann_categories_and_gap_overlap(db_path):
     assert r.gap_overlap_ms["other"] == pytest.approx(0.0)
 
 
+def test_sentinel_never_attributed(db_path):
+    # M4.1c 裁定 1（fallback path）：conn=-1 哨兵 globalTaskId=7 与 npu_kernel_x
+    # 同 gid —— 若未门控会错误解析进 named operator；必须落类型名兜底行
+    # 且不进 busy union（busy union 数字由 test_wall_session_and_busy_union 守住）
+    ev, _ = analyze_ascend_trace_db(db_path)
+    dev = {o.name: o for o in ev.operators if o.layer == "device"}
+    x = dev["npu_kernel_x"]
+    assert x.calls == 1  # 只有 conn=100 的真实任务行
+    assert x.summed_device_ms == pytest.approx(0.05)  # [200k,250k] = 50us
+    sentinel = dev["npu_task_type_37"]
+    assert sentinel.parent_id is None
+    assert sentinel.calls == 2  # 两行哨兵（gid=7 / gid=None）
+
+
+def test_overlap_authoritative_timeline(db_overlap_path):
+    # M4.1c 裁定 2：busy = OVERLAP type0∪type1 interval union = [100k,450k]=350us；
+    # compute+comm summed = 400us > busy —— summed 相加不得冒充 busy
+    ev, _ = analyze_ascend_trace_db(db_overlap_path)
+    bm = ev.backend_metrics.ascend
+    assert bm["timeline_source"] == "overlap_analysis"
+    assert ev.timeline.device_busy_ms == pytest.approx(0.35)
+    assert ev.timeline.compute_ms == pytest.approx(0.30)
+    assert ev.timeline.communication_ms == pytest.approx(0.10)
+    # 裁定 3：exposed = Free union（profiler 定义的 device idle），不再是 session−busy
+    assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(0.25)
+    # 裁定 5：窗口语义显式化——session 1.0ms ≠ overlap 窗口 0.95ms（type9 行延展 span）；
+    # workload.wall_ms 用 profiler 分类窗口（与 busy/exposed 同源），session 另记
+    assert ev.workload.wall_ms == pytest.approx(0.95)
+    assert bm["session_window_ms"] == pytest.approx(1.0)
+    assert bm["overlap_window_ms"] == pytest.approx(0.95)
+    assert bm["outside_overlap_window_ms"] == pytest.approx(0.05)
+    # 未收录 type 只记录不猜测：不进 busy/idle，span 照实包含
+    assert bm["overlap_unknown_types"] == {"9": 1}
+
+
+def test_overlap_communication_exposure(db_overlap_path):
+    # 裁定 4：total(type1)=0.10ms = not_overlapped(type2)=0.05 + overlapped=0.05；
+    # exposure 分解，不是 wall partition
+    ev, _ = analyze_ascend_trace_db(db_overlap_path)
+    c = ev.communication
+    assert c.calls == 1
+    assert c.total_ms == pytest.approx(0.10)
+    assert c.overlap_ms == pytest.approx(0.05)
+    assert c.overlap_ratio == pytest.approx(0.5)
+    assert ev.backend_metrics.ascend["communication_not_overlapped_ms"] == pytest.approx(0.05)
+
+
+def test_overlap_gap_correlation_uses_free(db_overlap_path):
+    # gap = Free 区间：launch [450k,560k] ∩ [450k,600k] = 110us 全落 Free
+    ev, _ = analyze_ascend_trace_db(db_overlap_path)
+    assert ev.runtime.gap_overlap_ms["launch"] == pytest.approx(0.11)
+    assert ev.runtime.gap_overlap_ms["other"] == pytest.approx(0.0)
+
+
+def test_overlap_empty_table_is_unavailable(tmp_path):
+    # OVERLAP_ANALYSIS 在但零行：timeline 不可用（None）——不回退 TASK、不填 0 冒充
+    p = tmp_path / "ascend_pytorch_profiler_0.db"
+    _create_fixture_db(p, overlap=True, overlap_rows=False)
+    ev, _ = analyze_ascend_trace_db(p)
+    bm = ev.backend_metrics.ascend
+    assert bm["timeline_source"] == "overlap_analysis"
+    assert bm["overlap_analysis_rows"] == 0
+    assert ev.timeline.device_busy_ms is None
+    assert ev.timeline.exposed_non_device_busy_ms is None
+    assert ev.timeline.compute_ms is None
+    assert ev.timeline.communication_ms is None
+    assert ev.communication.total_ms is None
+    assert ev.runtime.gap_overlap_ms is None
+
+
+def test_overlap_schema_missing_column_fails(tmp_path):
+    # 表在但缺列 -> 显式 unsupported（存在即承诺 schema，不允许静默降级到 fallback）
+    p = tmp_path / "ascend_pytorch_profiler_0.db"
+    _create_fixture_db(p)
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE OVERLAP_ANALYSIS (startNs INTEGER, endNs INTEGER)")
+    con.commit()
+    con.close()
+    with pytest.raises(UnsupportedTraceDBError, match="OVERLAP_ANALYSIS missing columns"):
+        analyze_ascend_trace_db(p)
+
+
 def test_three_layers_with_parent_linkage(db_path):
     # M4.1b 链路：TASK(conn=100) -> CANN(conn=100) -> PYTORCH(aten::mm)
     # -> device 行 npu_kernel_x 的 parent 唯一归属 framework aten::mm
@@ -175,6 +298,12 @@ def test_diagnosis_correlated_bound_fires(db_path):
 
 def test_round_trip(db_path):
     ev, _ = analyze_ascend_trace_db(db_path)
+    assert OptimizationEvidence.from_dict(ev.to_dict()) == ev
+
+
+def test_round_trip_overlap_path(db_overlap_path):
+    # authoritative path：communication/backend_metrics（含 str 化 unknown types）也要稳定 round-trip
+    ev, _ = analyze_ascend_trace_db(db_overlap_path)
     assert OptimizationEvidence.from_dict(ev.to_dict()) == ev
 
 
@@ -216,11 +345,13 @@ def test_missing_db_fails(tmp_path):
 @pytest.mark.skipif(not REAL_DB.exists(), reason="real trace DB not available (stays prepared_not_run in CI)")
 def test_real_trace_db_validation():
     ev, store = analyze_ascend_trace_db(REAL_DB)
-    # 真实样本（勘察记录）：rankId=0, deviceId=8, Ascend910B，session 124.55s
+    # 真实样本（勘察记录）：rankId=0, deviceId=8, Ascend910B；
+    # M4.1c：wall = overlap 分类窗口 111.049s，capture session 124.550s 另记
     assert ev.run.rank == 0
     assert ev.run.device_id == "8"
     assert ev.run.device == "Ascend910B"
-    assert ev.workload.wall_ms == pytest.approx(124550.0)
+    assert ev.workload.wall_ms == pytest.approx(111049.0, rel=1e-3)
+    assert ev.backend_metrics.ascend["session_window_ms"] == pytest.approx(124550.0, rel=1e-3)
     assert ev.timeline.device_busy_ms > 0
     r = ev.runtime
     # 互斥分类恒等式
@@ -235,6 +366,23 @@ def test_real_trace_db_validation():
     # gap_overlap 保守可用：与 exposed gap 同源
     assert ev.runtime.gap_overlap_ms is not None
     assert all(v >= 0.0 for v in ev.runtime.gap_overlap_ms.values())
+    # M4.1c authoritative（真实样本勘察值，m41b-conn-neg1-investigation.md）：
+    # compute 85.704s / comm 4.504s / not-overlapped 3.874s / free 21.471s /
+    # overlap 窗口 span 111.049s / session 124.550s
+    bm = ev.backend_metrics.ascend
+    assert bm["timeline_source"] == "overlap_analysis"
+    assert ev.timeline.compute_ms == pytest.approx(85704.0, rel=1e-3)
+    assert ev.timeline.communication_ms == pytest.approx(4504.0, rel=1e-3)
+    # busy = type0∪type1 union ≈ 85704 + 4504 − 630(overlapped) = 89578ms
+    assert ev.timeline.device_busy_ms == pytest.approx(89578.0, rel=0.01)
+    assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(21471.0, rel=1e-3)
+    c = ev.communication
+    assert c.total_ms == pytest.approx(4504.0, rel=1e-3)
+    assert c.overlap_ms == pytest.approx(630.0, rel=0.05)
+    assert bm["communication_not_overlapped_ms"] == pytest.approx(3874.0, rel=1e-3)
+    assert bm["overlap_window_ms"] == pytest.approx(111049.0, rel=1e-3)
+    # 裁定 5：session − overlap 窗口 ≈ 13.5s，是 capture 初始化/未覆盖区间，不是 idle
+    assert bm["outside_overlap_window_ms"] == pytest.approx(13501.0, rel=0.02)
 
 
 def test_multi_rank_fail_fast(tmp_path):
