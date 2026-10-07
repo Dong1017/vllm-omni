@@ -86,7 +86,10 @@ def total_event_overlap(events: list[Interval], against: list[Interval]) -> floa
         i = bisect.bisect_right(starts, s) - 1
         if i < 0:
             i = 0
-        for gs, ge in ag[i:]:
+        # 索引迭代，禁止 ag[i:] 切片——每次切片拷贝整段尾部，
+        # 大 against（如 Ascend OVERLAP free ~20 万段）× 百万事件会退化为 O(E·G)
+        for idx in range(i, len(ag)):
+            gs, ge = ag[idx]
             if ge <= s:
                 continue
             if gs >= e:
