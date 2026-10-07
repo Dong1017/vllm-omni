@@ -195,6 +195,31 @@ def test_ncu_csv_metric_evidence_binding(tmp_path):
                 assert ref.split(":", 1)[1] in prov_ids, (k, ref)
 
 
+def test_ncu_csv_multi_trace_fails_explicitly(tmp_path, capsys):
+    # --ncu-csv + >1 CUDA trace -> 显式报错（per-rank/capture 归属 M4.2b 定义）
+    for i in range(2):
+        trace = tmp_path / f"trace_rank{i}.json"
+        trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
+    ncu = tmp_path / "ncu.csv"
+    _write_ncu_csv(ncu, "72.5")
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "analyze",
+            "--backend",
+            "cuda",
+            "--input",
+            str(tmp_path),
+            "--output",
+            str(out),
+            "--ncu-csv",
+            str(ncu),
+        ]
+    )
+    assert rc == 2
+    assert "per-rank/capture" in capsys.readouterr().err
+
+
 def test_two_different_ncu_csv_contents_give_different_refs(tmp_path):
     trace = tmp_path / "trace_rank0.json"
     trace.write_text(json.dumps(_trace_dict()), encoding="utf-8")
