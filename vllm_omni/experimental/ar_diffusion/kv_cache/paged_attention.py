@@ -519,7 +519,7 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
-    if query_flat.is_npu:
+    if query_flat.device.type == "npu":
         # NPU: gather the visible blocks on device, then run the fused
         # npu_fusion_attention kernel over the packed (contiguous) window.
         # Mirrors the ROCm gather path; the reference implementation below is

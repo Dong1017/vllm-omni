@@ -371,7 +371,7 @@ class LingBotSelfAttention(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
             )
-            if (query.is_cuda or query.is_npu) and query.shape[0] == 1:
+            if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
                 # Package the visible window as a block table and call the
                 # same block-table entry point as the realtime path
                 # (FlashAttention on CUDA, the fused kernel on NPU) so direct
