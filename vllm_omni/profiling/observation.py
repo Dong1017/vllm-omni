@@ -89,24 +89,30 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
 
     core_ref_count = len(ev.metric_evidence)
     # 同 source/time domain 机械校验（MVP gate 审计 Fix 1/2）：
-    # 任何跨 metric 的比值（gap/wall、busy/wall、(total-overlap)/wall），
+    # 任何跨 metric 的比值（gap/window、busy/window、(total-overlap)/window），
     # 输入不同源时一律不计算，宁可缺少观察也不伪造口径。
-    gap_wall_same = _same_source(ev, "timeline.exposed_non_device_busy_ms", "workload.wall_ms")
-    busy_wall_same = _same_source(ev, "timeline.device_busy_ms", "workload.wall_ms")
-    comm_same = _same_source(ev, "communication.total_ms", "communication.overlap_ms", "workload.wall_ms")
-    gap_ratio = _ratio(ev.timeline.exposed_non_device_busy_ms, ev.workload.wall_ms) if gap_wall_same else None
+    # M4.1c gate P0：denominator 优先 timeline.window_ms（timeline evidence 的
+    # 实际覆盖窗口），unavailable 才回退 workload.wall_ms（CUDA/MVP 兼容）；
+    # same-source 校验绑定实际使用的 denominator。
+    use_window = ev.timeline.window_ms is not None
+    window_ms = ev.timeline.window_ms if use_window else ev.workload.wall_ms
+    window_key = "timeline.window_ms" if use_window else "workload.wall_ms"
+    denom_label = "timeline window" if use_window else "wall"
+    gap_wall_same = _same_source(ev, "timeline.exposed_non_device_busy_ms", window_key)
+    busy_wall_same = _same_source(ev, "timeline.device_busy_ms", window_key)
+    comm_same = _same_source(ev, "communication.total_ms", "communication.overlap_ms", window_key)
+    gap_ratio = _ratio(ev.timeline.exposed_non_device_busy_ms, window_ms) if gap_wall_same else None
     api = ev.runtime.api_summed_ms
     comm_total = ev.communication.total_ms
-    busy_ratio = _ratio(ev.timeline.device_busy_ms, ev.workload.wall_ms) if busy_wall_same else None
+    busy_ratio = _ratio(ev.timeline.device_busy_ms, window_ms) if busy_wall_same else None
 
     if gap_ratio is not None and gap_ratio >= OBSERVE_GAP_RATIO:
         add(
             "exposed_gap_present",
             "timeline.exposed_non_device_busy_ms",
             gap_ratio,
-            f"exposed non-device-busy gap is {gap_ratio:.1%} of wall",
-            ev.metric_evidence.get("timeline.exposed_non_device_busy_ms", [])
-            + ev.metric_evidence.get("workload.wall_ms", []),
+            f"exposed non-device-busy gap is {gap_ratio:.1%} of {denom_label}",
+            ev.metric_evidence.get("timeline.exposed_non_device_busy_ms", []) + ev.metric_evidence.get(window_key, []),
         )
 
     if api is not None and api > 0:
@@ -136,7 +142,7 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
                 and share >= OBSERVE_CATEGORY_SHARE
                 and corr_ratio >= OBSERVE_GAP_CORRELATION
                 and _same_source(ev, f"runtime.{cat}", corr_key)
-                and _same_source(ev, "timeline.exposed_non_device_busy_ms", "workload.wall_ms")
+                and _same_source(ev, "timeline.exposed_non_device_busy_ms", window_key)
             ):
                 add(
                     corr_kind,
@@ -153,17 +159,18 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
         # 分解缺失或来源不兼容都不得称 exposed
         if ev.communication.overlap_ms is not None and comm_same:
             not_overlapped = comm_total - ev.communication.overlap_ms
-            no_ratio = _ratio(not_overlapped, ev.workload.wall_ms)
+            no_ratio = _ratio(not_overlapped, window_ms)
             if no_ratio is not None and no_ratio >= OBSERVE_GAP_RATIO:
                 # P0-4.1：derived 值必须引用全部输入（total + overlap + wall）
                 add(
                     "communication_exposed",
                     "communication.total_ms",
                     no_ratio,
-                    f"not-overlapped communication is {no_ratio:.1%} of wall (derived: total - overlap, same source)",
+                    f"not-overlapped communication is {no_ratio:.1%} of {denom_label} "
+                    "(derived: total - overlap, same source)",
                     ev.metric_evidence.get("communication.total_ms", [])
                     + ev.metric_evidence.get("communication.overlap_ms", [])
-                    + ev.metric_evidence.get("workload.wall_ms", []),
+                    + ev.metric_evidence.get(window_key, []),
                 )
         else:
             reason = (
@@ -203,8 +210,8 @@ def build_observations(ev: OptimizationEvidence) -> list[Observation]:
                 "device_busy_dominant",
                 "timeline.device_busy_ms",
                 busy_ratio,
-                f"device busy (union) is {busy_ratio:.1%} of wall",
-                ev.metric_evidence.get("timeline.device_busy_ms", []) + ev.metric_evidence.get("workload.wall_ms", []),
+                f"device busy (union) is {busy_ratio:.1%} of {denom_label}",
+                ev.metric_evidence.get("timeline.device_busy_ms", []) + ev.metric_evidence.get(window_key, []),
             )
 
     # ---- M4.2a：硬件计数器观察（deterministic；仅 pct 类越过观察线才产，

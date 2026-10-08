@@ -218,9 +218,11 @@ def test_empty_csv_fails_explicitly(tmp_path):
         parse_ncu_csv(p)
 
 
-def test_schema_version_still_v06():
+def test_schema_version_current():
+    # M4.1c gate P0（2026-10-08）批准 v0.6 -> v0.7：Timeline.window_ms；
+    # hardware 契约（M4.2a）不变
     ev = OptimizationEvidence()
-    assert ev.schema_version == "0.6"
+    assert ev.schema_version == "0.7"
     assert ev.hardware is None
 
 

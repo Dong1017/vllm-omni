@@ -31,17 +31,25 @@
 #     device exposed-gap 区间内的时长（ms，与 api_summed 同 source）。
 #     这是把 runtime_*_heavy 升格为 *_bound 所需的时间相关性证据；
 #     无时间轴数据的 source（如 Ascend CSV）保持 None，不伪造。
-# 0.1..0.4 输入按显式 migration 规则读取，不 silent-drop（见 _migrate）。
+#
+# v0.7 变更（M4.1c gate semantic P0）：
+#   - Timeline.window_ms：当前 timeline evidence 实际分析/覆盖的 wall-clock
+#     window duration。与 workload.wall_ms 语义分离——后者是 run 级 wall
+#     （CUDA trace wall / capture session），不得用 timeline 分类窗口冒名；
+#     观察层 timeline 比值优先用 window_ms，unavailable 才回退 workload.wall_ms。
+# 0.1..0.6 输入按显式 migration 规则读取，不 silent-drop（见 _migrate）。
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm_omni.profiling.provenance import EvidenceRecord
 
-SCHEMA_VERSION = "0.6"
-READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4", "0.5", "0.6")
+SCHEMA_VERSION = "0.7"
+READ_VERSIONS = ("0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7")
 
 # operator 三层模型（决议 1）：framework_op -> runtime_op -> device_task(s)
 OPERATOR_LAYERS = ("framework", "runtime", "device")
@@ -99,6 +107,10 @@ class Timeline:
     compute_ms: float | None = None
     communication_ms: float | None = None
     unknown_ms: float | None = None
+    # M4.1c gate P0：当前 timeline evidence 实际分析/覆盖的 wall-clock window
+    # duration。timeline 比值（busy/window、exposed/window）的 denominator；
+    # 不得反向推导 workload.wall_ms——run 级 wall 需要独立边界证据。
+    window_ms: float | None = None
 
 
 @dataclass
@@ -288,11 +300,12 @@ class OptimizationEvidence:
 
 
 # 按类型注册的校验器；新增带约束的类型只需注册，不需要扩 if 列表（P0-5）
-_VALIDATORS: dict[type, object] = {}
+_ValidatorFn = Callable[[Any], None]
+_VALIDATORS: dict[type, _ValidatorFn] = {}
 
 
-def _register(cls: type) -> object:
-    def deco(fn: object) -> object:
+def _register(cls: type) -> Callable[[_ValidatorFn], _ValidatorFn]:
+    def deco(fn: _ValidatorFn) -> _ValidatorFn:
         _VALIDATORS[cls] = fn
         return fn
 
@@ -358,7 +371,7 @@ def _json_key(field_name: str) -> str:
     return "class" if field_name == "class_" else field_name
 
 
-def _dump(obj: object) -> object:
+def _dump(obj: object) -> Any:
     if isinstance(obj, list):
         return [_dump(v) for v in obj]
     if isinstance(obj, dict):
@@ -401,9 +414,9 @@ def _migrate(data: dict, from_version: str) -> dict:
     if from_version == "0.2":
         data = _migrate_0_2(data)
         from_version = "0.3"
-    if from_version in ("0.3", "0.4", "0.5"):
-        # 0.4 metric_evidence/depends_on、0.5 gap_overlap_ms、0.6 hardware
-        # 均为空默认（历史文件无法补充绑定，不编造）
+    if from_version in ("0.3", "0.4", "0.5", "0.6"):
+        # 0.4 metric_evidence/depends_on、0.5 gap_overlap_ms、0.6 hardware、
+        # 0.7 window_ms 均为空默认（历史文件无法补充绑定，不编造）
         data["schema_version"] = SCHEMA_VERSION
     return data
 

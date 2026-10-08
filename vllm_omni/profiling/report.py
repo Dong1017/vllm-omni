@@ -172,6 +172,12 @@ def render_summary_md(ev: OptimizationEvidence) -> str:
     gap = ev.timeline.exposed_non_device_busy_ms
     # P1：每个 metric 的 source 列按 metric_evidence 绑定渲染，不再笼统列全部文件
     lines.append(f"| wall | {_fmt(wall)} | {_status(wall)} | {_metric_source(ev, 'workload.wall_ms')} |")
+    # M4.1c gate P0：timeline 比值的实际 denominator（timeline evidence 覆盖窗口），
+    # 与 workload.wall_ms（run 级 wall）语义分离
+    window = ev.timeline.window_ms
+    lines.append(
+        f"| timeline window | {_fmt(window)} | {_status(window)} | {_metric_source(ev, 'timeline.window_ms')} |"
+    )
     lines.append(
         f"| device busy (union) | {_fmt(busy)} | {_status(busy)} | {_metric_source(ev, 'timeline.device_busy_ms')} |"
     )

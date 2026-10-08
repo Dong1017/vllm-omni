@@ -49,20 +49,26 @@ def _rule_communication(ev: OptimizationEvidence, obs: list[Observation]) -> lis
     exposed = next((o for o in obs if o.kind == "communication_exposed"), None)
     if exposed is None or exposed.value is None:
         return []
+    # M4.1c gate P0：denominator 优先 timeline.window_ms，unavailable 回退
+    # workload.wall_ms；same-source 校验绑定实际使用的 denominator
+    use_window = ev.timeline.window_ms is not None
+    window_ms = ev.timeline.window_ms if use_window else ev.workload.wall_ms
+    window_key = "timeline.window_ms" if use_window else "workload.wall_ms"
     # P0-4.2：同 source/time domain 机械校验（不依赖测试），四个输入缺一不判
     if not _same_source(
         ev,
         "communication.total_ms",
         "communication.overlap_ms",
-        "workload.wall_ms",
+        window_key,
         "timeline.exposed_non_device_busy_ms",
     ):
         return []
     total = ev.communication.total_ms
     overlap = ev.communication.overlap_ms
-    wall = ev.workload.wall_ms
+    wall = window_ms
     gap = ev.timeline.exposed_non_device_busy_ms
-    if None in (total, overlap, wall, gap) or wall <= 0:
+    # 显式逐项判 None（mypy 可 narrow；行为与 `None in (...)` 等价）
+    if total is None or overlap is None or wall is None or gap is None or wall <= 0:
         return []
     not_overlapped = total - overlap
     exposed_ratio = not_overlapped / wall if wall > 0 else 0.0

@@ -35,6 +35,13 @@
 #   5) SESSION_TIME_INFO 是 capture session 窗口，不自动等同 workload wall；
 #      overlap-analysis 分类窗口与 session 窗口的差值如实记录（真实样本
 #      111.049s vs 124.550s，差 13.5s 为 capture 初始化/未覆盖区间）。
+#   gate P0（2026-10-08，semantic）：DB 无独立 step/workload boundary，不能证明
+#      分类窗口是用户 workload wall——span/coverage 写 timeline.window_ms
+#      （schema v0.7），workload.wall_ms 保持 None；观察层比值优先 window_ms，
+#      unavailable 才回退 workload.wall_ms（CUDA/MVP 兼容）。措辞纪律：type0/1
+#      可 overlap、type2 ⊂ type1，不得称四类"互斥 partition"；OVERLAP_ANALYSIS
+#      provides the profiler timeline; in the validated sample, known busy union
+#      (compute∪communication) and Free partition the observed window.
 #   OVERLAP_ANALYSIS 表存在 -> authoritative path；不存在 -> task_union
 #   fallback（排除 conn=-1 后 union），timeline_source 显式标记，不 silent。
 
@@ -239,6 +246,8 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                 source_sha256=sha,
             )
         ov_intervals: dict[int, list[Interval]] = {}
+        ov_all_ints: list[Interval] = []
+        ov_unknown_ints: list[Interval] = []
         ov_sum_ns: dict[int, int] = {}
         ov_calls: dict[int, int] = {}
         ov_unknown: dict[int, int] = {}
@@ -249,6 +258,7 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                 if start is None or end is None or end <= start:
                     continue
                 overlap_rows += 1
+                ov_all_ints.append((start, end))  # int ns（P1-1）
                 ov_span = (start, end) if ov_span is None else (min(ov_span[0], start), max(ov_span[1], end))
                 known = otype in (
                     _OVERLAP_COMPUTE,
@@ -264,6 +274,7 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                 if not known:
                     # 未收录 type：如实记录计数，不猜测语义、不进 busy/idle（真实库仅 0-3）
                     ov_unknown[otype] = ov_unknown.get(otype, 0) + 1
+                    ov_unknown_ints.append((start, end))
 
         string_ids = {i: v for i, v in con.execute("SELECT id, value FROM STRING_IDS")}
 
@@ -362,36 +373,43 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
         #   union 口径互斥（AC-06）——summed 相加 > busy 正是 overlap 存在的证据。
         # fallback：OVERLAP_ANALYSIS 缺失 -> busy = TASK union（conn=-1 已排除），
         #   exposed/gap 仍用 session 窗口；timeline_source 显式标记，不 silent。
-        # 裁定 5：SESSION_TIME_INFO 是 capture session 窗口，不自动等同 workload
-        #   wall——authoritative path 的 workload.wall_ms 用 profiler 分类窗口
-        #   （overlap span，真实样本 111.049s）；session 窗口与差值（13.5s，capture
-        #   初始化/未覆盖，不是 device idle）另记 backend_metrics。
+        # 裁定 5 + gate P0（2026-10-08）：SESSION_TIME_INFO 是 capture session 窗口，
+        #   不自动等同 workload wall。authoritative path 的 timeline 覆盖窗口写
+        #   timeline.window_ms（v0.7），workload.wall_ms 保持 None——DB 无独立
+        #   step/workload boundary，不能证明该窗口是用户 workload wall。措辞纪律：
+        #   type0/1 可 overlap、type2 ⊂ type1，不得称四类"互斥 partition"；
+        #   OVERLAP_ANALYSIS provides the profiler timeline; in the validated
+        #   sample, known busy union (compute∪communication) and Free partition
+        #   the observed window.
         # final-review P0（fallback）：gap 窗口必须用绝对 session 起止 ns——误用
         #   相对时长 wall_ns 当右端点会与绝对 ns 区间完全错位。
         timeline = Timeline()
         workload = Workload()
         session_iv: Interval | None = (session[0], session[1]) if session and None not in session else None
-        if wall_ns is not None:
-            workload.wall_ms = wall_ns / 1e6  # fallback/empty：session 是唯一窗口证据
         gap_known = False
         if has_overlap and overlap_rows > 0:
+            workload.wall_ms = None  # gate P0：span/coverage ≠ workload wall，不冒名
             busy_iv = union(ov_intervals.get(_OVERLAP_COMPUTE, []) + ov_intervals.get(_OVERLAP_COMMUNICATION, []))
             free_iv = union(ov_intervals.get(_OVERLAP_FREE, []))
             timeline.device_busy_ms = intervals_total(busy_iv) / 1e6
             timeline.exposed_non_device_busy_ms = intervals_total(free_iv) / 1e6
             timeline.compute_ms = ov_sum_ns.get(_OVERLAP_COMPUTE, 0) / 1e6
             timeline.communication_ms = ov_sum_ns.get(_OVERLAP_COMMUNICATION, 0) / 1e6
-            # workload wall 与 busy/exposed/comm 全部同窗口同 provenance（overlap
-            # span），跨窗口比值（如 busy/session）由 observation 同源校验拒绝
-            assert ov_span is not None  # overlap_rows > 0 蕴含 span 已建立（内部契约）
-            workload.wall_ms = (ov_span[1] - ov_span[0]) / 1e6
+            # window = 全部 OVERLAP 行（含 unknown type）的 coverage union 总长——
+            # timeline 比值的 denominator，与 busy/exposed 同 provenance（同源校验）；
+            # unknown coverage 另记 backend_metrics，known partition 不声称完整
+            timeline.window_ms = intervals_total(union(ov_all_ints)) / 1e6
             gap_iv = free_iv
             gap_known = True
         elif has_overlap:
             # OVERLAP_ANALYSIS 在但零行：timeline 不可用——不得回退 TASK union，
             # 也不得填 0 冒充（AC-03）；gap_unknown -> gap_overlap 保持 None
+            if wall_ns is not None:
+                workload.wall_ms = wall_ns / 1e6  # session 是唯一窗口证据
             gap_iv = []
         else:
+            if wall_ns is not None:
+                workload.wall_ms = wall_ns / 1e6  # session 是唯一窗口证据
             busy_iv = union(task_ints) if task_seen else []
             busy_ns = intervals_total(busy_iv)
             if task_seen:
@@ -515,6 +533,9 @@ def analyze_ascend_trace_db(db_path: Path) -> tuple[OptimizationEvidence, Proven
                     backend_meta["outside_overlap_window_ms"] = (wall_ns - (ov_span[1] - ov_span[0])) / 1e6
             if ov_unknown:
                 backend_meta["overlap_unknown_types"] = {str(k): v for k, v in sorted(ov_unknown.items())}
+                # gate P0：unknown coverage 显式记录——known partition（busy∪free）
+                # 不声称覆盖完整 window
+                backend_meta["overlap_unknown_window_ms"] = intervals_total(union(ov_unknown_ints)) / 1e6
             if overlap_rows > 0:
                 backend_meta["communication_not_overlapped_ms"] = ov_sum_ns.get(_OVERLAP_COMM_NOT_OVERLAPPED, 0) / 1e6
 
@@ -579,8 +600,9 @@ def _trace_metric_evidence(
     ov = store.ref(rec_overlap.id) if rec_overlap is not None else None
     me: dict[str, list[str]] = {}
     if ov is not None:
-        # 裁定 5：wall 与 busy/exposed/comm 同窗口（overlap span），绑定同一记录
-        me["workload.wall_ms"] = [ov]
+        # gate P0：denominator 是 timeline.window_ms（与 busy/exposed/comm 同一条
+        # OVERLAP 记录）；workload.wall_ms 在 authoritative path 为 None，不绑定
+        me["timeline.window_ms"] = [ov]
         me["timeline.device_busy_ms"] = [ov]
         me["timeline.exposed_non_device_busy_ms"] = [ov]
         me["timeline.compute_ms"] = [ov]

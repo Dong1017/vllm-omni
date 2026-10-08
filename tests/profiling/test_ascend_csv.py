@@ -239,7 +239,7 @@ def test_db_only_dir_fails_explicitly(tmp_path):
 def test_json_dumpable(ascend_dir):
     ev, _ = analyze_ascend_csv(ascend_dir)
     raw = json.loads(ev.to_json())
-    assert raw["schema_version"] == "0.6"
+    assert raw["schema_version"] == "0.7"  # M4.1c gate P0
     assert raw["run"]["backend"] == "ascend"
 
 

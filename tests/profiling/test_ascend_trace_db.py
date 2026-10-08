@@ -36,7 +36,8 @@ REAL_DB = Path(
 #     重叠 50us）；type2 not-overlapped [400k,450k]=50us；type3 free
 #     [0,100k]+[450k,600k]=250us；type9 未知 [900k,950k]（只记录不进 busy/idle）
 #     -> busy=union(0∪1)=[100k,450k]=350us；compute+comm summed=400us>busy
-#     （overlap 证据）；exposed=Free=250us；窗口 span=[0,950k]=950us
+#     （overlap 证据）；exposed=Free=250us；window=coverage union（含 type9）
+#     =650us；span=[0,950k]=950us 仅 informational
 
 
 def _create_fixture_db(path: Path, *, overlap: bool = False, overlap_rows: bool = True) -> None:
@@ -162,8 +163,9 @@ def test_rank_from_rank_device_map(db_path):
 
 def test_wall_session_and_busy_union(db_path):
     ev, _ = analyze_ascend_trace_db(db_path)
-    # wall 来自 SESSION_TIME_INFO = 1.0ms
+    # wall 来自 SESSION_TIME_INFO = 1.0ms（fallback path：session 是唯一窗口证据）
     assert ev.workload.wall_ms == pytest.approx(1.0)
+    assert ev.timeline.window_ms is None  # 无 OVERLAP_ANALYSIS -> 无 timeline 窗口
     # busy = TASK union：[100k,400k]∪[200k,250k]（子集）∪[600k,650k] = 350us
     assert ev.timeline.device_busy_ms == pytest.approx(0.35)
     assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(0.65)
@@ -210,14 +212,17 @@ def test_overlap_authoritative_timeline(db_overlap_path):
     assert ev.timeline.communication_ms == pytest.approx(0.10)
     # 裁定 3：exposed = Free union（profiler 定义的 device idle），不再是 session−busy
     assert ev.timeline.exposed_non_device_busy_ms == pytest.approx(0.25)
-    # 裁定 5：窗口语义显式化——session 1.0ms ≠ overlap 窗口 0.95ms（type9 行延展 span）；
-    # workload.wall_ms 用 profiler 分类窗口（与 busy/exposed 同源），session 另记
-    assert ev.workload.wall_ms == pytest.approx(0.95)
+    # gate P0（2026-10-08）：timeline 覆盖窗口写 timeline.window_ms（全部 OVERLAP 行
+    # 的 coverage union = [0,600k]∪[900k,950k] = 650us），workload.wall_ms 保持
+    # None——DB 无独立 step/workload boundary，不得冒名
+    assert ev.workload.wall_ms is None
+    assert ev.timeline.window_ms == pytest.approx(0.65)
+    # session 窗口与 span 差值如实另记（informational）；unknown coverage 显式记录
     assert bm["session_window_ms"] == pytest.approx(1.0)
     assert bm["overlap_window_ms"] == pytest.approx(0.95)
     assert bm["outside_overlap_window_ms"] == pytest.approx(0.05)
-    # 未收录 type 只记录不猜测：不进 busy/idle，span 照实包含
     assert bm["overlap_unknown_types"] == {"9": 1}
+    assert bm["overlap_unknown_window_ms"] == pytest.approx(0.05)
 
 
 def test_overlap_communication_exposure(db_overlap_path):
@@ -251,8 +256,38 @@ def test_overlap_empty_table_is_unavailable(tmp_path):
     assert ev.timeline.exposed_non_device_busy_ms is None
     assert ev.timeline.compute_ms is None
     assert ev.timeline.communication_ms is None
+    assert ev.timeline.window_ms is None
+    # session 是唯一窗口证据：wall 仍如实来自 SESSION_TIME_INFO
+    assert ev.workload.wall_ms == pytest.approx(1.0)
     assert ev.communication.total_ms is None
     assert ev.runtime.gap_overlap_ms is None
+
+
+def test_overlap_window_partition_invariants(db_overlap_path):
+    # gate P0 item 4：interval-level invariants——busy = union(type0,type1)，
+    # busy ∩ Free = []；busy ∪ Free ∪ unknown coverage 铺满已分类 window
+    import sqlite3
+
+    from vllm_omni.profiling.intervals import intersect, union
+    from vllm_omni.profiling.intervals import total as iv_total
+
+    ev, _ = analyze_ascend_trace_db(db_overlap_path)
+    con = sqlite3.connect(f"file:{db_overlap_path.as_posix()}?mode=ro", uri=True)
+    rows = con.execute("SELECT startNs, endNs, type FROM OVERLAP_ANALYSIS").fetchall()
+    con.close()
+    busy_iv = union([r[:2] for r in rows if r[2] in (0, 1)])
+    free_iv = union([r[:2] for r in rows if r[2] == 3])
+    unknown_iv = union([r[:2] for r in rows if r[2] not in (0, 1, 2, 3)])
+    all_iv = union([r[:2] for r in rows])
+    # busy 与 Free 不相交（端点相接不计）
+    assert iv_total(intersect(busy_iv, free_iv)) == 0
+    # busy ∪ Free ∪ unknown = 全部分类 coverage（unknown 显式记录，known 不声称完整）
+    assert iv_total(union(busy_iv + free_iv + unknown_iv)) == iv_total(all_iv)
+    # window_ms 与 coverage union 一致（ms <- ns）
+    assert ev.timeline.window_ms == pytest.approx(iv_total(all_iv) / 1e6)
+    # known busy∪Free 不覆盖完整 window（unknown type9 在 [900k,950k]）
+    assert iv_total(union(busy_iv + free_iv)) == pytest.approx(600_000)
+    assert ev.backend_metrics.ascend["overlap_unknown_window_ms"] == pytest.approx(0.05)
 
 
 def test_overlap_schema_missing_column_fails(tmp_path):
@@ -346,11 +381,13 @@ def test_missing_db_fails(tmp_path):
 def test_real_trace_db_validation():
     ev, store = analyze_ascend_trace_db(REAL_DB)
     # 真实样本（勘察记录）：rankId=0, deviceId=8, Ascend910B；
-    # M4.1c：wall = overlap 分类窗口 111.049s，capture session 124.550s 另记
+    # gate P0：workload.wall_ms = None（无 step boundary 证据），
+    # timeline 覆盖窗口 111.049s 落 timeline.window_ms，session 124.550s 另记
     assert ev.run.rank == 0
     assert ev.run.device_id == "8"
     assert ev.run.device == "Ascend910B"
-    assert ev.workload.wall_ms == pytest.approx(111049.0, rel=1e-3)
+    assert ev.workload.wall_ms is None
+    assert ev.timeline.window_ms == pytest.approx(111049.0, rel=1e-3)
     assert ev.backend_metrics.ascend["session_window_ms"] == pytest.approx(124550.0, rel=1e-3)
     assert ev.timeline.device_busy_ms > 0
     r = ev.runtime
@@ -383,6 +420,24 @@ def test_real_trace_db_validation():
     assert bm["overlap_window_ms"] == pytest.approx(111049.0, rel=1e-3)
     # 裁定 5：session − overlap 窗口 ≈ 13.5s，是 capture 初始化/未覆盖区间，不是 idle
     assert bm["outside_overlap_window_ms"] == pytest.approx(13501.0, rel=0.02)
+    # gate P0 item 4（真实库）：interval-level invariants——独立 SQL 重读
+    # OVERLAP_ANALYSIS，busy∩Free = []，busy∪Free 覆盖完整已分类 coverage
+    import sqlite3
+
+    from vllm_omni.profiling.intervals import intersect, union
+    from vllm_omni.profiling.intervals import total as iv_total
+
+    con = sqlite3.connect(f"file:{REAL_DB.as_posix()}?mode=ro", uri=True)
+    rows = con.execute("SELECT startNs, endNs, type FROM OVERLAP_ANALYSIS").fetchall()
+    con.close()
+    assert {r[2] for r in rows} == {0, 1, 2, 3}  # 无 unknown type：known partition 可声称完整
+    busy_iv = union([r[:2] for r in rows if r[2] in (0, 1)])
+    free_iv = union([r[:2] for r in rows if r[2] == 3])
+    assert iv_total(intersect(busy_iv, free_iv)) == 0
+    window_ns = ev.timeline.window_ms * 1e6
+    assert iv_total(union(busy_iv + free_iv)) == pytest.approx(window_ns, rel=1e-6)
+    # 实测样本上 coverage union 与 span 一致（无缝铺满，2026-10-08 只读核查）
+    assert iv_total(union([r[:2] for r in rows])) == pytest.approx(window_ns, rel=1e-6)
 
 
 def test_multi_rank_fail_fast(tmp_path):
