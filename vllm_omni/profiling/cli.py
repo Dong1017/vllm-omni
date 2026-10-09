@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from vllm_omni.profiling.backends import (
 )
 from vllm_omni.profiling.backends.ncu_csv import parse_ncu_csv
 from vllm_omni.profiling.discovery import BackendDetectionError, detect_backend, discover
+from vllm_omni.profiling.distributed import (
+    build_distributed_summary,
+    build_rank_timeline_from_ascend_db,
+    resolve_clock_validation,
+    write_distributed_outputs,
+)
 from vllm_omni.profiling.provenance import ProvenanceStore, compute_run_id
 from vllm_omni.profiling.report import write_outputs
 from vllm_omni.profiling.schema import OptimizationEvidence
@@ -239,26 +246,79 @@ def cmd_query(args: argparse.Namespace) -> int:
                 print(f"  {name}: {count}")
     elif view == "diagnosis":
         print("--- observations (what is happening) ---")
-        for o in build_all_observations(ev):
-            print(f"{o.id} [{o.kind}] {o.metric_key}={o.value} evidence={', '.join(o.evidence_ids) or '-'}")
-            print(f"      {o.note}")
+        for obs_item in build_all_observations(ev):
+            print(
+                f"{obs_item.id} [{obs_item.kind}] {obs_item.metric_key}={obs_item.value} "
+                f"evidence={', '.join(obs_item.evidence_ids) or '-'}"
+            )
+            print(f"      {obs_item.note}")
         print("--- diagnosis candidates (conservative; why needs the agent) ---")
         if not ev.diagnosis.candidates:
             print("unknown")
-        for c in ev.diagnosis.candidates:
-            print(f"{c.class_:<28} confidence={c.confidence:<7} evidence={', '.join(c.evidence_ids)}")
+        for cand in ev.diagnosis.candidates:
+            print(f"{cand.class_:<28} confidence={cand.confidence:<7} evidence={', '.join(cand.evidence_ids)}")
     elif view == "provenance":
-        for r in ev.provenance:
-            agg = r.aggregation or "-"
-            query = r.query or "-"
-            rank = r.rank if r.rank is not None else "-"
+        for rec in ev.provenance:
+            agg = rec.aggregation or "-"
+            query = rec.query or "-"
+            rank = rec.rank if rec.rank is not None else "-"
             print(
-                f"{r.id} | {r.source_file} | {r.source_type} | rank={rank} | "
-                f"parser={r.parser} | query={query} | aggregation={agg} | unit={r.unit}"
+                f"{rec.id} | {rec.source_file} | {rec.source_type} | rank={rank} | "
+                f"parser={rec.parser} | query={query} | aggregation={agg} | unit={rec.unit}"
             )
     else:
         print(f"error: unknown view {view!r}", file=sys.stderr)
         return 2
+    return 0
+
+
+def cmd_analyze_distributed(args: argparse.Namespace) -> int:
+    """M4.3：多 rank 空泡分析（backend-neutral reducer + Ascend rank-timeline adapter）。"""
+    rank_timelines = []
+    seen_paths: set[Path] = set()
+    if args.rank_input:
+        for item in args.rank_input:
+            rank_str, _, path_str = item.partition("=")
+            if not rank_str.isdigit() or not path_str:
+                raise ValueError(f"rank-input must be N=<db path>, got {item!r}")
+            path = Path(path_str)
+            if path in seen_paths:
+                raise ValueError(f"distributed: repeated rank DB path {path}")
+            seen_paths.add(path)
+            timeline = build_rank_timeline_from_ascend_db(path)
+            if timeline.rank_id != int(rank_str):
+                raise ValueError(
+                    f"distributed: --rank-input {rank_str}={path} but the DB's RANK_DEVICE_MAP "
+                    f"says rankId={timeline.rank_id}; the DB carries its own rank identity"
+                )
+            rank_timelines.append(timeline)
+    if args.input:
+        input_path = Path(args.input)
+        result = discover(input_path, "ascend")
+        for db_path in sorted(result.ascend.profiler_db):
+            if db_path in seen_paths:
+                continue
+            seen_paths.add(db_path)
+            rank_timelines.append(build_rank_timeline_from_ascend_db(db_path))
+    if not rank_timelines:
+        raise BackendDetectionError(
+            "distributed: no rank DBs provided; pass --rank-input N=<db path> "
+            "(repeatable) or --input <dir containing rank DBs>"
+        )
+    clock_metadata = json.loads(Path(args.clock_metadata).read_text(encoding="utf-8")) if args.clock_metadata else None
+    clock_validation, clock_meta = resolve_clock_validation(rank_timelines, args.shared_clock, clock_metadata)
+    summary = build_distributed_summary(
+        rank_timelines, clock_validation, clock_meta, Path(args.windows) if args.windows else None
+    )
+    written = write_distributed_outputs(summary, Path(args.output), intervals_csv=args.intervals_csv)
+    common_window = next(w for w in summary["windows"] if w["window"]["name"] == "common_coverage_window")
+    print(
+        f"analyzed-distributed ranks={summary['rank_ids']} clock={clock_validation} "
+        f"common_no_device_task_ms={common_window['distributed']['common_no_device_task']['duration_ms']:.3f} "
+        f"common_no_compute_ms={common_window['distributed']['common_no_compute']['duration_ms']:.3f}"
+    )
+    for key in sorted(written):
+        print(f"  wrote {written[key]}")
     return 0
 
 
@@ -285,6 +345,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("--view", choices=QUERY_VIEWS, required=True)
     p_query.add_argument("--top", type=int, default=20)
     p_query.set_defaults(func=cmd_query)
+
+    p_dist = sub.add_parser(
+        "analyze-distributed",
+        help="multi-rank common no-task / no-compute analysis (M4.3, Ascend trace DBs)",
+    )
+    p_dist.add_argument("--backend", choices=("ascend",), default="ascend")
+    p_dist.add_argument(
+        "--input",
+        default=None,
+        help="directory containing multi-rank Ascend profiler DBs (rank identity read from each DB)",
+    )
+    p_dist.add_argument(
+        "--rank-input",
+        action="append",
+        default=None,
+        metavar="N=<db path>",
+        help="explicit rank DB (repeatable); the DB's RANK_DEVICE_MAP rankId must match N",
+    )
+    p_dist.add_argument(
+        "--shared-clock",
+        action="store_true",
+        help="explicit assertion that rank timestamps share one clock origin (recorded as "
+        "clock_validation=explicit_assertion; without it or clock metadata the command fails)",
+    )
+    p_dist.add_argument(
+        "--clock-metadata",
+        default=None,
+        help="optional JSON with non-empty 'evidence' string -> clock_validation=validated",
+    )
+    p_dist.add_argument(
+        "--windows",
+        default=None,
+        help='optional JSON of named phase windows: {"name": [start_ns, end_ns], ...}',
+    )
+    p_dist.add_argument("--output", required=True, help="output directory for distributed summary files")
+    p_dist.add_argument(
+        "--intervals-csv", action="store_true", help="also write distributed_intervals.csv (common layers)"
+    )
+    p_dist.set_defaults(func=cmd_analyze_distributed)
     return parser
 
 
