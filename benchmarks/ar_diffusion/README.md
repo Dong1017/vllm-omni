@@ -16,16 +16,19 @@ concurrent serving or VAE/end-to-end video throughput.
 ## Reproduce
 
 This benchmark depends on the native chunk APIs in PR #8282. Until that PR
-lands, combine this benchmark branch with the dependency in a disposable
-development checkout. The archived results use the pinned dependency below:
+lands, apply this draft's benchmark commits to the pinned dependency in a
+disposable development checkout. Start from this draft branch:
 
 ```bash
+benchmark_head=$(git rev-parse HEAD)
 git fetch https://github.com/vllm-project/vllm-omni.git refs/pull/8282/head
-git merge --no-edit 86490babe358740cf98f019d1972f3b364a329d4
+git switch -c codex/wan-benchmark-reproduce 86490babe358740cf98f019d1972f3b364a329d4
+git cherry-pick "e4af781dc71ffdf6962c469aaa6a8b87ab7908f6..${benchmark_head}"
 ```
 
 The benchmark and `test_wan_hybrid_kv.py` require that combined checkout;
 `main` alone does not yet provide the dependency's native chunk APIs.
+This reproduces the archived dependency without merging later `main` changes.
 Later dependency revisions need separate compatibility validation.
 
 Use a Linux/CUDA environment compatible with the PR #8282 branch, with vLLM,
