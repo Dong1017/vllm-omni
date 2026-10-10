@@ -1,0 +1,18 @@
+{
+  "dependency_head": "86490babe358740cf98f019d1972f3b364a329d4",
+  "benchmark_head": "ef5f8c8c54c42a3d84deb51e791b7fa4ce928b1f",
+  "full_requests_checked": 8,
+  "source_snapshots_checked": 14,
+  "latent_sha256": "ca3e3a7c429f24ed69b62cd7a4423b10baf01ed22f965a3fcaa40f7ac0201b6a",
+  "rows": [
+    {
+      "variant": "baseline",
+      "median_fps": 120.58927483008323
+    },
+    {
+      "variant": "hybrid_fused",
+      "median_fps": 133.67828088294786
+    }
+  ],
+  "dit_speedup": 1.1085420413325127
+}

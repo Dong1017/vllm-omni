@@ -139,12 +139,20 @@ including strided residual tensors. They do not require model weights:
 python -m pytest -o addopts='' \
   tests/diffusion/ar_diffusion/test_wan_hybrid_kv.py \
   tests/diffusion/ar_diffusion/test_wan_native_optimizations.py \
-  -m 'core_model and cpu' --run-level=L1 -q
+  -m 'core_model and cpu' --run-level=core_model -q
 python -m pytest -o addopts='' \
   tests/diffusion/ar_diffusion/test_wan_native_pointwise.py \
-  -m 'core_model and cuda' --run-level=L2 -q
+  -m 'core_model and cuda' --run-level=core_model -q
 ```
 
 The repository-wide test plugins also require a vLLM version compatible with
 the selected Omni branch. For isolated unit/kernel checks when those unrelated
 plugins cannot load, add `--noconftest` and omit `--run-level`.
+
+Independent single-node H200 validation of this draft, with raw completion
+events and the environment recorded, is available in
+[the H200 results](results/h200-validation-20261010/README.md).
+The hashes in the examples above belong to the archived H800 environment.
+For a different environment, first omit `--expected-sha` to establish a
+baseline hash, which the harness then requires every variant and repeat to
+match. Record that hash for subsequent runs in the same environment.

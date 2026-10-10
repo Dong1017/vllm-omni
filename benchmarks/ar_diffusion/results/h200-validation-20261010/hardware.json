@@ -1,0 +1,60 @@
+{
+  "CUDA_VISIBLE_DEVICES": "0,1,2,4,7",
+  "devices": [
+    {
+      "local_rank": 0,
+      "reported_name": "NVIDIA L20X",
+      "uuid": "006eb78c-23cb-f37d-eb7c-0ccb578b8f11",
+      "capability": [
+        9,
+        0
+      ],
+      "multiprocessors": 132,
+      "total_memory_bytes": 150121283584
+    },
+    {
+      "local_rank": 1,
+      "reported_name": "NVIDIA L20X",
+      "uuid": "76ec3aee-7fec-b98c-562a-7697a4be04c7",
+      "capability": [
+        9,
+        0
+      ],
+      "multiprocessors": 132,
+      "total_memory_bytes": 150121283584
+    },
+    {
+      "local_rank": 2,
+      "reported_name": "NVIDIA L20X",
+      "uuid": "cbf66259-f4ab-0ede-1811-82037dde5924",
+      "capability": [
+        9,
+        0
+      ],
+      "multiprocessors": 132,
+      "total_memory_bytes": 150121283584
+    },
+    {
+      "local_rank": 3,
+      "reported_name": "NVIDIA L20X",
+      "uuid": "3e893502-9769-d3ff-450d-2033b31bb63e",
+      "capability": [
+        9,
+        0
+      ],
+      "multiprocessors": 132,
+      "total_memory_bytes": 150121283584
+    },
+    {
+      "local_rank": 4,
+      "reported_name": "NVIDIA L20X",
+      "uuid": "0e488755-d8ed-b688-81e7-8e377dc10fd5",
+      "capability": [
+        9,
+        0
+      ],
+      "multiprocessors": 132,
+      "total_memory_bytes": 150121283584
+    }
+  ]
+}

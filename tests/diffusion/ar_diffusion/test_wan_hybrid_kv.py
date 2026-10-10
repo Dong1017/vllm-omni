@@ -7,13 +7,13 @@ from collections import defaultdict
 import pytest
 import torch
 from torch import nn
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from benchmarks.ar_diffusion import hybrid_transport
 from benchmarks.ar_diffusion.block_plan import BlockPlan, KVKey
 from benchmarks.ar_diffusion.hybrid_kv import HybridNoisyKVState
 from benchmarks.ar_diffusion.hybrid_transport import LayerMajorPages
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

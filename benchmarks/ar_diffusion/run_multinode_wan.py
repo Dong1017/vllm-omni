@@ -89,6 +89,16 @@ def main():
     device = torch.device("cuda", local_rank)
     from vllm.config.vllm import set_current_vllm_config
     from vllm.utils.torch_utils import set_default_torch_dtype
+    from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import FlowEuler, _LatentChunkAdapter
+    from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
+    from vllm_omni.experimental.ar_diffusion.chunk_executor import (
+        ARDiffusionChunkContext,
+        ChunkRunSpec,
+        ChunkTopology,
+        run_chunk_pipeline,
+    )
+    from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
@@ -99,17 +109,7 @@ def main():
         initialize_model_parallel,
     )
     from vllm_omni.diffusion.forward_context import set_forward_context
-    from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import FlowEuler, _LatentChunkAdapter
-    from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
     from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
-    from vllm_omni.experimental.ar_diffusion.chunk_executor import (
-        ARDiffusionChunkContext,
-        ChunkRunSpec,
-        ChunkTopology,
-        run_chunk_pipeline,
-    )
-    from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
-    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
     od = OmniDiffusionConfig(
         model=str(args.model),
