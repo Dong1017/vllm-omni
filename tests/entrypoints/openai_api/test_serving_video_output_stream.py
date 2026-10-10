@@ -60,7 +60,9 @@ def _build_test_app(
     class FakeStreamingVideoEncoder:
         encode_calls: list[int] = []
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = len(self.encode_calls)
             self.encode_calls.append(idx)
@@ -416,7 +418,9 @@ def _build_handler_for_async_tests(
         def __init__(self) -> None:
             self.encode_calls = 0
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = self.encode_calls
             self.encode_calls += 1
