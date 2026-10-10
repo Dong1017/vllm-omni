@@ -33,8 +33,8 @@ Later dependency revisions need separate compatibility validation.
 
 Use a Linux/CUDA environment compatible with the PR #8282 branch, with vLLM,
 PyTorch, paged FlashAttention, Triton, `safetensors` and `cuda.bindings` installed.
-The tested environment and raw measurements are documented in
-[the results](results/h800-q3-20261009/README.md).
+The tested environments and raw measurements are linked under
+[Recorded validation](#recorded-validation).
 
 `OMNI_MODEL` must point to the complete Wan 2.1 1.3B RF Diffusers model root,
 including `transformer/config.json` and transformer safetensors. Passing only
@@ -46,7 +46,7 @@ shape `[1,512,4096]`. It excludes T5 loading and encoding from DiT measurements.
 Expand it to an absolute path visible from both nodes:
 
 ```bash
-gzip -dc benchmarks/ar_diffusion/results/h800-q3-20261009/conditioning.pt.gz > /tmp/omni-condition.pt
+gzip -dc benchmarks/ar_diffusion/fixtures/conditioning.pt.gz > /tmp/omni-condition.pt
 sha256sum /tmp/omni-condition.pt
 # 198358abb9eb6e80296d18bb78f82924a4fef1fa1a44ff26af34e75cfda9c5af
 ```
@@ -64,8 +64,7 @@ python -m torch.distributed.run \
   -m benchmarks.ar_diffusion.run_multinode_wan \
   --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 2 --steps 4 --chunks 128 --skip 64 --measure 32 \
-  --variants baseline hybrid_fused --warmup 1 --repeat 3 \
-  --expected-sha a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d
+  --variants baseline hybrid_fused --warmup 1 --repeat 3
 ```
 
 Adjust the network interface to the actual deployment. Each node uses five
@@ -80,8 +79,7 @@ python -m torch.distributed.run --standalone --nproc-per-node=5 \
   -m benchmarks.ar_diffusion.run_multinode_wan \
   --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 1 --steps 4 --chunks 128 --skip 64 --measure 32 \
-  --variants baseline hybrid_fused --warmup 1 --repeat 3 \
-  --expected-sha d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe
+  --variants baseline hybrid_fused --warmup 1 --repeat 3
 ```
 
 Run from the checkout root and use a distinct output directory for each
@@ -149,10 +147,23 @@ The repository-wide test plugins also require a vLLM version compatible with
 the selected Omni branch. For isolated unit/kernel checks when those unrelated
 plugins cannot load, add `--noconftest` and omit `--run-level`.
 
-Independent single-node H200 validation of this draft, with raw completion
-events and the environment recorded, is available in
-[the H200 results](results/h200-validation-20261010/README.md).
-The hashes in the examples above belong to the archived H800 environment.
-For a different environment, first omit `--expected-sha` to establish a
-baseline hash, which the harness then requires every variant and repeat to
-match. Record that hash for subsequent runs in the same environment.
+## Recorded validation
+
+Independent five-H200 validation measured baseline **120.589275 DiT FPS** and
+`hybrid_fused` **133.678281 DiT FPS** (+10.85%), with matching full latent hashes
+across one warmup and three measured requests per variant. The four-variant
+smoke, 23 CPU contracts and 3 CUDA kernel checks also passed. Performance is
+bound to dependency `86490bab` plus benchmark `ef5f8c8c`; the later import fixes
+were checked with another five-GPU smoke. These are single-node DiT results.
+
+The complete evidence and audit scripts are preserved at the fixed archive
+commit `72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe`, outside the active benchmark:
+
+- [Independent H200 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h200-validation-20261010)
+- [Original contributor's H800 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h800-q3-20261009)
+- [H800 archive audit script](https://github.com/Dong1017/vllm-omni/blob/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/audit_results.py)
+
+The first baseline request establishes a reference hash, which every variant
+and repeat must match. Record that hash and optionally pass `--expected-sha`
+for subsequent runs in the same environment. Archived H800 hashes are not
+cross-environment references.

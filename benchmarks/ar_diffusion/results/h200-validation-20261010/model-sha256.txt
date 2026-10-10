@@ -1,2 +1,0 @@
-0b093fa072e9ff28763febe9b964ee582f566733a6d6709deb9dfba1bde16b81  /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev/transformer/config.json
-e88d04afc82adf91048976a0e33ae3e7f1b0a1c25fe0bce1563a6dc111093637  /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev/transformer/diffusion_pytorch_model.safetensors

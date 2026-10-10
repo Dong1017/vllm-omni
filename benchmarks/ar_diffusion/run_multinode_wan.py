@@ -23,14 +23,6 @@ import torch.distributed as dist
 from safetensors import safe_open
 
 
-def grid(steps):
-    endpoint = torch.tensor(1 / 1000, dtype=torch.float32)
-    endpoint = float(5 * endpoint / (1 + 4 * endpoint))
-    values = torch.linspace(1.0, endpoint, steps, dtype=torch.float64)
-    sigmas = (5 * values / (1 + 4 * values)).float().tolist() + [0.0]
-    return sigmas, [1000 * x for x in sigmas[:-1]]
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=Path, required=True)
@@ -152,7 +144,6 @@ def main():
         prompt = torch.load(args.condition, map_location="cpu", weights_only=True)["text"].to(device)
         pp = get_pp_group()
         sampler = FlowEuler(args.steps, shift=5.0)
-        sampler.sigmas, sampler.timesteps = grid(args.steps)
         plan = build_chunk_plan(
             ChunkSchedule(args.chunks, args.steps, args.steps + 1, args.groups, Ordering.INTERLEAVED, 6)
         )
