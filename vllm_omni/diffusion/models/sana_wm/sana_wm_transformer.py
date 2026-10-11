@@ -1200,8 +1200,9 @@ class SanaWmSelfAttention(nn.Module):
         self._cam_prep_use_compiled = bool(value)
 
     @staticmethod
-    def _cam_prep_supported(q_normed: torch.Tensor, k_normed: torch.Tensor, v_raw: torch.Tensor,
-                            *, require_cuda: bool = True) -> bool:
+    def _cam_prep_supported(
+        q_normed: torch.Tensor, k_normed: torch.Tensor, v_raw: torch.Tensor, *, require_cuda: bool = True
+    ) -> bool:
         """Cheap metadata gate for the compiled leaves (no data scans).
 
         ``require_cuda=False`` lifts only the device check so tests can exercise
@@ -1240,13 +1241,25 @@ class SanaWmSelfAttention(nn.Module):
         )
         if not needs_grad and self._cam_prep_supported(q_normed, k_normed, v_raw):
             return get_compiled_cam_prep()(
-                q_normed, k_normed, v_raw,
-                proj_q=proj_q, proj_kv=proj_kv, rope_cos=rope_cos, rope_sin=rope_sin,
+                q_normed,
+                k_normed,
+                v_raw,
+                proj_q=proj_q,
+                proj_kv=proj_kv,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
                 k_scale=float(k_scale),
             )
-        return cam_prep_func(q_normed, k_normed, v_raw,
-                             proj_q=proj_q, proj_kv=proj_kv, rope_cos=rope_cos, rope_sin=rope_sin,
-                             k_scale=k_scale)
+        return cam_prep_func(
+            q_normed,
+            k_normed,
+            v_raw,
+            proj_q=proj_q,
+            proj_kv=proj_kv,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            k_scale=k_scale,
+        )
 
     def _cam_prep_callable(self):
         """Return this instance's camera-prep callable.

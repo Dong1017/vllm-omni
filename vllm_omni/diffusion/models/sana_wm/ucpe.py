@@ -608,18 +608,23 @@ def get_compiled_cam_prep() -> Callable:
         rope_out = torch.compile(_leaf_rope_out, dynamic=False, options=dict(_INDUCTOR_OPTS))
 
         def _compiled_cam_prep_impl(q_normed, k_normed, v_raw, *, proj_q, proj_kv, rope_cos, rope_sin, k_scale):
-            half_dim = _validate_cam_prep_inputs(
-                q_normed, k_normed, v_raw, proj_q, proj_kv, rope_cos, rope_sin
-            )
+            half_dim = _validate_cam_prep_inputs(q_normed, k_normed, v_raw, proj_q, proj_kv, rope_cos, rope_sin)
             q_norm, k_norm, value = prepare(q_normed, k_normed, v_raw, float(k_scale))
             q_half = _apply_ray_projection(q_norm[..., :half_dim], proj_q)
             k_half = _apply_ray_projection(k_norm[..., :half_dim], proj_kv)
             v_half = _apply_ray_projection(value[..., :half_dim], proj_kv)
             k_pre_sq = k_norm.square().sum(dim=-1).permute(0, 2, 1).contiguous()
             q_out, k_out, v_out, k_post = rope_out(
-                q_norm, k_norm, value,
-                q_half=q_half, k_half=k_half, v_half=v_half,
-                rope_cos=rope_cos, rope_sin=rope_sin, half_dim=half_dim, dtype=v_raw.dtype,
+                q_norm,
+                k_norm,
+                value,
+                q_half=q_half,
+                k_half=k_half,
+                v_half=v_half,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                half_dim=half_dim,
+                dtype=v_raw.dtype,
             )
             k_post_sq = k_post.square().sum(dim=-1).permute(0, 2, 1).contiguous()
             inflation_sq = k_post_sq.clamp_min(1e-12) / k_pre_sq.clamp_min(1e-12)

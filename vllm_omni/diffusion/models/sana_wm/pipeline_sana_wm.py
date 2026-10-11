@@ -26,7 +26,6 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import (
     denormalize_latents,
@@ -46,11 +45,11 @@ from vllm_omni.diffusion.models.sana_wm.config import (
     SanaWmConfig,
 )
 from vllm_omni.diffusion.models.sana_wm.request import normalize_sana_wm_payload
-from vllm_omni.diffusion.models.sana_wm.ucpe import _inductor_options_available
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmTransformer3DModel,
 )
+from vllm_omni.diffusion.models.sana_wm.ucpe import _inductor_options_available
 from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -62,6 +61,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 

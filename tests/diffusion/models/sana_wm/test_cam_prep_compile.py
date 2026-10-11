@@ -209,7 +209,8 @@ def test_broadcastable_but_native_forbidden_shapes_raise(monkeypatch):
 def test_unsupported_inputs_fall_back_to_native(monkeypatch):
     compiled_calls = []
     monkeypatch.setattr(
-        tr_module, "get_compiled_cam_prep",
+        tr_module,
+        "get_compiled_cam_prep",
         lambda: (compiled_calls.append(1) or cam_prep_func),
     )
     a = _bare_attention()
@@ -229,7 +230,6 @@ def test_unsupported_inputs_fall_back_to_native(monkeypatch):
 def test_supported_gate_checks_each_condition():
     # Per-condition supported-gate checks (require_cuda=False lifts only the
     # device check so the remaining conditions fail/pass independently).
-    a = _bare_attention()
     base = _small_inputs()
 
     def variant(**over):
@@ -238,9 +238,7 @@ def test_supported_gate_checks_each_condition():
         return kw
 
     def supported(kw):
-        return SanaWmSelfAttention._cam_prep_supported(
-            kw["q_normed"], kw["k_normed"], kw["v_raw"], require_cuda=False
-        )
+        return SanaWmSelfAttention._cam_prep_supported(kw["q_normed"], kw["k_normed"], kw["v_raw"], require_cuda=False)
 
     assert supported(base) is True  # baseline satisfies the gate
     assert supported(variant(v_raw=base["v_raw"].to(torch.float32))) is False  # dtype
