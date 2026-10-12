@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""torchrun harness for the native PR8282 Wan chunk executor and noisy KV.
-
-The Omni diffusion frontend does not implement a multinode executor. This runs
-its actual DiT model, scheduler, PP coordinator and cache with external ranks.
-Pre-encoded conditioning and CUDA completion events isolate DiT throughput.
-"""
+# 外部 torchrun 运行原生 Noisy PP；预编码文本与 CUDA events 隔离 DiT 吞吐。
 
 import argparse
 import hashlib

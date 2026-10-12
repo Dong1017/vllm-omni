@@ -1,4 +1,4 @@
-# Wan chunk pipeline: IPC/NCCL benchmark adapters
+# Noisy PP: Wan RF chunk benchmark
 
 This opt-in harness runs the native `StageWanTransformer`, chunk executor,
 Latest KV selection, RF Flow Euler sampler and paged FlashAttention from
@@ -41,6 +41,10 @@ including `transformer/config.json` and transformer safetensors. Passing only
 the transformer directory is unsupported. The model configuration must have
 30 blocks, 12 attention heads and head size 128.
 
+Supply a locally available checkpoint matching this RF contract. The benchmark
+does not release model weights or assume a public model ID. Runtime module
+paths and pipeline registration follow the pinned dependency in PR #8282.
+
 The compressed fixture contains BF16 T5 embeddings for `a cat walking on grass`,
 shape `[1,512,4096]`. It excludes T5 loading and encoding from DiT measurements.
 Expand it to an absolute path visible from both nodes:
@@ -61,7 +65,7 @@ NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=0 \
 python -m torch.distributed.run \
   --nnodes=2 --nproc-per-node=5 --node-rank="$OMNI_NODE_RANK" \
   --master-addr="$OMNI_MASTER_ADDR" --master-port=29879 \
-  -m benchmarks.ar_diffusion.run_multinode_wan \
+  -m benchmarks.ar_diffusion.benchmark_noisy_pp \
   --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 2 --steps 4 --chunks 128 --skip 64 --measure 32 \
   --variants baseline hybrid_fused --warmup 1 --repeat 3
@@ -76,7 +80,7 @@ For one node (`K=30`), use:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
 python -m torch.distributed.run --standalone --nproc-per-node=5 \
-  -m benchmarks.ar_diffusion.run_multinode_wan \
+  -m benchmarks.ar_diffusion.benchmark_noisy_pp \
   --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 1 --steps 4 --chunks 128 --skip 64 --measure 32 \
   --variants baseline hybrid_fused --warmup 1 --repeat 3
@@ -121,7 +125,7 @@ requests keep mappings alive until the worker job exits.
 Source snapshots, per-request events and hashes, GPU memory statistics and
 median summaries are written under the output directory. Per-block transport
 rounds and read labels derive directly from the native `ChunkPlan`; no second
-scheduler or general KV manager is included. Retained WaveServe transport
+scheduler or general KV manager is included. Original transport
 source attribution and adaptation hashes are listed in
 [provenance.json](provenance.json).
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# Adapted from Physis-AI WaveServe; see provenance.json.
+# Adapted from the Physis-AI transport sources recorded in provenance.json.
 """Layer-major KV ring with local IPC tickets and static remote NCCL rounds."""
 
 import ctypes
