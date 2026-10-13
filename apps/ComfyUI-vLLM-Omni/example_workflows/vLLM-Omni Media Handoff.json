@@ -1,0 +1,824 @@
+{
+  "last_node_id": 13,
+  "last_link_id": 24,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "title": "H3 or restored video",
+      "pos": [
+        40,
+        130
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            13,
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "h3_source.mp4"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "title": "External soundtrack (or generated AUDIO)",
+      "pos": [
+        40,
+        420
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            15,
+            16,
+            18,
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "soundtrack.wav"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "GetVideoComponents",
+      "title": "Reuse source frames and FPS",
+      "pos": [
+        400,
+        150
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            1,
+            5,
+            9
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            17
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            2,
+            6,
+            10
+          ]
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "links": [
+            3,
+            7,
+            11
+          ]
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "links": [
+            4,
+            8,
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 4,
+      "type": "SaveVideo",
+      "title": "1. Keep the source audio",
+      "pos": [
+        1330,
+        40
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 14
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/preserve",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "AudioConcat",
+      "title": "Repeat supplied audio twice (hard join)",
+      "pos": [
+        600,
+        900
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio1",
+          "type": "AUDIO",
+          "link": 18
+        },
+        {
+          "name": "audio2",
+          "type": "AUDIO",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "AudioConcat"
+      },
+      "widgets_values": [
+        "after"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "MarkdownNote",
+      "title": "Media handoff",
+      "pos": [
+        40,
+        730
+      ],
+      "size": [
+        490,
+        410
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "Choose a video and soundtrack, then queue. Four MP4s show distinct audio policies.\n\nPreserve: the original VIDEO goes directly to Save Video.\nReplace: source frames/FPS plus only the supplied AUDIO.\nMix: mean of source and supplied AUDIO (built-in AudioMerge).\nRepeat twice: concatenate two copies of supplied AUDIO, then replace.\n\nSave Video trims audio longer than the video. Short replacement/repeated tracks end early; the video continues without that audio. Repeating twice is not an automatic fill-to-length loop.\n\nAll rebuilt branches take FPS, bit depth and color space from the source. H3 source audio is normally stereo. You may connect Generate Video or a restoration VIDEO instead of Load Video; Generate Music AUDIO may replace Load Audio. Each remote generation node keeps its own service URL/model.\n\nSee docs/media-handoff.md for supported ComfyUI revision and validation."
+      ]
+    },
+    {
+      "id": 7,
+      "type": "CreateVideo",
+      "title": "2. Replace the source audio",
+      "pos": [
+        980,
+        330
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "link": 2,
+          "widget": {
+            "name": "fps"
+          }
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 15
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "link": 3,
+          "widget": {
+            "name": "bit_depth"
+          }
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "link": 4,
+          "widget": {
+            "name": "color_space"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24,
+        "auto",
+        "sRGB",
+        "none"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "SaveVideo",
+      "title": "Save replacement",
+      "pos": [
+        1330,
+        330
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/replace",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "AudioMerge",
+      "title": "3. Mix: mean of both tracks",
+      "pos": [
+        650,
+        610
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio1",
+          "type": "AUDIO",
+          "link": 17
+        },
+        {
+          "name": "audio2",
+          "type": "AUDIO",
+          "link": 16
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "AudioMerge"
+      },
+      "widgets_values": [
+        "mean"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "CreateVideo",
+      "title": "Mix using source video timing",
+      "pos": [
+        980,
+        620
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "link": 6,
+          "widget": {
+            "name": "fps"
+          }
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 20
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "link": 7,
+          "widget": {
+            "name": "bit_depth"
+          }
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "link": 8,
+          "widget": {
+            "name": "color_space"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            23
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24,
+        "auto",
+        "sRGB",
+        "none"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SaveVideo",
+      "title": "Save mixture",
+      "pos": [
+        1330,
+        620
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 23
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/mix",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "CreateVideo",
+      "title": "4. Replace with two soundtrack copies",
+      "pos": [
+        980,
+        910
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 9
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "link": 10,
+          "widget": {
+            "name": "fps"
+          }
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 21
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "link": 11,
+          "widget": {
+            "name": "bit_depth"
+          }
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "link": 12,
+          "widget": {
+            "name": "color_space"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24,
+        "auto",
+        "sRGB",
+        "none"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "SaveVideo",
+      "title": "Save two-copy repeat",
+      "pos": [
+        1330,
+        910
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/repeat-twice",
+        "mp4",
+        "auto"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      3,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      3,
+      2,
+      7,
+      1,
+      "FLOAT"
+    ],
+    [
+      3,
+      3,
+      3,
+      7,
+      3,
+      "COMBO"
+    ],
+    [
+      4,
+      3,
+      4,
+      7,
+      4,
+      "COMBO"
+    ],
+    [
+      5,
+      3,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      3,
+      2,
+      10,
+      1,
+      "FLOAT"
+    ],
+    [
+      7,
+      3,
+      3,
+      10,
+      3,
+      "COMBO"
+    ],
+    [
+      8,
+      3,
+      4,
+      10,
+      4,
+      "COMBO"
+    ],
+    [
+      9,
+      3,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      10,
+      3,
+      2,
+      13,
+      1,
+      "FLOAT"
+    ],
+    [
+      11,
+      3,
+      3,
+      13,
+      3,
+      "COMBO"
+    ],
+    [
+      12,
+      3,
+      4,
+      13,
+      4,
+      "COMBO"
+    ],
+    [
+      13,
+      1,
+      0,
+      3,
+      0,
+      "VIDEO"
+    ],
+    [
+      14,
+      1,
+      0,
+      4,
+      0,
+      "VIDEO"
+    ],
+    [
+      15,
+      2,
+      0,
+      7,
+      2,
+      "AUDIO"
+    ],
+    [
+      16,
+      2,
+      0,
+      9,
+      1,
+      "AUDIO"
+    ],
+    [
+      17,
+      3,
+      1,
+      9,
+      0,
+      "AUDIO"
+    ],
+    [
+      18,
+      2,
+      0,
+      5,
+      0,
+      "AUDIO"
+    ],
+    [
+      19,
+      2,
+      0,
+      5,
+      1,
+      "AUDIO"
+    ],
+    [
+      20,
+      9,
+      0,
+      10,
+      2,
+      "AUDIO"
+    ],
+    [
+      21,
+      5,
+      0,
+      13,
+      2,
+      "AUDIO"
+    ],
+    [
+      22,
+      7,
+      0,
+      8,
+      0,
+      "VIDEO"
+    ],
+    [
+      23,
+      10,
+      0,
+      11,
+      0,
+      "VIDEO"
+    ],
+    [
+      24,
+      13,
+      0,
+      12,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.75,
+      "offset": [
+        20,
+        20
+      ]
+    }
+  },
+  "version": 0.4
+}

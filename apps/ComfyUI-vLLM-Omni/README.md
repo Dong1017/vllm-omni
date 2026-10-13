@@ -301,6 +301,13 @@ The node requires at least one mask; the server then enforces the cross-field ru
   </picture>
 </p>
 
+### Media handoff for generated or restored video
+
+The **vLLM-Omni Media Handoff** template preserves, replaces, mixes, or repeats
+a supplied soundtrack twice using built-in ComfyUI nodes. Rebuilt videos take
+their FPS from the source. See [media handoff](docs/media-handoff.md) for the
+audio-length rules, remote-service wiring and validation.
+
 ### Chaining multiple model services
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Chaining Services**)
