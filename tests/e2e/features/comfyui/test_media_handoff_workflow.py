@@ -37,15 +37,17 @@ def test_graph_connections_are_consistent_and_acyclic(graph):
     assert len(tuple(TopologicalSorter(dependencies).static_order())) == len(nodes)
 
 
-def test_rebuilt_video_uses_source_frames_and_timing(graph):
+def test_soundtrack_override_receives_original_video(graph):
     nodes, links = graph
-    rebuilds = [node for node in nodes.values() if node["type"] == "CreateVideo"]
-    assert len(rebuilds) == 3
-    for node in rebuilds:
-        for name, slot in (("images", 0), ("fps", 2), ("bit_depth", 3), ("color_space", 4)):
-            origin, output_slot = source(nodes, links, node, name)
-            assert origin["type"] == "GetVideoComponents"
-            assert output_slot == slot
+    overrides = [node for node in nodes.values() if node["type"] == "ConcatenateVideo"]
+    assert len(overrides) == 3
+    for node in overrides:
+        origin, output_slot = source(nodes, links, node, "videos.video0")
+        assert origin["type"] == "LoadVideo" and output_slot == 0
+        assert node["widgets_values"] == ["auto"]
+        assert [value["name"] for value in node["inputs"]] == ["videos.video0", "complete_audio"]
+    assert not any(node["type"] == "CreateVideo" for node in nodes.values())
+    assert all(node["widgets_values"][2] == "auto" for node in nodes.values() if node["type"] == "SaveVideo")
 
 
 def test_audio_policies_and_original_output_are_distinct(graph):
@@ -56,7 +58,8 @@ def test_audio_policies_and_original_output_are_distinct(graph):
     assert original["type"] == "LoadVideo"
     for policy, expected in (("replace", "LoadAudio"), ("mix", "AudioMerge"), ("loop", "VLLMOmniAudioToVideoDuration")):
         video, _ = source(nodes, links, outputs[f"CUI03/{policy}"], "video")
-        audio, _ = source(nodes, links, video, "audio")
+        assert video["type"] == "ConcatenateVideo"
+        audio, _ = source(nodes, links, video, "complete_audio")
         assert audio["type"] == expected
     mix = next(node for node in nodes.values() if node["type"] == "AudioMerge")
     assert mix["widgets_values"] == ["mean"]
@@ -74,7 +77,7 @@ def test_template_uses_media_nodes_and_portable_assets(graph):
         "LoadVideo",
         "LoadAudio",
         "GetVideoComponents",
-        "CreateVideo",
+        "ConcatenateVideo",
         "SaveVideo",
         "AudioMerge",
         "VLLMOmniAudioToVideoDuration",

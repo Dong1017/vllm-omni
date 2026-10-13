@@ -11,7 +11,7 @@ Queue once to save four outputs under `output/CUI03/`:
 | Output | Audio policy |
 | --- | --- |
 | `preserve` | Save the original VIDEO with its original audio. |
-| `replace` | Use only the supplied soundtrack with the source video frames. |
+| `replace` | Use only the supplied soundtrack with the source VIDEO. |
 | `mix` | Use AudioMerge's `mean`: average the source and supplied waveforms. |
 | `loop` | Repeat the supplied soundtrack to fill the source video, then replace the source audio. |
 
@@ -31,18 +31,30 @@ source requires conversion before using frame-count/frame-rate timing.
 Use **Audio Adjust Volume**
 before **AudioMerge** when you need a different balance.
 
-The rebuilt branches receive FPS, bit depth and color space from
-**Get Video Components**, rather than using a separate FPS setting. They
-re-encode the source frames; they do not promise byte-identical video output.
+The three soundtrack branches use **Concatenate Video** with a single
+`video0` input and `complete_audio` to override the soundtrack. Keep its codec
+and **Save Video**'s codec set to `auto`. For an encoded file VIDEO, this copies
+the video packets into the output container instead of rebuilding RGB frames.
+It retains encoded video quality and frame spacing; ComfyUI normalizes the
+clip start to zero. The container and encoded audio change.
+**Get Video Components** extracts the original audio for mixing;
+its IMAGE/FLOAT outputs are not used to reconstruct the video.
+
+A tensor-backed VIDEO from a generation/restoration node must first be encoded
+by ComfyUI. This graph cannot recover encoding or timestamps already discarded
+by a producer. Stream-copy behavior applies to encoded inputs supported by
+ComfyUI's output container; choose MP4 as in the template.
 Replacement preserves the supplied audio's sample rate and channel count.
 Mixing uses the standard AudioMerge sample-rate conversion and normalization;
-a mono supplied track broadcasts across an H3 stereo source. The source-video
+a mono supplied track broadcasts across an H3 stereo source. If the source has
+no audio, AudioMerge passes the supplied soundtrack through. The source-video
 branch remains separate, so changing the soundtrack does not discard the
 original output.
 
 ## Connect remote services
 
 To process a fresh generation, connect **Generate Video → VIDEO** to
+all three **Concatenate Video → video0** inputs,
 **Get Video Components → video**, **Save original → video**, and
 **Audio to Video Duration → video**, replacing **Load Video**.
 The same sockets accept a restoration node's VIDEO output.
@@ -56,8 +68,8 @@ This saved-media template can be validated on CPU after generation.
 
 ## Compatibility and validation
 
-Use a ComfyUI version that exposes the five Get Video Components outputs,
-including `bit_depth` and `color_space`. The validation baseline is ComfyUI
+Use a ComfyUI version with **Concatenate Video**'s `complete_audio` input.
+The validation baseline is ComfyUI
 `06c67806bcb36789a1e8e1278c6a764b389ff858`. Install this extension's
 **Audio to Video Duration** node for the loop branch. The other media nodes
 are built into ComfyUI.
@@ -70,7 +82,9 @@ ffprobe -v error -count_frames \
   -of json output/CUI03/replace_00001_.mp4
 ```
 
-Compare video frame count and FPS with the source; check the intended audio
+Compare video frame count, FPS, time base and frame timestamps with the source;
+for encoded MP4 inputs, also compare video packet contents to confirm that
+no video re-encoding occurred. Check the intended audio
 sample rate/channel count, listen to the selected audio policy, and watch for
 audio/video timing differences. Test both a longer soundtrack and a shorter
 one so clipping and early audio termination are visible. Record the source H3
