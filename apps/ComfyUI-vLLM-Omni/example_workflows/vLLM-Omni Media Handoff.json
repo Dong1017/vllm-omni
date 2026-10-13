@@ -24,7 +24,8 @@
           "type": "VIDEO",
           "links": [
             13,
-            14
+            14,
+            18
           ]
         }
       ],
@@ -58,7 +59,6 @@
           "links": [
             15,
             16,
-            18,
             19
           ]
         }
@@ -182,8 +182,8 @@
     },
     {
       "id": 5,
-      "type": "AudioConcat",
-      "title": "Repeat supplied audio twice (hard join)",
+      "type": "VLLMOmniAudioToVideoDuration",
+      "title": "Fit soundtrack to video duration",
       "pos": [
         600,
         900
@@ -197,12 +197,12 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "audio1",
-          "type": "AUDIO",
+          "name": "video",
+          "type": "VIDEO",
           "link": 18
         },
         {
-          "name": "audio2",
+          "name": "audio",
           "type": "AUDIO",
           "link": 19
         }
@@ -217,10 +217,10 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "AudioConcat"
+        "Node name for S&R": "VLLMOmniAudioToVideoDuration"
       },
       "widgets_values": [
-        "after"
+        "loop"
       ]
     },
     {
@@ -244,7 +244,7 @@
         "Node name for S&R": "MarkdownNote"
       },
       "widgets_values": [
-        "Choose a video and soundtrack, then queue. Four MP4s show distinct audio policies.\n\nPreserve: the original VIDEO goes directly to Save Video.\nReplace: source frames/FPS plus only the supplied AUDIO.\nMix: mean of source and supplied AUDIO (built-in AudioMerge).\nRepeat twice: concatenate two copies of supplied AUDIO, then replace.\n\nSave Video trims audio longer than the video. Short replacement/repeated tracks end early; the video continues without that audio. Repeating twice is not an automatic fill-to-length loop.\n\nAll rebuilt branches take FPS, bit depth and color space from the source. H3 source audio is normally stereo. You may connect Generate Video or a restoration VIDEO instead of Load Video; Generate Music AUDIO may replace Load Audio. Each remote generation node keeps its own service URL/model.\n\nSee docs/media-handoff.md for supported ComfyUI revision and validation."
+        "Choose a video and soundtrack, then queue. Four MP4s show distinct audio policies.\n\nPreserve: the original VIDEO goes directly to Save Video.\nReplace: source frames/FPS plus only the supplied AUDIO.\nMix: mean of source and supplied AUDIO (built-in AudioMerge).\nLoop: repeat supplied AUDIO to the exact video duration, retaining sample rate and channels. Choose pad for a silent tail, or trim to leave short audio unchanged.\n\nSave Video trims audio longer than the video. Short replacement tracks end early. Audio to Video Duration fills the loop branch to the video duration using its rational frame rate; loops have a hard join, without crossfade.\n\nAll rebuilt branches take FPS, bit depth and color space from the source. H3 source audio is normally stereo. You may connect Generate Video or a restoration VIDEO instead of Load Video; Generate Music AUDIO may replace Load Audio. Each remote generation node keeps its own service URL/model.\n\nSee docs/media-handoff.md for supported ComfyUI revision and validation."
       ]
     },
     {
@@ -509,7 +509,7 @@
     {
       "id": 13,
       "type": "CreateVideo",
-      "title": "4. Replace with two soundtrack copies",
+      "title": "4. Loop soundtrack to fill video",
       "pos": [
         980,
         910
@@ -579,7 +579,7 @@
     {
       "id": 12,
       "type": "SaveVideo",
-      "title": "Save two-copy repeat",
+      "title": "Save looped soundtrack",
       "pos": [
         1330,
         910
@@ -609,7 +609,7 @@
         "Node name for S&R": "SaveVideo"
       },
       "widgets_values": [
-        "CUI03/repeat-twice",
+        "CUI03/loop",
         "mp4",
         "auto"
       ]
@@ -754,11 +754,11 @@
     ],
     [
       18,
-      2,
+      1,
       0,
       5,
       0,
-      "AUDIO"
+      "VIDEO"
     ],
     [
       19,

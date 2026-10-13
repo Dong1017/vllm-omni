@@ -303,8 +303,10 @@ The node requires at least one mask; the server then enforces the cross-field ru
 
 ### Media handoff for generated or restored video
 
-The **vLLM-Omni Media Handoff** template preserves, replaces, mixes, or repeats
-a supplied soundtrack twice using built-in ComfyUI nodes. Rebuilt videos take
+The **vLLM-Omni Media Handoff** template preserves, replaces, mixes, or loops
+a supplied soundtrack to the video's duration. **Audio to Video Duration**
+also supports padding with silence and leaving short audio unchanged, while
+preserving the supplied sample rate and channels. Rebuilt videos take
 their FPS from the source. See [media handoff](docs/media-handoff.md) for the
 audio-length rules, remote-service wiring and validation.
 

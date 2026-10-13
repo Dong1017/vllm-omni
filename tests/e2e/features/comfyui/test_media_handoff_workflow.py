@@ -51,10 +51,10 @@ def test_rebuilt_video_uses_source_frames_and_timing(graph):
 def test_audio_policies_and_original_output_are_distinct(graph):
     nodes, links = graph
     outputs = {node["widgets_values"][0]: node for node in nodes.values() if node["type"] == "SaveVideo"}
-    assert set(outputs) == {"CUI03/preserve", "CUI03/replace", "CUI03/mix", "CUI03/repeat-twice"}
+    assert set(outputs) == {"CUI03/preserve", "CUI03/replace", "CUI03/mix", "CUI03/loop"}
     original, _ = source(nodes, links, outputs["CUI03/preserve"], "video")
     assert original["type"] == "LoadVideo"
-    for policy, expected in (("replace", "LoadAudio"), ("mix", "AudioMerge"), ("repeat-twice", "AudioConcat")):
+    for policy, expected in (("replace", "LoadAudio"), ("mix", "AudioMerge"), ("loop", "VLLMOmniAudioToVideoDuration")):
         video, _ = source(nodes, links, outputs[f"CUI03/{policy}"], "video")
         audio, _ = source(nodes, links, video, "audio")
         assert audio["type"] == expected
@@ -62,12 +62,13 @@ def test_audio_policies_and_original_output_are_distinct(graph):
     assert mix["widgets_values"] == ["mean"]
     assert source(nodes, links, mix, "audio1")[0]["type"] == "GetVideoComponents"
     assert source(nodes, links, mix, "audio2")[0]["type"] == "LoadAudio"
-    repeat = next(node for node in nodes.values() if node["type"] == "AudioConcat")
-    assert repeat["widgets_values"] == ["after"]
-    assert source(nodes, links, repeat, "audio1") == source(nodes, links, repeat, "audio2")
+    repeat = next(node for node in nodes.values() if node["type"] == "VLLMOmniAudioToVideoDuration")
+    assert repeat["widgets_values"] == ["loop"]
+    assert source(nodes, links, repeat, "video")[0]["type"] == "LoadVideo"
+    assert source(nodes, links, repeat, "audio")[0]["type"] == "LoadAudio"
 
 
-def test_template_uses_standard_nodes_and_portable_assets(graph):
+def test_template_uses_media_nodes_and_portable_assets(graph):
     nodes, _ = graph
     assert {node["type"] for node in nodes.values()} == {
         "LoadVideo",
@@ -76,7 +77,7 @@ def test_template_uses_standard_nodes_and_portable_assets(graph):
         "CreateVideo",
         "SaveVideo",
         "AudioMerge",
-        "AudioConcat",
+        "VLLMOmniAudioToVideoDuration",
         "MarkdownNote",
     }
     for node in nodes.values():
