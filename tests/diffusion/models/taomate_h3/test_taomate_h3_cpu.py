@@ -272,7 +272,7 @@ def _tiny_transformer() -> nn.Module:
         attn.out_proj = _TupleLinear(inner, arch.hidden_size, bias=False)
         mlp = nn.Module()
         mlp.fc1 = _TupleLinear(arch.hidden_size, 2 * arch.ffn_hidden_size, bias=False)
-        mlp.fc2 = _TupleLinear(arch.ffn_hidden_size, arch.hidden_size, bias=False)
+        mlp.fc2 = _TupleLinear(arch.hidden_size, arch.hidden_size, bias=False)
         parent.add_module("attn", attn)
         parent.add_module("mlp", mlp)
     return model
@@ -708,7 +708,10 @@ def test_prepare_ahead_layout_matches_a_fresh_one_and_noise_is_reused() -> None:
     # Across the request boundary: the noise draws of request 1 are made ahead and consumed.
     session.begin_phase(3, transformer=transformer, device=device)
     session.prepare_ahead(completed_phase_index=3)
-    assert session.noise_ahead is not None and session.noise_ahead[0] == 1
+    # The cross-request noise draws run on a daemon thread; join before asserting.
+    assert session._noise_thread is not None
+    session._noise_thread.join(timeout=10.0)
+    assert session._noise_thread is not None and session.noise_ahead is not None and session.noise_ahead[0] == 1
     expected_audio, expected_video = session._request_noise(1)
     session.finish_request()
     request = session.begin_request(
@@ -797,7 +800,7 @@ def test_hold_bound_can_fall_back_to_a_neutral_prompt(monkeypatch) -> None:
         return torch.full((6, 8), 7.0), tags
 
     monkeypatch.setattr(pipe, "encode_prompt", encode_prompt, raising=False)
-    state = _hold_state(chunk_index=_NUM_PHASES, applied_version=1)
+    state = _hold_state(chunk_index=2 * _NUM_PHASES, applied_version=1)
     pipe.prepare_next_chunk(state)
     state.extra["taomate_hold_since"] -= 1.0
     with pytest.raises(_RequestStartedError):
