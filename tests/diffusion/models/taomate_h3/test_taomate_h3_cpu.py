@@ -272,7 +272,7 @@ def _tiny_transformer() -> nn.Module:
         attn.out_proj = _TupleLinear(inner, arch.hidden_size, bias=False)
         mlp = nn.Module()
         mlp.fc1 = _TupleLinear(arch.hidden_size, 2 * arch.ffn_hidden_size, bias=False)
-        mlp.fc2 = _TupleLinear(arch.hidden_size, arch.hidden_size, bias=False)
+        mlp.fc2 = _TupleLinear(arch.hidden_size, 2 * arch.ffn_hidden_size, bias=False)
         parent.add_module("attn", attn)
         parent.add_module("mlp", mlp)
     return model
