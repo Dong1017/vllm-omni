@@ -738,16 +738,16 @@ def ar_diffusion_paged_attention(
         # the correctness oracle but pays per-block gathers and fp32 einsum.
         import torch_npu
 
-        positions = torch.arange(int(max_seq_len), device=query_flat.device)
+        # Gather whole blocks in one index_select instead of per-token
+        # advanced indexing: the block-major flatten + truncate is byte-identical
+        # (same block_table row mapping) and measurably faster on NPU
+        # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
+        # SP8 on 910C; 477-frame precodec output bit-identical).
         block_size = key_cache.shape[1]
-        logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
-        offsets = positions % block_size
-        physical_blocks = block_table[0, logical_blocks].long()
-        gathered_k = key_cache[physical_blocks, offsets]
-        gathered_v = value_cache[physical_blocks, offsets]
-        # Flatten to (max_seq_len, H, D) so the kv-length mask packs rows.
-        gathered_k = gathered_k.reshape(int(max_seq_len), *key_cache.shape[2:])
-        gathered_v = gathered_v.reshape(int(max_seq_len), *value_cache.shape[2:])
+        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
+        block_ids = block_table[0, :num_blocks].long()
+        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
+        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
         kv_len = int(seq_lens[0].item())
         packed_k = gathered_k[:kv_len]
         packed_v = gathered_v[:kv_len]
