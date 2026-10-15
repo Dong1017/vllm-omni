@@ -24,30 +24,6 @@ class CachedProjection(nn.Module):
         self.values.clear()
 
 
-class FixedStageCondition(nn.Module):
-    """S=T+1 gives this rank one timestep and immutable text per request.
-
-    The harness checks every planned task's stage before installing this.
-    Serial/mixed-stage execution must use the original condition embedder.
-    """
-
-    def __init__(self, base):
-        super().__init__()
-        self.base = base
-        self.text = self.value = None
-
-    def forward(self, timestep, encoder_hidden_states, encoder_hidden_states_image=None, timestep_seq_len=None):
-        if encoder_hidden_states_image is not None or timestep_seq_len is not None:
-            raise ValueError("fixed-stage cache supports single Wan T2V conditioning")
-        if self.value is None or self.text is not encoder_hidden_states:
-            self.text = encoder_hidden_states
-            self.value = self.base(timestep, encoder_hidden_states, None, timestep_seq_len=None)
-        return self.value
-
-    def clear(self):
-        self.text = self.value = None
-
-
 class FusedNativeBlock(nn.Module):
     def __init__(self, base):
         super().__init__()
@@ -86,16 +62,13 @@ def optimized(model, variant):
     if variant not in ("cached", "fused"):
         raise ValueError("unknown native optimization")
     wan = model.wan
-    condition = wan.condition_embedder
-    cached_condition = FixedStageCondition(condition)
-    modules = [cached_condition]
+    modules = []
     blocks = []
     for index in range(model.start_layer, model.end_layer):
         block = wan.blocks[index]
         projections = {name: getattr(block.attn2, name) for name in ("to_k", "to_v", "norm_k")}
         blocks.append((index, block, projections))
     try:
-        wan.condition_embedder = cached_condition
         for index, block, projections in blocks:
             for name, projection in projections.items():
                 wrapper = CachedProjection(projection)
@@ -105,7 +78,6 @@ def optimized(model, variant):
                 wan.blocks[index] = FusedNativeBlock(block)
         yield modules
     finally:
-        wan.condition_embedder = condition
         for index, block, projections in blocks:
             wan.blocks[index] = block
             for name, projection in projections.items():

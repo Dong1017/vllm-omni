@@ -167,9 +167,6 @@ def main():
         kv_group = dist.new_group(ranks=list(range(world)), backend="nccl")
         reference = args.expected_sha
         groups = []
-        for slot in range(plan.num_slots):
-            task = plan.task(slot, rank)
-            assert task is None or task[1] == rank // args.groups, "condition cache requires a fixed stage"
         producer = args.steps * args.groups - 1
         for group, variant in enumerate(args.variants):
             rows = []

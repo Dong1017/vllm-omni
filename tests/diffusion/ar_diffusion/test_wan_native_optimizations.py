@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from benchmarks.ar_diffusion.native_optimizations import CachedProjection, FixedStageCondition, optimized
+from benchmarks.ar_diffusion.native_optimizations import CachedProjection, optimized
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -21,16 +21,6 @@ class CountingProjection(nn.Module):
         return value * 2
 
 
-class CountingCondition(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.calls = 0
-
-    def forward(self, timestep, text, image=None, timestep_seq_len=None):
-        self.calls += 1
-        return text + timestep
-
-
 class AdapterStage(nn.Module):
     """Minimal module graph exercising adapter installation, not model math."""
 
@@ -38,7 +28,7 @@ class AdapterStage(nn.Module):
         super().__init__()
         self.start_layer, self.end_layer = 0, 1
         self.wan = nn.Module()
-        self.wan.condition_embedder = CountingCondition()
+        self.wan.condition_embedder = nn.Identity()
         block = nn.Module()
         block.attn2 = nn.Module()
         for name in ("to_k", "to_v", "norm_k"):
@@ -62,29 +52,6 @@ def test_projection_cache_uses_identity_and_expires_at_request_boundary():
     assert base.calls == 3
 
 
-def test_condition_cache_expires_between_requests_and_tracks_text_identity():
-    base = CountingCondition()
-    cached = FixedStageCondition(base)
-    text, timestep = torch.tensor([1.0]), torch.tensor([2.0])
-    first = cached(timestep, text)
-    assert cached(timestep, text) is first
-    assert base.calls == 1
-    assert torch.equal(cached(timestep, text.clone()), first)
-    assert base.calls == 2
-    cached.clear()
-    assert torch.equal(cached(torch.tensor([4.0]), text), torch.tensor([5.0]))
-    assert base.calls == 3
-
-
-@pytest.mark.parametrize("extra", ["image", "sequence"])
-def test_condition_cache_rejects_unsupported_conditioning(extra):
-    cached = FixedStageCondition(CountingCondition())
-    image = torch.zeros(1) if extra == "image" else None
-    seq_len = 1 if extra == "sequence" else None
-    with pytest.raises(ValueError, match="single Wan T2V conditioning"):
-        cached(torch.zeros(1), torch.zeros(1), image, seq_len)
-
-
 @pytest.mark.parametrize("variant", ["cached", "fused"])
 @pytest.mark.parametrize("abort", [False, True])
 def test_scoped_optimizations_restore_original_modules_on_exit(variant, abort):
@@ -95,8 +62,8 @@ def test_scoped_optimizations_restore_original_modules_on_exit(variant, abort):
 
     def run():
         with optimized(stage, variant) as caches:
-            assert stage.wan.condition_embedder is not condition
-            assert len(caches) == 4
+            assert stage.wan.condition_embedder is condition
+            assert len(caches) == 3
             for name in originals:
                 assert isinstance(getattr(block.attn2, name), CachedProjection)
             if abort:

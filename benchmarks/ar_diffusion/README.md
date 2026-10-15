@@ -5,7 +5,7 @@ Latest KV selection, experimental FlowEuler sampler and paged FlashAttention fro
 [PR #8282](https://github.com/vllm-project/vllm-omni/pull/8282).
 It publishes KV per transformer block using CUDA IPC on the same host and
 NCCL between hosts. Native attention, model weights and sampling stay in use.
-The fused variant also caches request-local conditioning projections and
+The fused variant also caches request-local text K/V projections and
 preserves eager BF16 rounding in gated residual kernels. Normalization and
 modulation use the native AdaLayerNorm, including its CUDA fusion.
 
@@ -93,8 +93,9 @@ python -m torch.distributed.run --standalone --nproc-per-node=4 \
 ```
 
 Run from the checkout root and use a distinct output directory for each
-topology or source revision. `hybrid` enables the transport and conditioning
-cache without pointwise fusion; `cached` enables only the conditioning cache.
+topology or source revision. `hybrid` enables the transport and text K/V
+projection cache without pointwise fusion; `cached` enables only that cache.
+Condition embeddings use the native per-step cache from PR #8282.
 Only Latest-KV with one fixed denoise/clean stage per rank is supported.
 Each scheduled cell and its attention context refer to one transformer block;
 the hybrid ring indexes the native plan without expanding the schedule again.
@@ -163,7 +164,8 @@ plugins cannot load, add `--noconftest` and omit `--run-level`.
 
 ### CausVid/cell validation (October 15)
 
-On four H200 GPUs with dependency `80d6d53`, BF16, T3/S4/G1, shift8, q3/H6,
+On four H200 GPUs with dependency `80d6d53` and benchmark `a54c13cd1`, BF16,
+T3/S4/G1, shift8, q3/H6,
 128 chunks and skip64/measure32, one warmup plus three measured requests gave:
 
 | Variant | Median DiT FPS | KV reservation per rank |
@@ -178,6 +180,11 @@ The fused block now reuses native AdaLayerNorm; bypassing its CUDA path had
 caused a hash mismatch. This is single-node DiT validation, not E2E or DMD parity.
 Raw events, source snapshots and the independent timing/hash audit are under
 `/data/dxw/outputs/pr8728-causvid-cell-20261015/results/` on the validation host.
+
+A subsequent cleanup removed the redundant condition-embedding wrapper:
+20 CPU checks and a two-GPU T1/G1 before/after smoke passed, with all eight
+complete outputs matching across the four variants. The performance table
+remains bound to `a54c13cd1`.
 
 ### Historical RF validation (October 10)
 
