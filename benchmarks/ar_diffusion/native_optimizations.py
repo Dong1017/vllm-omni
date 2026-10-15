@@ -60,27 +60,21 @@ class FusedNativeBlock(nn.Module):
     def forward(self, hidden, text, temb, rotary, mask=None, vsa_shape=None, preserve_vsa=False):
         if temb.ndim != 3 or mask is not None or vsa_shape is not None or preserve_vsa:
             raise ValueError("pointwise benchmark fusion supports native Wan T2V only")
-        from .native_pointwise import modulation, residual
+        from .native_pointwise import residual
 
         block = self.base
         shift, scale, gate, ff_shift, ff_scale, ff_gate = (block.scale_shift_table + temb).chunk(6, dim=1)
-
-        def norm(module, value, scale, shift):
-            normalized = module.layernorm(value)
-            if normalized.dtype == scale.dtype == shift.dtype == torch.bfloat16:
-                return modulation(normalized, scale, shift).type_as(value)
-            return (normalized * (1 + scale) + shift).type_as(value)
 
         def add(value, delta, gate):
             if value.dtype == delta.dtype == gate.dtype == torch.bfloat16:
                 return residual(value, delta, gate)
             return (value + delta * gate).type_as(value)
 
-        normalized = norm(block.norm1, hidden, scale, shift)
+        normalized = block.norm1(hidden, scale, shift).type_as(hidden)
         # StageWanTransformer's paged self-attention hook ignores metadata.
         hidden = add(hidden, block.attn1(normalized, rotary, None), gate)
         hidden = hidden + block.attn2(block.norm2(hidden).type_as(hidden), text, None)
-        normalized = norm(block.norm3, hidden, ff_scale, ff_shift)
+        normalized = block.norm3(hidden, ff_scale, ff_shift).type_as(hidden)
         return add(hidden, block.ffn(normalized), ff_gate)
 
 

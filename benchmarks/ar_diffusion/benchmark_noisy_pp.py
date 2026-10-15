@@ -21,10 +21,12 @@ from safetensors import safe_open
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=Path, required=True)
+    p.add_argument("--causvid-ckpt", type=Path, required=True)
     p.add_argument("--condition", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--groups", type=int, choices=[1, 2], default=2)
-    p.add_argument("--steps", type=int, choices=[4], default=4)
+    p.add_argument("--groups", type=int, choices=[1, 2], default=1)
+    p.add_argument("--steps", type=int, default=3)
+    p.add_argument("--shift", type=float, default=8.0)
     p.add_argument("--chunks", type=int, default=128)
     p.add_argument("--skip", type=int, default=64)
     p.add_argument("--measure", type=int, default=32)
@@ -43,18 +45,21 @@ def main():
         files += [
             root / name
             for name in (
-                "vllm_omni/diffusion/models/waveserve_wan/transformer.py",
+                "vllm_omni/diffusion/models/causvid_wan/transformer.py",
+                "vllm_omni/diffusion/models/causvid_wan/wan_cell.py",
+                "vllm_omni/diffusion/models/causvid_wan/weights.py",
                 "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
-                "vllm_omni/experimental/ar_diffusion/chunk_executor.py",
-                "vllm_omni/experimental/ar_diffusion/chunk_schedule.py",
+                "vllm_omni/diffusion/layers/adalayernorm.py",
+                "vllm_omni/diffusion/layers/norm.py",
+                "vllm_omni/experimental/ar_diffusion/cell_executor.py",
+                "vllm_omni/experimental/ar_diffusion/cell_schedule.py",
+                "vllm_omni/experimental/ar_diffusion/flow_euler.py",
                 "vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py",
                 "vllm_omni/experimental/ar_diffusion/kv_cache/paged_attention.py",
             )
         ]
         manifest = {}
         for file in files:
-            if not file.is_file():
-                continue
             relative = file.relative_to(root)
             dst = args.out / "source_snapshot" / relative
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -65,6 +70,8 @@ def main():
         (args.out / "source_snapshot/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     if world != (args.steps + 1) * args.groups:
         p.error("world must equal (steps + clean) times groups")
+    if args.steps < 1 or args.shift <= 0:
+        p.error("steps and shift must be positive")
     if args.warmup < 0 or args.repeat < 1 or args.measure < 1:
         p.error("warmup must be nonnegative; repeat and measure must be positive")
     if args.skip < 1 or args.skip + args.measure > args.chunks:
@@ -76,15 +83,17 @@ def main():
     device = torch.device("cuda", local_rank)
     from vllm.config.vllm import set_current_vllm_config
     from vllm.utils.torch_utils import set_default_torch_dtype
-    from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import FlowEuler, _LatentChunkAdapter
-    from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
-    from vllm_omni.experimental.ar_diffusion.chunk_executor import (
-        ARDiffusionChunkContext,
-        ChunkRunSpec,
-        ChunkTopology,
-        run_chunk_pipeline,
+    from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
+    from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+    from vllm_omni.diffusion.models.causvid_wan.weights import causvid_pt_to_diffusers_state
+    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+        ARDiffusionCellContext,
+        CellRunSpec,
+        CellTopology,
+        run_cell_pipeline,
     )
-    from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
+    from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+    from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
     from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -101,7 +110,7 @@ def main():
     od = OmniDiffusionConfig(
         model=str(args.model),
         dtype=torch.bfloat16,
-        model_class_name="WaveServeWanPipeline",
+        model_class_name="CausVidWanPipeline",
         num_gpus=world,
         enforce_eager=True,
         parallel_config=DiffusionParallelConfig(pipeline_parallel_size=world),
@@ -132,15 +141,25 @@ def main():
                         yield key, f.get_tensor(key)
 
         model.load_weights(weights())
+        model.load_weights(causvid_pt_to_diffusers_state(args.causvid_ckpt).items())
         model.eval().requires_grad_(False)
         shape = (1, 16, 3, 60, 104)
         tokens = model.seq_len_for_latent(shape)
         kv_spec = ARDiffusionNoisyKVSpec(model.local_num_layers, 12, 128, tokens, tokens, 6)
         prompt = torch.load(args.condition, map_location="cpu", weights_only=True)["text"].to(device)
         pp = get_pp_group()
-        sampler = FlowEuler(args.steps, shift=5.0)
-        plan = build_chunk_plan(
-            ChunkSchedule(args.chunks, args.steps, args.steps + 1, args.groups, Ordering.INTERLEAVED, 6)
+        sampler = FlowEuler(args.steps, shift=args.shift)
+        plan = build_cell_plan(
+            CellSchedule(
+                args.chunks,
+                args.steps,
+                args.steps + 1,
+                args.groups,
+                Ordering.LATEST_KV,
+                6,
+                blocks=model.num_layers,
+                blocks_per_rank=model.local_num_layers,
+            )
         )
         from benchmarks.ar_diffusion.hybrid_kv import HybridNoisyKVState, native_hybrid_attention
         from benchmarks.ar_diffusion.native_optimizations import optimized
@@ -166,6 +185,8 @@ def main():
                     layer_groups=args.groups,
                     max_batch_size=1,
                     stages=args.steps + 1,
+                    layer_offset=model.start_layer,
+                    blocks_per_rank=model.local_num_layers,
                 )
             )
             with ExitStack() as scopes:
@@ -181,8 +202,8 @@ def main():
                         if hybrid
                         else NoisyKVState(kv)
                     )
-                    ctx = ARDiffusionChunkContext(
-                        ChunkRunSpec(ChunkTopology(args.steps + 1, args.groups), 1, rank, pp), state
+                    ctx = ARDiffusionCellContext(
+                        CellRunSpec(CellTopology(args.steps + 1, args.groups), 1, rank, pp), state
                     )
                     request = f"benchmark-{index}"
                     ctx.enqueue(request, plan, chunk_tokens=tokens)
@@ -195,7 +216,7 @@ def main():
                         events.append(event)
                         latents.append(latent.detach())
 
-                    adapter = _LatentChunkAdapter(
+                    adapter = WanCell(
                         model,
                         sampler=sampler,
                         prompt_embeds=prompt,
@@ -212,7 +233,7 @@ def main():
                         forward.enter_context(torch.inference_mode())
                         if hybrid:
                             forward.enter_context(native_hybrid_attention(state))
-                        run_chunk_pipeline(ctx=ctx, adapter=adapter)
+                        run_cell_pipeline(ctx=ctx, adapter=adapter)
                     current_omni_platform.synchronize()
                     dist.barrier()
                     seconds = time.perf_counter() - start
@@ -270,8 +291,12 @@ def main():
             if rank == producer:
                 samples = [r["steady_fps"] for r in rows if not r["warmup"]]
                 result = dict(
-                    implementation="native vLLM-Omni PR8282 chunk executor; external torchrun harness",
+                    implementation="native vLLM-Omni PR8282 cell executor; external torchrun harness",
                     boundary="pure DiT CUDA completion, preencoded text, no VAE/codec/frontend",
+                    model=str(args.model.resolve()),
+                    causvid_ckpt=str(args.causvid_ckpt.resolve()),
+                    sampler="experimental FlowEuler",
+                    shift=args.shift,
                     steps=args.steps,
                     groups=args.groups,
                     k=30 // args.groups,

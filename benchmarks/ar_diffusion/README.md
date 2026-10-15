@@ -1,12 +1,13 @@
-# Noisy PP: Wan RF chunk benchmark
+# Noisy PP: CausVid Wan DiT benchmark
 
-This opt-in harness runs the native `StageWanTransformer`, chunk executor,
-Latest KV selection, RF Flow Euler sampler and paged FlashAttention from
+This opt-in harness runs the native `StageWanTransformer`, cell executor,
+Latest KV selection, experimental FlowEuler sampler and paged FlashAttention from
 [PR #8282](https://github.com/vllm-project/vllm-omni/pull/8282).
 It publishes KV per transformer block using CUDA IPC on the same host and
 NCCL between hosts. Native attention, model weights and sampling stay in use.
 The fused variant also caches request-local conditioning projections and
-preserves eager BF16 rounding in modulation and gated residual kernels.
+preserves eager BF16 rounding in gated residual kernels. Normalization and
+modulation use the native AdaLayerNorm, including its CUDA fusion.
 
 These are benchmark-scoped adapters, installed and restored by context
 managers. The diffusion frontend does not gain a multinode serving executor.
@@ -15,20 +16,20 @@ concurrent serving or VAE/end-to-end video throughput.
 
 ## Reproduce
 
-This benchmark depends on the native chunk APIs in PR #8282. Until that PR
+This benchmark depends on the native cell APIs in PR #8282. Until that PR
 lands, apply this draft's benchmark commits to the pinned dependency in a
 disposable development checkout. Start from this draft branch:
 
 ```bash
 benchmark_head=$(git rev-parse HEAD)
 git fetch https://github.com/vllm-project/vllm-omni.git refs/pull/8282/head
-git switch -c codex/wan-benchmark-reproduce 86490babe358740cf98f019d1972f3b364a329d4
+git switch -c codex/wan-benchmark-reproduce 80d6d53c3a5994dd5b86b157b042bd89d131c447
 git cherry-pick "e4af781dc71ffdf6962c469aaa6a8b87ab7908f6..${benchmark_head}"
 ```
 
 The benchmark and `test_wan_hybrid_kv.py` require that combined checkout;
-`main` alone does not yet provide the dependency's native chunk APIs.
-This reproduces the archived dependency without merging later `main` changes.
+`main` alone does not yet provide the dependency's native cell APIs.
+This pins the reviewed CausVid dependency without merging later `main` changes.
 Later dependency revisions need separate compatibility validation.
 
 Use a Linux/CUDA environment compatible with the PR #8282 branch, with vLLM,
@@ -36,14 +37,17 @@ PyTorch, paged FlashAttention, Triton, `safetensors` and `cuda.bindings` install
 The tested environments and raw measurements are linked under
 [Recorded validation](#recorded-validation).
 
-`OMNI_MODEL` must point to the complete Wan 2.1 1.3B RF Diffusers model root,
+`OMNI_MODEL` must point to the complete `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` root,
 including `transformer/config.json` and transformer safetensors. Passing only
 the transformer directory is unsupported. The model configuration must have
 30 blocks, 12 attention heads and head size 128.
 
-Supply a locally available checkpoint matching this RF contract. The benchmark
-does not release model weights or assume a public model ID. Runtime module
-paths and pipeline registration follow the pinned dependency in PR #8282.
+Set `CAUSVID_CKPT` to the locally downloaded `tianweiy/CausVid`
+`autoregressive_checkpoint/model.pt`. The native remapper overlays the student
+after loading the Diffusers DiT shell. Both variants use identical weights.
+Runtime module paths and pipeline registration follow the pinned dependency.
+The default is T=3 plus one clean stage, shift=8. This uses the dependency's
+experimental FlowEuler path; it does not implement official DMD sampling parity.
 
 The compressed fixture contains BF16 T5 embeddings for `a cat walking on grass`,
 shape `[1,512,4096]`. It excludes T5 loading and encoding from DiT measurements.
@@ -60,36 +64,40 @@ first node's reachable address, `OMNI_CONDITION` to the expanded fixture path,
 and `OMNI_OUTPUT` to an empty shared results directory. Run on both nodes:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
 NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=0 \
 python -m torch.distributed.run \
-  --nnodes=2 --nproc-per-node=5 --node-rank="$OMNI_NODE_RANK" \
+  --nnodes=2 --nproc-per-node=4 --node-rank="$OMNI_NODE_RANK" \
   --master-addr="$OMNI_MASTER_ADDR" --master-port=29879 \
   -m benchmarks.ar_diffusion.benchmark_noisy_pp \
-  --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
-  --groups 2 --steps 4 --chunks 128 --skip 64 --measure 32 \
+  --model "$OMNI_MODEL" --causvid-ckpt "$CAUSVID_CKPT" \
+  --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
+  --groups 2 --steps 3 --shift 8 --chunks 128 --skip 64 --measure 32 \
   --variants baseline hybrid_fused --warmup 1 --repeat 3
 ```
 
-Adjust the network interface to the actual deployment. Each node uses five
-GPUs; the stage-major placement has five stages with two block partitions per
+Adjust the network interface to the actual deployment. Each node uses four
+GPUs; the stage-major placement has four stages with two block partitions per
 stage (`K=15`). CUDA IPC requires distinct physical GPUs for local ranks.
 
 For one node (`K=30`), use:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
-python -m torch.distributed.run --standalone --nproc-per-node=5 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
   -m benchmarks.ar_diffusion.benchmark_noisy_pp \
-  --model "$OMNI_MODEL" --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
-  --groups 1 --steps 4 --chunks 128 --skip 64 --measure 32 \
+  --model "$OMNI_MODEL" --causvid-ckpt "$CAUSVID_CKPT" \
+  --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
+  --groups 1 --steps 3 --shift 8 --chunks 128 --skip 64 --measure 32 \
   --variants baseline hybrid_fused --warmup 1 --repeat 3
 ```
 
 Run from the checkout root and use a distinct output directory for each
 topology or source revision. `hybrid` enables the transport and conditioning
 cache without pointwise fusion; `cached` enables only the conditioning cache.
-Only the four-denoise-step plus clean contract is accepted by this harness.
+Only Latest-KV with one fixed denoise/clean stage per rank is supported.
+Each scheduled cell and its attention context refer to one transformer block;
+the hybrid ring indexes the native plan without expanding the schedule again.
 
 ## Timing and output contract
 
@@ -113,7 +121,7 @@ output after timing. All variants and repeats must match the supplied hash
 or the first request's hash. Latest KV semantics depend on `K`, so hashes are
 compared within a topology rather than across `K=15` and `K=30`.
 
-The hybrid ring has `(history+1) * stages = 35` version positions per layer;
+The default hybrid ring has `(history+1) * stages = 28` version positions per layer;
 it owns the only KV pool in hybrid runs. The baseline allocates its native
 version pool separately. `kv_capacity` reports version positions per layer
 for the selected pool, identified by `kv_pool`; `kv_reserved_bytes` includes
@@ -124,7 +132,7 @@ requests keep mappings alive until the worker job exits.
 
 Source snapshots, per-request events and hashes, GPU memory statistics and
 median summaries are written under the output directory. Per-block transport
-rounds and read labels derive directly from the native `ChunkPlan`; no second
+rounds and read labels derive directly from the native `CellPlan`; no second
 scheduler or general KV manager is included. Original transport
 source attribution and adaptation hashes are listed in
 [provenance.json](provenance.json).
@@ -152,6 +160,29 @@ the selected Omni branch. For isolated unit/kernel checks when those unrelated
 plugins cannot load, add `--noconftest` and omit `--run-level`.
 
 ## Recorded validation
+
+### CausVid/cell validation (October 15)
+
+On four H200 GPUs with dependency `80d6d53`, BF16, T3/S4/G1, shift8, q3/H6,
+128 chunks and skip64/measure32, one warmup plus three measured requests gave:
+
+| Variant | Median DiT FPS | KV reservation per rank |
+| --- | ---: | ---: |
+| Native baseline | 129.320568 | 8.03 GiB |
+| `hybrid_fused` | 138.301577 (+6.94%) | 22.49 GiB |
+
+All eight complete latent hashes matched. The 23 CPU contracts and 3 CUDA
+kernel checks passed. Eight-chunk smokes also passed for all four variants
+at T3/G1 and for baseline/hybrid_fused at T1/G2 (four GPUs in both cases).
+The fused block now reuses native AdaLayerNorm; bypassing its CUDA path had
+caused a hash mismatch. This is single-node DiT validation, not E2E or DMD parity.
+Raw events, source snapshots and the independent timing/hash audit are under
+`/data/dxw/outputs/pr8728-causvid-cell-20261015/results/` on the validation host.
+
+### Historical RF validation (October 10)
+
+The following measurements used the earlier RF checkpoint, T=4, shift=5 and
+chunk APIs, rather than the current CausVid benchmark.
 
 Independent five-H200 validation measured baseline **120.589275 DiT FPS** and
 `hybrid_fused` **133.678281 DiT FPS** (+10.85%), with matching full latent hashes

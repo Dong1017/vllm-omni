@@ -7,7 +7,7 @@ from collections import defaultdict
 import pytest
 import torch
 from torch import nn
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
+from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from benchmarks.ar_diffusion import hybrid_transport
@@ -19,28 +19,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("groups", [1, 2])
-@pytest.mark.parametrize("steps", [4, 5])
+@pytest.mark.parametrize("steps", [3, 4])
 @pytest.mark.parametrize("chunks", [1, 7, 128])
 def test_block_rounds_preserve_native_sources_and_last_reader(groups, steps, chunks):
-    native = build_chunk_plan(ChunkSchedule(chunks, steps, steps + 1, groups, Ordering.INTERLEAVED, 6))
-    plan = BlockPlan(native, 30)
+    native = build_cell_plan(
+        CellSchedule(chunks, steps, steps + 1, groups, Ordering.LATEST_KV, 6, blocks=30, blocks_per_rank=30 // groups)
+    )
+    plan = BlockPlan(native)
     assert len(plan.by_key) == chunks * (steps + 1) * 30
     consumers = defaultdict(list)
     for key, task in plan.by_key.items():
-        slot = task.tick // plan.blocks_per_rank
-        assert native.task(slot, task.rank) == (key.chunk, key.step)
-        assert native.completion_slot((key.chunk, key.step), task.rank % groups) == slot
-        sources = native.sources((key.chunk, key.step), task.rank)
-        assert plan.reads[task] == tuple(KVKey(*source.version, key.block) for source in sources)
+        cell = (key.chunk, key.step, key.block)
+        assert native.task(task.tick, task.rank) == cell
+        assert native.completion_tick(cell) == task.tick
+        sources = native.sources(cell, task.rank)
+        assert plan.reads[task] == tuple(KVKey(*source.version) for source in sources)
         for source, selected in zip(sources, plan.reads[task]):
             assert plan.owner(selected) == source.owner
             assert plan.by_key[selected].tick < task.tick
             consumers[selected, task.rank].append(task)
     for key, destinations in plan.destinations.items():
-        producer_slot = plan.by_key[key].tick // plan.blocks_per_rank
+        producer_slot = plan.by_key[key].tick
         for rank, last in destinations.items():
             latest = max(consumers[key, rank], key=lambda task: task.tick).key
-            assert last == (latest.chunk, latest.step)
+            assert last == (latest.chunk, latest.step, latest.block)
             assert native.task(producer_slot, rank) is not None
 
 
@@ -71,7 +73,7 @@ def test_hybrid_state_constructor_does_not_allocate_a_second_kv_pool(monkeypatch
     monkeypatch.setattr(torch, "empty", unexpected_allocation)
     state = HybridNoisyKVState(spec, nn.Module(), None, torch.device("cpu"), torch.bfloat16)
     assert state.pages is None and state.reserved_bytes == 0
-    native = build_chunk_plan(ChunkSchedule(7, 4, 5, 2, Ordering.INTERLEAVED, 6))
+    native = build_cell_plan(CellSchedule(7, 3, 4, 2, Ordering.LATEST_KV, 6, blocks=30, blocks_per_rank=15))
     with pytest.raises(ValueError, match="chunk tokens"):
         state.begin_request("invalid", native, chunk_tokens=0)
     assert not state._chunk_tokens

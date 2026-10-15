@@ -255,8 +255,8 @@ class LayerMajorPages:
                     raise RuntimeError(f"remote page missing from producer round: {key}")
                 current.wait_event(self.remote_ready[key])
 
-    def release(self, key, chunk, step):
-        if self.all_destinations(key)[self.rank] != (chunk, step):
+    def release(self, key, reader):
+        if self.all_destinations(key)[self.rank] != reader:
             return
         if not self.local_peer(self.plan.owner(key)):
             self.remote_ready.pop(key)

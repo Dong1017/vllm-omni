@@ -15,6 +15,8 @@ from .hybrid_transport import LayerMajorPages
 class HybridNoisyKVState:
     """Single-request executor adapter; owns only the hybrid ring, no native pool."""
 
+    uses_comm_stream = False
+
     def __init__(self, spec, model, group, device, dtype):
         self.spec, self.model, self.group = spec, model, group
         self.device, self.dtype = device, dtype
@@ -40,7 +42,7 @@ class HybridNoisyKVState:
         if chunk_tokens <= 0 or chunk_tokens % spec.block_size or chunk_tokens > spec.max_chunk_tokens:
             raise ValueError("chunk tokens do not fit the KV specification")
         self._chunk_tokens[req] = chunk_tokens
-        self.plan = BlockPlan(plan, self.model.num_layers)
+        self.plan = BlockPlan(plan)
         groups, stages = plan.schedule.layer_groups, plan.schedule.stages
         self.pages = LayerMajorPages(self.plan, spec, chunk_tokens, self.device, self.dtype, self.group)
         push = self.pages
@@ -49,28 +51,26 @@ class HybridNoisyKVState:
             push.buffers.numel() * push.buffers.element_size() + push.flags.numel() * push.flags.element_size()
         )
         device = push.device
+
+        def gpu(values, dtype):
+            return torch.tensor(values, dtype=dtype).pin_memory().to(device, non_blocking=True)
+
+        query_locs = gpu([0, chunk_tokens], torch.int32)
+        width = spec.max_history_chunks + 1
         for chunk in range(plan.schedule.chunks):
             step = self._rank // groups
-            task = self.plan.task(chunk, step, self.model.start_layer)
-            keys = self.plan.reads[task]
-            ids = [k.chunk % push.capacity * stages + k.step for k in keys]
             write = chunk % push.capacity * stages + step
-            ids.append(write)
-            width = spec.max_history_chunks + 1
-
-            def gpu(values, dtype):
-                return torch.tensor(values, dtype=dtype).pin_memory().to(device, non_blocking=True)
-
-            table = gpu([ids + [0] * (width - len(ids))], torch.int32)
-            seq_len = len(ids) * chunk_tokens
-            seq_lens = gpu([seq_len], torch.int32)
-            query_locs = gpu([0, chunk_tokens], torch.int32)
             slots = torch.arange(chunk_tokens, device=device, dtype=torch.long) + write * chunk_tokens
-            contexts = []
             for local in range(self.model.local_num_layers):
+                block = self.model.start_layer + local
+                task = self.plan.task(chunk, step, block)
+                ids = [k.chunk % push.capacity * stages + k.step for k in self.plan.reads[task]] + [write]
+                table = gpu([ids + [0] * (width - len(ids))], torch.int32)
+                seq_len = len(ids) * chunk_tokens
+                seq_lens = gpu([seq_len], torch.int32)
                 pools = [push.buffers[local, field].view(-1, spec.num_kv_heads, spec.head_size) for field in range(2)]
                 assert all(value.is_contiguous() for value in pools)
-                contexts.append(
+                self.prepared[chunk, step, block] = [
                     NoisyLayerContext(
                         local,
                         pools[0],
@@ -84,18 +84,20 @@ class HybridNoisyKVState:
                         width * chunk_tokens,
                         seq_len,
                     )
-                )
-            self.prepared[chunk] = contexts
+                ]
+
+    def await_task_sources(self, tasks):
+        # Publish this cell's KV before waiting for history inside attend().
+        return 0
 
     def prepare(self, tasks):
         if len(tasks) != 1:
-            raise ValueError("hybrid benchmark requires one chunk per slot")
+            raise ValueError("hybrid benchmark requires one cell per slot")
         _, self.current = tasks[0]
-        return [self.prepared[self.current[0]]]
+        return [self.prepared[self.current]]
 
     def attend(self, original, inputs, query, key, value, *args, **kwargs):
-        chunk, step = self.current
-        block = self.model.start_layer + int(inputs.layer_idx)
+        chunk, step, block = self.current
         task = self.plan.task(chunk, step, block)
         push = self.pages
         push.prepare_round(self.plan.by_tick[task.tick])
@@ -107,7 +109,7 @@ class HybridNoisyKVState:
         output = original(inputs, query, key, value, *args, **kwargs)
         for previous in reads:
             # Releases are on the attention stream, after FA3 has read the page.
-            push.release(previous, chunk, step)
+            push.release(previous, self.current)
         push.commit_round()
         return output
 
@@ -150,7 +152,7 @@ class HybridNoisyKVState:
 
 @contextmanager
 def native_hybrid_attention(state):
-    from vllm_omni.diffusion.models.waveserve_wan import transformer
+    from vllm_omni.diffusion.models.causvid_wan import transformer
 
     original = transformer.paged_write_attn
     transformer.paged_write_attn = lambda *a, **k: state.attend(original, *a, **k)
