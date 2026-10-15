@@ -243,9 +243,6 @@ class _Session:
         # The next request's noise draws, produced off the measured path (see
         # prepare_ahead): the in-flight thread and its one-shot status.
         self._noise_thread: threading.Thread | None = None
-        # Per-session clean-commit graph: the commit's stage writes land in this
-        # session's cache buffers, so captured kernels are session-private.
-        self.commit_graph: GraphedForward | None = None
         # Timing bookkeeping (taomate_h3_log_timings): the last phase
         # preparation and the wall-clock end of the last logged phase.
         self.prepare_seconds = 0.0
@@ -507,9 +504,6 @@ class _Session:
         self.renorm_anchor = None
         self.teacher_previous_clean = None
         self.teacher_previous_count = None
-        # The captured kernels write this session's cache buffers; drop the
-        # graphs so the pools free with the session.
-        self.commit_graph = None
 
 
 def use_cuda_fp8_activation_quant(module: torch.nn.Module) -> int:
@@ -659,9 +653,6 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         # collectives stay outside the graph.
         self._tm_vae_cuda_graph = bool(model_config.get("taomate_h3_vae_cuda_graph", False))
         self._tm_vae_decode_graph: GraphedForward | None = None
-        # Graph the sigma-zero clean-commit forward per session: its stage
-        # writes land in this session's cache buffers (see _Session.close).
-        self._tm_commit_cuda_graph = bool(model_config.get("taomate_h3_commit_cuda_graph", False))
         # Profile one chunk (phase) with torch.profiler: the three student
         # forwards, the commit forward and the decode of chunk index
         # taomate_h3_profile_chunk; writes a kernel table and a Chrome trace
@@ -1675,30 +1666,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 stream_context(commit_ctx),
                 torch.inference_mode(),
             ):
-                commit_graph = session.commit_graph
-                if commit_graph is None and self._tm_commit_cuda_graph and self.device.type == "cuda":
-                    try:
-                        _, _, group = _ulysses_state()
-                    except Exception:  # noqa: BLE001 - single process or CPU tests have no distributed state
-                        group = None
-                    session.commit_graph = GraphedForward(
-                        self.transformer,
-                        device=self.device,
-                        max_entries=self._tm_cuda_graph_max_entries,
-                        group=group,
-                        name="TaoMate-H3 clean commit",
-                    )
-                    commit_graph = session.commit_graph
-                if commit_graph is not None and commit_graph.enabled:
-                    # Key by phase identity and the context's baked slice spans
-                    # (the attention slices q/k/v at host-int span bounds), so a
-                    # replay must hit the phase whose spans were captured.
-                    commit_graph(
-                        variant=(commit_ctx.seq_len, commit_ctx.condition_span, commit_ctx.media_span),
-                        **forward_kwargs,
-                    )
-                else:
-                    self.transformer(**forward_kwargs)
+                self.transformer(**forward_kwargs)
             if self._tm_log_timings:
                 phase_state.timings["commit_launch"] = time.perf_counter() - commit_started
             cache.commit()
