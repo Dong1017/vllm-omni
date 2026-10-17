@@ -83,18 +83,6 @@ def main():
     device = torch.device("cuda", local_rank)
     from vllm.config.vllm import set_current_vllm_config
     from vllm.utils.torch_utils import set_default_torch_dtype
-    from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-    from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-    from vllm_omni.diffusion.models.causvid_wan.weights import causvid_pt_to_diffusers_state
-    from vllm_omni.experimental.ar_diffusion.cell_executor import (
-        ARDiffusionCellContext,
-        CellRunSpec,
-        CellTopology,
-        run_cell_pipeline,
-    )
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
-    from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
-    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
@@ -105,7 +93,19 @@ def main():
         initialize_model_parallel,
     )
     from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
+    from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+    from vllm_omni.diffusion.models.causvid_wan.weights import causvid_pt_to_diffusers_state
     from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+        ARDiffusionCellContext,
+        CellRunSpec,
+        CellTopology,
+        run_cell_pipeline,
+    )
+    from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+    from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
     od = OmniDiffusionConfig(
         model=str(args.model),
