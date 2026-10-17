@@ -16,23 +16,17 @@ concurrent serving or VAE/end-to-end video throughput.
 
 ## Reproduce
 
-This benchmark depends on the native cell APIs in PR #8282. Until that PR
-lands, apply this draft's benchmark commits to the pinned dependency in a
-disposable development checkout. Start from this draft branch:
+The native cell APIs from PR #8282 are merged into upstream `main` (merge
+commit `959b483cfb6e3cb72b35ca3992f46717d22a66e5`). This draft branch
+includes the merged dependency; no dependency cherry-pick is needed.
+From a local clone, fetch and check out the benchmark branch:
 
 ```bash
-benchmark_head=$(git rev-parse HEAD)
-git fetch https://github.com/vllm-project/vllm-omni.git refs/pull/8282/head
-git switch -c codex/wan-benchmark-reproduce 80d6d53c3a5994dd5b86b157b042bd89d131c447
-git cherry-pick "e4af781dc71ffdf6962c469aaa6a8b87ab7908f6..${benchmark_head}"
+git fetch https://github.com/vllm-project/vllm-omni.git pull/8728/head
+git switch -c codex/wan-benchmark-reproduce FETCH_HEAD
 ```
 
-The benchmark and `test_wan_hybrid_kv.py` require that combined checkout;
-`main` alone does not yet provide the dependency's native cell APIs.
-This pins the reviewed CausVid dependency without merging later `main` changes.
-Later dependency revisions need separate compatibility validation.
-
-Use a Linux/CUDA environment compatible with the PR #8282 branch, with vLLM,
+Use a Linux/CUDA environment compatible with this checkout, with vLLM,
 PyTorch, paged FlashAttention, Triton, `safetensors` and `cuda.bindings` installed.
 The tested environments and raw measurements are linked under
 [Recorded validation](#recorded-validation).
@@ -161,6 +155,18 @@ the selected Omni branch. For isolated unit/kernel checks when those unrelated
 plugins cannot load, add `--noconftest` and omit `--run-level`.
 
 ## Recorded validation
+
+### Post-merge compatibility (October 17)
+
+With upstream main `b164fea797531c1fa10f8b87829632cad006b9fc` (including
+merged PR #8282), 20 CPU checks and 3 CUDA BF16 kernel checks passed. A real
+four-H200 T3/S4/G1, shift8, eight-chunk smoke ran all four variants with clean
+process exits. All complete latent hashes matched
+`4e34a83a4592b47ed2341f31e61455635c0973efa98bad901065f2ec246e49d4`.
+This confirms compatibility after branch synchronization; it is not a new
+steady-throughput measurement. Runtime benchmark code is unchanged from
+`a93668047`. Evidence is under
+`/data/dxw/outputs/pr8728-postmerge-20261017/results/` on the validation host.
 
 ### CausVid/cell validation (October 15)
 
