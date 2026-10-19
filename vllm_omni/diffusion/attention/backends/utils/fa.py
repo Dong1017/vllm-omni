@@ -62,6 +62,9 @@ flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
 # FP8 descales are supported by vLLM's FA3 dispatcher and standalone FA3.
 FLASH_ATTN_SUPPORTS_FP8 = False
+# True when flash_attn_varlen_func above is vLLM's dispatcher, which ships both
+# FA2 and FA3 kernels and selects FA2 by default (see vllm_fa_version_for_device).
+FLASH_ATTN_VARLEN_FROM_VLLM = False
 IS_FLASH_ATTN_4 = False
 IS_AITER = False
 
@@ -122,6 +125,7 @@ else:
 
             flash_attn_varlen_func = _fa_varlen
             FLASH_ATTN_SUPPORTS_FP8 = True
+            FLASH_ATTN_VARLEN_FROM_VLLM = True
         except (ImportError, ModuleNotFoundError):
             pass
 
@@ -163,6 +167,24 @@ else:
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+def vllm_fa_version_for_device(device: torch.device) -> int | None:
+    """Return the FA version to request from vLLM's dispatcher for ``device``.
+
+    vLLM's dispatcher defaults to FA2 everywhere. Diffusion attention ran FA3
+    on Hopper through the dedicated fa3-fwd package before that dependency was
+    dropped, so reuse the ring-path version chooser to keep requesting FA3
+    where the bundled kernels support it (FA4 on Blackwell). Return None when
+    the resolved implementation is not vLLM's dispatcher (standalone packages
+    own their version) or no versioned kernel can be resolved.
+    """
+    if not FLASH_ATTN_VARLEN_FROM_VLLM or device.type != "cuda":
+        return None
+    try:
+        return resolve_vllm_flash_attn_version()
+    except (ImportError, RuntimeError):
+        return None
 
 
 def validate_fa4_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> bool:
