@@ -58,6 +58,54 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
 
 
+@pytest.mark.cpu
+def test_vllm_fa_version_for_device(monkeypatch):
+    """Only vLLM-dispatcher resolutions override the FA2 default, CUDA devices only."""
+    monkeypatch.setattr(fa, "FLASH_ATTN_VARLEN_FROM_VLLM", False)
+    assert fa.vllm_fa_version_for_device(torch.device("cuda")) is None
+
+    monkeypatch.setattr(fa, "FLASH_ATTN_VARLEN_FROM_VLLM", True)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+    assert fa.vllm_fa_version_for_device(torch.device("cuda")) == 3
+
+    def _raise(requested=None):
+        raise RuntimeError("no versioned kernel")
+
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", _raise)
+    assert fa.vllm_fa_version_for_device(torch.device("cuda")) is None
+
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+    assert fa.vllm_fa_version_for_device(torch.device("cpu")) is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("fa_version", [3, None])
+def test_varlen_dense_passes_resolved_fa_version(monkeypatch, fa_version):
+    """The dense varlen fallback forwards the resolved version to the dispatcher."""
+    calls = []
+
+    def fake_varlen_func(*, q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+    monkeypatch.setattr(fa, "vllm_fa_version_for_device", lambda device: fa_version)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    output = impl.forward_cuda(query, query, query, None)
+
+    assert output.shape == query.shape
+    assert len(calls) == 1
+    if fa_version is None:
+        assert "fa_version" not in calls[0]
+    else:
+        assert calls[0]["fa_version"] == fa_version
+
+
 def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
     batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
     query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)

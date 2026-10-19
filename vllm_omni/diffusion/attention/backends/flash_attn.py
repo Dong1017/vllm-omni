@@ -450,6 +450,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             _unpad_input,
             _upad_input,
             flash_attn_varlen_func,
+            vllm_fa_version_for_device,
         )
 
         if flash_attn_varlen_func is None:
@@ -471,6 +472,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_length_q = query_length
             indices_q = None
 
+        fa_version = vllm_fa_version_for_device(query.device)
         out_unpad = flash_attn_varlen_func(
             q,
             k,
@@ -482,6 +484,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             **{
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,
+                **({"fa_version": fa_version} if fa_version else {}),
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
@@ -508,6 +511,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_fa_version_for_device,
         )
 
         if flash_attn_varlen_func is None:
@@ -515,6 +519,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
             raise ValueError("Packed variable-length attention currently requires batch size 1")
 
+        fa_version = vllm_fa_version_for_device(query.device)
         out = flash_attn_varlen_func(
             q=query.flatten(0, 1),
             k=key.flatten(0, 1),
@@ -525,6 +530,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=max_seqlen_k,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **({"fa_version": fa_version} if fa_version else {}),
         )
         out = self._unwrap_flash_output(out)
         return out.reshape_as(query)
@@ -545,6 +551,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_fa_version_for_device,
         )
 
         if flash_attn_varlen_func is None:
@@ -558,6 +565,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key = key.flatten(0, 1)
         value = value.flatten(0, 1)
 
+        fa_version = vllm_fa_version_for_device(query.device)
         out = flash_attn_varlen_func(
             q=query,
             k=key,
@@ -568,6 +576,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=k_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **({"fa_version": fa_version} if fa_version else {}),
         )
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
