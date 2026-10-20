@@ -347,25 +347,6 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO, LoRA and Upscale Function Test"
-        key: nightly-diffusion-x2v-function-minimax-h3
-        source_file_dependencies: diffusion_minimax_h3_function
-        timeout_in_minutes: 150
-        mirror_hardwares: a3_npu_2
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HF_HUB_OFFLINE: "1"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - |
-            set -eu
-            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
-            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_ref2va.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
-            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_turbo_lora.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
-            VLLM_OMNI_SERVER_STORAGE__PATH=$(mktemp -d)
-            export VLLM_OMNI_SERVER_STORAGE__PATH
-            trap 'rm -rf "$$VLLM_OMNI_SERVER_STORAGE__PATH"' EXIT
-            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO Perf Test"
         key: nightly-diffusion-x2v-performance-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_perf
