@@ -9,8 +9,11 @@ VLLM_TEST_MINIMAX_H3_MODEL may point to a local FL2VA model directory.
 
 import json
 import os
+from io import BytesIO
 from pathlib import Path
 
+import av
+import numpy as np
 import pytest
 
 from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid
@@ -22,6 +25,23 @@ from vllm_omni.platforms import current_omni_platform
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
 UPSCALER = os.environ.get("VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER")
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+
+
+def _video_mean_absolute_error(video: bytes, reference: bytes) -> float:
+    # FL2VA 在两遍生成中复用图像条件；检查整段生成内容，避免仅凭首帧判定精修。
+    absolute_error = 0.0
+    pixel_count = 0
+    with av.open(BytesIO(video)) as actual, av.open(BytesIO(reference)) as expected:
+        for frame, reference_frame in zip(actual.decode(video=0), expected.decode(video=0), strict=True):
+            pixels = frame.to_ndarray(format="rgb24")
+            reference_pixels = reference_frame.to_ndarray(format="rgb24")
+            assert pixels.shape == reference_pixels.shape
+            absolute_error += np.abs(pixels.astype(np.float32) - reference_pixels.astype(np.float32)).sum(
+                dtype=np.float64
+            )
+            pixel_count += pixels.size
+    assert pixel_count > 0
+    return absolute_error / pixel_count / 255.0
 
 
 @pytest.mark.skipif(not UPSCALER, reason="set VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER to the real upscaler checkpoint")
@@ -72,7 +92,7 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
     "task",
     [
         pytest.param("t2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
-        pytest.param("fl2va", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+        pytest.param("fl2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
     ],
 )
 def test_latent_upscale_and_refine(
@@ -92,12 +112,15 @@ def test_latent_upscale_and_refine(
     # both VAE ranks must encode it before broadcasting the condition latents.
     # Four base steps and the minimum four-second clip keep real-weight CI affordable.
     # Use size rather than width/height: upscale intentionally changes output dimensions.
-    for name, upscale, refine, width, height in [
+    requests = [
         ("original", False, False, 512, 288),
         ("upscaled", 2.0, False, 1024, 576),
         ("refined", 2.0, 0.5, 1024, 576),
         ("disabled_again", False, False, 512, 288),
-    ]:
+    ]
+    if task == "fl2va":
+        requests.append(("upscaled_again", 2.0, False, 1024, 576))
+    for name, upscale, refine, width, height in requests:
         responses = online_client.send_video_diffusion_request(
             {
                 "model": omni_server.model,
@@ -133,4 +156,11 @@ def test_latent_upscale_and_refine(
     assert frame_counts[0] > 0
     assert len(set(frame_counts)) == 1, f"Upscale/refinement changed the frame count: {frame_counts}"
     # Equal output resolution alone would miss a silently ignored second denoise pass.
-    assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)
+    if task == "fl2va":
+        # 相同 seed 的无精修请求应稳定，避免把请求间波动误判为精修生效。
+        repeat_error = _video_mean_absolute_error(videos[4], videos[1])
+        assert repeat_error < 1 / 255, f"Unrefined repeat video MAE is {repeat_error:.6f}."
+        refinement_error = _video_mean_absolute_error(videos[2], videos[1])
+        assert refinement_error > 1 / 255, f"Expected refinement video MAE > {1 / 255}, got {refinement_error:.6f}."
+    else:
+        assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)
