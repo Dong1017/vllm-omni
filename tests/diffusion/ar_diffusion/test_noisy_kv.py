@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellPlan,
     CellSchedule,

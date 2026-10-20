@@ -3,7 +3,8 @@
 
 import pytest
 import torch
-from vllm_omni.diffusion.models.physis_h3.positions import output_frames, phase_aligned_frames, video_positions
+
+from vllm_omni.diffusion.models.physis.h3.positions import output_frames, phase_aligned_frames, video_positions
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 

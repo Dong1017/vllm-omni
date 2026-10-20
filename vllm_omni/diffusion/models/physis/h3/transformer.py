@@ -7,6 +7,7 @@ from copy import copy
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import _resolve_native_target
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (

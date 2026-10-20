@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
-from vllm_omni.diffusion.models.physis_wan.request import validate_physis_request
+
+from vllm_omni.diffusion.models.physis.common import build_physis_cell_plan, validate_physis_request
+from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
@@ -60,3 +62,31 @@ def test_explicit_recipe_is_accepted():
         seed=0,
     )
     validate_physis_request(params, num_frames=81)
+
+
+@pytest.mark.parametrize("chunks", [19, 29, 14, 48])
+@pytest.mark.parametrize(("stages", "groups"), [(1, 1), (1, 2), (4, 1)])
+def test_shared_plan_preserves_model_schedule_and_task_order(chunks, stages, groups):
+    plan = build_physis_cell_plan(
+        chunks=chunks, stages=stages, layer_groups=groups, blocks=8, blocks_per_rank=8 // groups
+    )
+    expected = build_cell_plan(
+        CellSchedule(
+            chunks=chunks - 1,
+            num_denoise_steps=4,
+            stages=stages,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=8,
+            blocks_per_rank=8 // groups,
+            clean_pass=False,
+        )
+    )
+    assert plan.schedule == expected.schedule
+    assert plan.num_slots == expected.num_slots
+    assert all(
+        plan.task(slot, rank) == expected.task(slot, rank)
+        for slot in range(plan.num_slots)
+        for rank in range(plan.world)
+    )

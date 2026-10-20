@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
+
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,

@@ -3,7 +3,8 @@
 
 import pytest
 import torch
-from vllm_omni.diffusion.models.physis_ltx.sampler import LTXFourStepSampler
+
+from vllm_omni.diffusion.models.physis.ltx.sampler import LTXFourStepSampler
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
 

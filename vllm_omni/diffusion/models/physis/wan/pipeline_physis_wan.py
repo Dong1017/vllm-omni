@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer, UMT5EncoderModel
+
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
@@ -16,10 +17,9 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 
-from .request import validate_physis_request
+from ..common import build_physis_cell_plan, validate_physis_request
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
 PROFILES = {
@@ -254,21 +254,14 @@ class PhysisWanPipeline(CausVidWanPipeline):
         if chunks < 2:
             raise ValueError("Use at least two chunks for Physis Wan Cell execution")
         validate_physis_request(req.sampling_params, num_frames=4 * chunks + 5)
-        stages = self.stage_parallel_size
-        if stages not in (1, 4):
+        if self.stage_parallel_size not in (1, 4):
             raise ValueError("Physis Wan supports stage_parallel_size=1 or 4")
-        plan = build_cell_plan(
-            CellSchedule(
-                chunks=chunks - 1,
-                num_denoise_steps=4,
-                stages=stages,
-                layer_groups=self.layer_groups,
-                ordering=Ordering.SAME_STEP,
-                kv_history_chunks=18,
-                blocks=self.transformer.num_layers,
-                blocks_per_rank=self.transformer.local_num_layers,
-                clean_pass=False,
-            )
+        plan = build_physis_cell_plan(
+            chunks=chunks,
+            stages=self.stage_parallel_size,
+            layer_groups=self.layer_groups,
+            blocks=self.transformer.num_layers,
+            blocks_per_rank=self.transformer.local_num_layers,
         )
         return plan, extra, 4
 

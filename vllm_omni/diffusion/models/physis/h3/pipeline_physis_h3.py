@@ -11,16 +11,16 @@ import torch
 from diffusers import AutoencoderKLMiniMaxH3
 from torch import nn
 from transformers import AutoTokenizer
+
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
-from vllm_omni.diffusion.models.physis_wan.pipeline_physis_wan import PhysisWanCell
-from vllm_omni.diffusion.models.physis_wan.request import validate_physis_request
-from vllm_omni.diffusion.models.physis_wan.sampler import WAN22_5B, WanFourStepSampler
+from vllm_omni.diffusion.models.physis.common import build_physis_cell_plan, validate_physis_request
+from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanCell
+from vllm_omni.diffusion.models.physis.wan.sampler import WAN22_5B, WanFourStepSampler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import get_wan22_post_process_func as get_wan22_post_process_func
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
@@ -178,18 +178,12 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         if chunks < 3:
             raise ValueError("H3 whole-sequence VAE decoding requires at least three latent chunks")
         validate_physis_request(req.sampling_params, num_frames=output_frames(chunks))
-        plan = build_cell_plan(
-            CellSchedule(
-                chunks=chunks - 1,
-                num_denoise_steps=4,
-                stages=self.stage_parallel_size,
-                layer_groups=self.layer_groups,
-                ordering=Ordering.SAME_STEP,
-                kv_history_chunks=18,
-                blocks=self.transformer.num_layers,
-                blocks_per_rank=self.transformer.local_num_layers,
-                clean_pass=False,
-            )
+        plan = build_physis_cell_plan(
+            chunks=chunks,
+            stages=self.stage_parallel_size,
+            layer_groups=self.layer_groups,
+            blocks=self.transformer.num_layers,
+            blocks_per_rank=self.transformer.local_num_layers,
         )
         return plan, extra
 

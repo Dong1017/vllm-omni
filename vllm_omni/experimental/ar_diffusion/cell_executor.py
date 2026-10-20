@@ -12,6 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
+
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,

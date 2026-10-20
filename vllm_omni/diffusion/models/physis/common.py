@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from vllm_omni.experimental.ar_diffusion.cell_schedule import CellPlan, CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -29,3 +30,21 @@ def validate_physis_request(
         raise ValueError("Physis checkpoints are guidance distilled and do not support CFG")
     if params.timesteps is not None or params.sigmas is not None:
         raise ValueError("Physis uses its trained four-step timestep and sigma schedule")
+
+
+def build_physis_cell_plan(
+    *, chunks: int, stages: int, layer_groups: int, blocks: int, blocks_per_rank: int
+) -> CellPlan:
+    return build_cell_plan(
+        CellSchedule(
+            chunks=chunks - 1,
+            num_denoise_steps=4,
+            stages=stages,
+            layer_groups=layer_groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=blocks,
+            blocks_per_rank=blocks_per_rank,
+            clean_pass=False,
+        )
+    )

@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
@@ -410,9 +411,9 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
-    "PhysisH3Pipeline": ("physis_h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
-    "PhysisLTXPipeline": ("physis_ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
-    "PhysisWanPipeline": ("physis_wan", "pipeline_physis_wan", "PhysisWanPipeline"),
+    "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
+    "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
+    "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
     "CausVidWanPipeline": (
         "causvid_wan",
         "pipeline_causvid_wan",
@@ -579,6 +580,7 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
+
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
         install_wan_vae_encoder_fastpath,
         install_wan_vae_fastpath,

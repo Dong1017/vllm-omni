@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Ordering,
