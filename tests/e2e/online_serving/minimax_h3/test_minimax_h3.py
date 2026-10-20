@@ -9,14 +9,11 @@ VLLM_TEST_MINIMAX_H3_MODEL may point to a local FL2VA model directory.
 
 import json
 import os
-from io import BytesIO
 from pathlib import Path
 
-import av
-import numpy as np
 import pytest
 
-from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid
+from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid, video_mean_absolute_error
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
@@ -25,23 +22,6 @@ from vllm_omni.platforms import current_omni_platform
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
 UPSCALER = os.environ.get("VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER")
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
-
-
-def _video_mean_absolute_error(video: bytes, reference: bytes) -> float:
-    # FL2VA reuses the image condition across both passes; check the whole generation instead of judging refinement by the first frame only.
-    absolute_error = 0.0
-    pixel_count = 0
-    with av.open(BytesIO(video)) as actual, av.open(BytesIO(reference)) as expected:
-        for frame, reference_frame in zip(actual.decode(video=0), expected.decode(video=0), strict=True):
-            pixels = frame.to_ndarray(format="rgb24")
-            reference_pixels = reference_frame.to_ndarray(format="rgb24")
-            assert pixels.shape == reference_pixels.shape
-            absolute_error += np.abs(pixels.astype(np.float32) - reference_pixels.astype(np.float32)).sum(
-                dtype=np.float64
-            )
-            pixel_count += pixels.size
-    assert pixel_count > 0
-    return absolute_error / pixel_count / 255.0
 
 
 @pytest.mark.skipif(not UPSCALER, reason="set VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER to the real upscaler checkpoint")
@@ -158,9 +138,9 @@ def test_latent_upscale_and_refine(
     # Equal output resolution alone would miss a silently ignored second denoise pass.
     if task == "fl2va":
         # A same-seed request without refinement must stay stable, so request-to-request variance is not misread as refinement.
-        repeat_error = _video_mean_absolute_error(videos[4], videos[1])
+        repeat_error = video_mean_absolute_error(videos[4], videos[1])
         assert repeat_error < 1 / 255, f"Unrefined repeat video MAE is {repeat_error:.6f}."
-        refinement_error = _video_mean_absolute_error(videos[2], videos[1])
+        refinement_error = video_mean_absolute_error(videos[2], videos[1])
         assert refinement_error > 1 / 255, f"Expected refinement video MAE > {1 / 255}, got {refinement_error:.6f}."
     else:
         assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)
