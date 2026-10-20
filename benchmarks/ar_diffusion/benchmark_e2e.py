@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import numpy as np
+
     from vllm_omni.outputs import OmniRequestOutput
 
 
@@ -164,6 +165,7 @@ def main() -> None:
     args = parse_args()
 
     import torch
+
     import vllm_omni
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
