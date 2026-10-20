@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
@@ -13,6 +15,8 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     group_of_block,
     is_group_boundary,
     max_local_blocks,
+    rank_of_block,
+    stage_of,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -395,3 +399,86 @@ def test_wait_ready_nonempty_after_cell_expand():
     )
     wait_entries = sum(len(plan.wait_ready(slot, rank)) for slot in range(plan.num_slots) for rank in range(plan.world))
     assert wait_entries > 0
+
+
+@pytest.mark.parametrize("stages", [1, 4])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_same_step_without_clean_pass(stages, groups):
+    schedule = CellSchedule(
+        chunks=24,
+        num_denoise_steps=4,
+        stages=stages,
+        layer_groups=groups,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=18,
+        blocks=groups * 2,
+        clean_pass=False,
+    )
+    plan = build_cell_plan(schedule)
+    tasks = set()
+    for tick in range(plan.num_ticks):
+        assert plan.transfers(tick) == ()
+        for rank in range(plan.world):
+            assert plan.wait_ready(tick, rank) == frozenset()
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            assert task not in tasks
+            tasks.add(task)
+            chunk, step, block = task
+            assert 0 <= step < 4
+            assert stage_of(step, schedule) == rank // groups
+            assert rank_of_block(step, block, schedule) == rank
+            expected = {(prev, step, block) for prev in range(max(0, chunk - 18), chunk)}
+            sources = plan.sources(task, rank)
+            assert {source.version for source in sources} == expected
+            assert all(source.owner == rank for source in sources)
+            assert all(plan.completion_tick(source.version) < tick for source in sources)
+    assert len(tasks) == 24 * 4 * schedule.num_blocks
+
+
+@pytest.mark.parametrize("ordering", list(Ordering))
+@pytest.mark.parametrize("stages", [1, 5])
+def test_clean_pass_default_matches_explicit_clean_plan(ordering, stages):
+    schedule = CellSchedule(
+        chunks=6,
+        num_denoise_steps=4,
+        stages=stages,
+        layer_groups=2,
+        ordering=ordering,
+        kv_history_chunks=18,
+        blocks=4,
+    )
+    default = build_cell_plan(schedule)
+    explicit = build_cell_plan(replace(schedule, clean_pass=True))
+    assert schedule.clean_pass is True
+    assert default.num_ticks == explicit.num_ticks
+    for tick in range(default.num_ticks):
+        assert default.transfers(tick) == explicit.transfers(tick)
+        for rank in range(default.world):
+            task = default.task(tick, rank)
+            assert task == explicit.task(tick, rank)
+            assert default.wait_ready(tick, rank) == explicit.wait_ready(tick, rank)
+            if task is not None:
+                assert default.sources(task, rank) == explicit.sources(task, rank)
+    assert any(
+        default.task(tick, rank)[1] == 4
+        for tick in range(default.num_ticks)
+        for rank in range(default.world)
+        if default.task(tick, rank) is not None
+    )
+    for rank in range(default.world):
+        assert default.last_use(rank) == explicit.last_use(rank)
+
+
+@pytest.mark.parametrize("ordering", [Ordering.SELF_FORCING, Ordering.LATEST_KV])
+def test_no_clean_pass_requires_same_step(ordering):
+    with pytest.raises(ValueError, match="requires SAME_STEP"):
+        CellSchedule(4, 4, 1, 1, ordering, 18, clean_pass=False)
+
+
+@pytest.mark.parametrize("stages", [2, 3, 5])
+def test_no_clean_pass_rejects_wrong_stage_count(stages):
+    with pytest.raises(ValueError, match="stages must be 1 or num_denoise_steps"):
+        CellSchedule(4, 4, stages, 1, Ordering.SAME_STEP, 18, clean_pass=False)
+

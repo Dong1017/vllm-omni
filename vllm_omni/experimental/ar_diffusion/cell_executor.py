@@ -67,7 +67,9 @@ def _activation_edges(
     if topology.step_replicas == 1:
         peer_tasks = rank_work(inflight, slot, last_rank)
         if _tasks_need_activation_send(peer_tasks, schedule):
-            edges.append((last_rank, 0, peer_tasks))
+            last_step = peer_tasks[0][1][1] == schedule.num_denoise_steps - 1
+            if schedule.clean_pass or not last_step:
+                edges.append((last_rank, 0, peer_tasks))
     for src in range(last_rank):
         dst = src + 1
         src_tasks = rank_work(inflight, slot, src)
@@ -426,3 +428,4 @@ def bind_ar_diffusion_cell_context(owner: Any, ctx: ARDiffusionCellContext) -> I
         yield ctx
     finally:
         owner._ar_diffusion_cell_context = prev
+

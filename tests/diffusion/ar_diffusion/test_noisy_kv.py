@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -289,3 +291,89 @@ def test_begin_request_rejects_invalid_chunk_length(chunk_tokens):
     with pytest.raises(ValueError, match="chunk_tokens"):
         state.begin_request("A", _vertical_plan(), chunk_tokens=chunk_tokens)
     assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("stages,history_steps", [(1, 4), (4, 1)])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_same_step_all_live_history_versions_fit_capacity(stages, history_steps, groups):
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=24,
+            num_denoise_steps=4,
+            stages=stages,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=2 * groups,
+            clean_pass=False,
+        )
+    )
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=2,
+        num_kv_heads=1,
+        head_size=4,
+        block_size=4,
+        max_chunk_tokens=4,
+        max_history_chunks=18,
+        resident_history_steps=history_steps,
+    )
+    for rank in range(plan.world):
+        cache = NoisyKVCache(
+            spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=groups,
+            max_batch_size=2,
+            stages=stages,
+            layer_offset=2 * (rank % groups),
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        for req in ("A", "B"):
+            state.begin_request(req, plan, chunk_tokens=4)
+        peaks = [0] * spec.num_layers
+        for tick in range(plan.num_ticks):
+            task = plan.task(tick, rank)
+            if task is not None:
+                contexts = state.prepare(tuple((req, task) for req in ("A", "B")))
+                assert all(context[0].seq_len == (min(task[0], 18) + 1) * 4 for context in contexts)
+            for layer in range(spec.num_layers):
+                live = cache.capacity - len(cache.pool.free[layer])
+                peaks[layer] = max(peaks[layer], live)
+                assert live <= cache.capacity
+            state.evict(tick)
+        assert not cache.pool.keys
+        assert all(peak > 0 for peak in peaks)
+        if stages == 1:
+            # The old one-history-step capacity is insufficient on the real plan.
+            old_capacity = 2 * max(18 + 2 + groups, 18 + stages)
+            assert min(peaks) > old_capacity
+
+
+def test_same_step_resident_history_steps_budget_and_default():
+    cache = _cache()
+    assert cache.spec.resident_history_steps == 1
+    spec = replace(cache.spec, max_history_chunks=18, resident_history_steps=4)
+    expanded = NoisyKVCache(
+        spec,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    assert expanded.capacity == 18 * 4 + 3
+    with pytest.raises(RuntimeError, match="requires 75"):
+        NoisyKVCache(
+            spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=1,
+            max_batch_size=1,
+            available_bytes=expanded.reserved_bytes - expanded.bytes_per_version * spec.num_layers,
+        )
+
+
+def test_resident_history_steps_must_be_positive():
+    with pytest.raises(ValueError, match="resident_history_steps must be positive"):
+        replace(_cache().spec, resident_history_steps=0)
+
