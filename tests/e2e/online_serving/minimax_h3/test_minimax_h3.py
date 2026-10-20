@@ -139,8 +139,10 @@ def test_latent_upscale_and_refine(
     if task == "fl2va":
         # A same-seed request without refinement must stay stable, so request-to-request variance is not misread as refinement.
         repeat_error = video_mean_absolute_error(videos[4], videos[1])
+        print(f"repeat_error={repeat_error:.6f}")
         assert repeat_error < 1 / 255, f"Unrefined repeat video MAE is {repeat_error:.6f}."
         refinement_error = video_mean_absolute_error(videos[2], videos[1])
+        print(f"refinement_error={refinement_error:.6f}")
         assert refinement_error > 1 / 255, f"Expected refinement video MAE > {1 / 255}, got {refinement_error:.6f}."
     else:
         assert_video_first_frames_differ(videos[2], videos[1], min_mean_absolute_error=1 / 255)
