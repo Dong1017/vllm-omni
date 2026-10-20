@@ -38,7 +38,7 @@ def test_sdpa_npu_packed_padding_matches_dense_mask():
     query = torch.randn(1, 9, 2, 8, generator=generator)
     key = torch.randn(1, 11, 2, 8, generator=generator)
     value = torch.randn(1, 11, 2, 8, generator=generator)
-    # 放大 padding，确保错误地读取后缀会改变结果。
+    # Inflated padding so that wrongly reading the suffix changes the result.
     value[:, 7:] += 100
     metadata = AttentionMetadata(
         packed_padding=PackedPaddingMetadata(

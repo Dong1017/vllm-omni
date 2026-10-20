@@ -390,7 +390,8 @@ class SDPAImpl(AttentionImpl):
         if attn_metadata is not None and attn_metadata.packed_padding is not None:
             if self.causal or attn_metadata.attn_mask is not None:
                 raise ValueError("NPU SDPA packed padding requires non-causal attention without an explicit mask")
-            # 生产者保证 [real, pad] 布局；去掉 K/V 的 padding 后无需构造 Q×K 遮罩。
+            # The producer guarantees the [real, pad] layout; slice the padding
+            # off K/V instead of materializing the Q x K mask.
             length = attn_metadata.packed_padding.kv_length
             return self._forward_impl(query, key[:, :length], value[:, :length])
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")

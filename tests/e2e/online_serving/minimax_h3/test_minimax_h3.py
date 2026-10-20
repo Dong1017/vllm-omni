@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
 
 def _video_mean_absolute_error(video: bytes, reference: bytes) -> float:
-    # FL2VA 在两遍生成中复用图像条件；检查整段生成内容，避免仅凭首帧判定精修。
+    # FL2VA reuses the image condition across both passes; check the whole generation instead of judging refinement by the first frame only.
     absolute_error = 0.0
     pixel_count = 0
     with av.open(BytesIO(video)) as actual, av.open(BytesIO(reference)) as expected:
@@ -157,7 +157,7 @@ def test_latent_upscale_and_refine(
     assert len(set(frame_counts)) == 1, f"Upscale/refinement changed the frame count: {frame_counts}"
     # Equal output resolution alone would miss a silently ignored second denoise pass.
     if task == "fl2va":
-        # 相同 seed 的无精修请求应稳定，避免把请求间波动误判为精修生效。
+        # A same-seed request without refinement must stay stable, so request-to-request variance is not misread as refinement.
         repeat_error = _video_mean_absolute_error(videos[4], videos[1])
         assert repeat_error < 1 / 255, f"Unrefined repeat video MAE is {repeat_error:.6f}."
         refinement_error = _video_mean_absolute_error(videos[2], videos[1])
