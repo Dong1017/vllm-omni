@@ -215,3 +215,77 @@ The first baseline request establishes a reference hash, which every variant
 and repeat must match. Record that hash and optionally pass `--expected-sha`
 for subsequent runs in the same environment. Archived H800 hashes are not
 cross-environment references.
+
+## End-to-end video requests
+
+`benchmark_e2e.py` measures synchronous, single-request `Omni.generate` wall
+time. Each request includes text encoding, DiT denoising, VAE decoding,
+postprocessing and return to the client. Model initialization and warmup are
+excluded. Output is measured as actual returned RGB frames divided by request
+wall time. `--fps` specifies playback speed; it is not generation throughput.
+
+The E2E entrypoint uses the selected model's pipeline and deployment config.
+It does not install the DiT harness's four optimization variants. The original
+`benchmark_noisy_pp.py` retains its pre-encoded-text, DiT-only measurement scope.
+
+For an installed Physis model integration, set `OMNI_MODEL` to its full local
+model snapshot or repository ID, then run from the repository root:
+
+```bash
+python benchmarks/ar_diffusion/benchmark_e2e.py \
+  --model "$OMNI_MODEL" \
+  --class-name PhysisWanPipeline \
+  --deploy-config vllm_omni/deploy/physis_wan.yaml \
+  --frames 81 --chunks 19 --fps 16 \
+  --steps 4 --height 480 --width 832 \
+  --prompt 'A corgi running along the beach at sunset, waves rolling in, golden light.' \
+  --seed 0 --kv-history-chunks 18 --warmup 1 --repeats 3 \
+  --output-json results/wan21-1p3b-e2e.json
+```
+
+Keep the scheduler's `CUDA_VISIBLE_DEVICES` allocation. The script reads and
+records it; it does not assign GPUs. `--pipeline-parallel-size` optionally
+overrides the deploy configuration's PP degree. PP is the number of processes
+in the model pipeline; Physis's `stage_parallel_size` independently selects
+how the denoising steps are distributed.
+
+Use Omni's existing `--stage-overrides` mapping to adjust logical device IDs
+and model configuration without copying deployment files. For example, a
+four-process Same-Step topology based on `physis_wan.yaml` adds:
+
+```bash
+--pipeline-parallel-size 4 \
+--stage-overrides '{"0":{"devices":"0,1,2,3","model_config":{"physis_profile":"wan21_1p3b","num_denoise_steps":4,"ar_diffusion_stage_config":{"stage_parallel_size":4,"max_batch_size":1,"max_history_chunks":18}}}}'
+```
+
+Logical device IDs are relative to the scheduler's visible allocation. For
+two processes, use devices `0,1`, PP=2 and `stage_parallel_size=1`; for one
+process, use device `0`, PP=1 and `stage_parallel_size=1`. Set the complete
+`model_config` override explicitly, since it replaces that configuration.
+
+The following fixed workloads all use four denoising steps, 480x832 output,
+guidance scale 1.0, seed 0 and 18 history chunks:
+
+| Model | Class | Deploy config | Wan profile | Frames | Chunks | Playback FPS |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| Wan 2.1 1.3B Same-Step | `PhysisWanPipeline` | `physis_wan.yaml` | `wan21_1p3b` | 81 | 19 | 16 |
+| Wan 2.1 14B Same-Step | `PhysisWanPipeline` | `physis_wan.yaml` | `wan21_14b` | 81 | 19 | 16 |
+| Wan 2.2 5B Same-Step | `PhysisWanPipeline` | `physis_wan.yaml` | `wan22_5b` | 121 | 29 | 24 |
+| LTX 2.5 22B Same-Step | `PhysisLTXPipeline` | `physis_ltx.yaml` | — | 121 | 14 | 24 |
+| MiniMax H3 33B Same-Step | `PhysisH3Pipeline` | `physis_h3.yaml` | — | 162 | 48 | 24 |
+
+For the two other Wan checkpoints, replace `physis_profile` in the stage
+override. LTX and H3 use their respective deploy configurations and retain
+their own model configuration fields when constructing an override. These
+pipelines and deploy files are provided by the model integration, separately
+from this benchmark change.
+
+The JSON includes every measured request plus median and aggregate E2E
+throughput, benchmark and imported runtime source HEADs and working tree status, model input and
+resolved local path, optional `--revision`, device identity and visible device
+allocation. Use a pinned local snapshot or pass `--revision` to identify model
+weights. `physis.dit` and `physis.chunk_*` are retained in seconds under
+`physis_stage_durations_seconds`; raw `stage_durations` is also retained because
+other engine keys may have different units. DiT FPS is derived only when a
+`physis.dit` duration is present. Those model timings describe denoising and
+chunk completion, while E2E FPS measures the entire completed request.
