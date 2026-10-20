@@ -11,17 +11,13 @@ class LTXFourStepSampler:
         def warp(value):
             return shift * value / (1.0 + (shift - 1.0) * value)
 
-        ladder = warp(
-            torch.linspace(1.0, warp(0.001), 4, dtype=torch.float64, device="cpu")
-        )
+        ladder = warp(torch.linspace(1.0, warp(0.001), 4, dtype=torch.float64, device="cpu"))
         self.sigmas = (*ladder.float().tolist(), 0.0)
         self.timesteps = tuple(1000.0 * sigma for sigma in self.sigmas[:-1])
 
     @staticmethod
     def generator(device, seed, chunk, step):
-        return torch.Generator(device=device).manual_seed(
-            seed * 1_000_003 + chunk * 4096 + step + 1
-        )
+        return torch.Generator(device=device).manual_seed(seed * 1_000_003 + chunk * 4096 + step + 1)
 
     def initial_noise(self, shape, *, device, seed, chunk):
         return torch.randn(

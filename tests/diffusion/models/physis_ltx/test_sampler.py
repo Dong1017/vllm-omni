@@ -23,22 +23,16 @@ def test_noise_and_every_transition_match_reference(chunk):
     sampler = LTXFourStepSampler()
     shape = (1, 128, 3 if chunk == 0 else 1, 2, 3)
     seed = 17
-    initial_generator = torch.Generator(device="cpu").manual_seed(
-        seed * 1_000_003 + chunk * 4096
-    )
+    initial_generator = torch.Generator(device="cpu").manual_seed(seed * 1_000_003 + chunk * 4096)
     expected = torch.randn(shape, generator=initial_generator, dtype=torch.float32)
     actual = sampler.initial_noise(shape, device="cpu", seed=seed, chunk=chunk)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for step in range(4):
-        prediction = (
-            torch.linspace(-1, 1, actual.numel()).reshape(shape).to(torch.bfloat16)
-        )
+        prediction = torch.linspace(-1, 1, actual.numel()).reshape(shape).to(torch.bfloat16)
         clean = expected.float() - sampler.sigmas[step] * prediction.float()
         following = sampler.sigmas[step + 1]
         if following:
-            generator = torch.Generator(device="cpu").manual_seed(
-                seed * 1_000_003 + chunk * 4096 + step + 1
-            )
+            generator = torch.Generator(device="cpu").manual_seed(seed * 1_000_003 + chunk * 4096 + step + 1)
             noise = torch.randn(shape, generator=generator, dtype=torch.float32)
             expected = (1.0 - following) * clean + following * noise
         else:

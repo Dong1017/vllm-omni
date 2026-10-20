@@ -8,7 +8,6 @@ from dataclasses import replace
 
 import pytest
 import torch
-
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellPlan,
     CellSchedule,
@@ -376,4 +375,3 @@ def test_same_step_resident_history_steps_budget_and_default():
 def test_resident_history_steps_must_be_positive():
     with pytest.raises(ValueError, match="resident_history_steps must be positive"):
         replace(_cache().spec, resident_history_steps=0)
-

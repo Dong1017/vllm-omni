@@ -7,7 +7,6 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
-
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
@@ -580,7 +579,6 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
-
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
         install_wan_vae_encoder_fastpath,
         install_wan_vae_fastpath,

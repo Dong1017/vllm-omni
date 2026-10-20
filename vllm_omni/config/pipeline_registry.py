@@ -29,13 +29,12 @@ from typing import TypeAlias
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
-
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
-from vllm_omni.diffusion.models.physis_wan.pipeline_config import PHYSIS_WAN_PIPELINE
 from vllm_omni.diffusion.models.physis_h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis_ltx.pipeline_config import PHYSIS_LTX_PIPELINE
+from vllm_omni.diffusion.models.physis_wan.pipeline_config import PHYSIS_WAN_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
@@ -279,4 +278,3 @@ def resolve_pipeline_config(
         return None
     pipeline = OMNI_PIPELINES[model_type]
     return pipeline(hf_config) if callable(pipeline) else pipeline
-

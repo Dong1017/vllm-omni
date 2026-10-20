@@ -20,4 +20,3 @@ PHYSIS_WAN_PIPELINE = PipelineConfig(
         ),
     ),
 )
-

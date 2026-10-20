@@ -20,6 +20,7 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     _as_request_list,
 )
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.diffusion.models.physis_wan.request import validate_physis_request
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
@@ -27,12 +28,12 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import (
     resolve_pp_rank_and_group,
     run_cell_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Ordering,
     build_cell_plan,
 )
+from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from .sampler import LTXFourStepSampler
@@ -41,16 +42,11 @@ from .transformer import StageLTXTransformer
 
 class PhysisLTXCell(WanCell):
     def _init_noise(self, chunk):
-        return self.sampler.initial_noise(
-            self.latent_shape, device=self.device, seed=self.seed, chunk=chunk + 1
-        )
+        return self.sampler.initial_noise(self.latent_shape, device=self.device, seed=self.seed, chunk=chunk + 1)
 
     def activation_spec(self, *, batch, include_hidden):
         spec = super().activation_spec(batch=batch, include_hidden=include_hidden)
-        return [
-            (name, shape, torch.bfloat16 if name == "hidden_states" else dtype)
-            for name, shape, dtype in spec
-        ]
+        return [(name, shape, torch.bfloat16 if name == "hidden_states" else dtype) for name, shape, dtype in spec]
 
     def forward(self, tasks, kv_contexts, *, hidden):
         assert len(tasks) == 1
@@ -84,12 +80,8 @@ class PhysisLTXCell(WanCell):
         if not (block == tf.end_layer - 1 and tf.is_stage_last):
             live[chunk] = latent
             return {"latent": latent, "hidden_states": tokens}
-        prediction = tf.unembed(
-            tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep
-        )
-        latent = self.sampler.advance(
-            latent, prediction, step=step, seed=self.seed, chunk=chunk + 1
-        )
+        prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
+        latent = self.sampler.advance(latent, prediction, step=step, seed=self.seed, chunk=chunk + 1)
         live[chunk] = latent
         if step == 3:
             self.finished.setdefault(request, {})[chunk] = latent.detach()
@@ -116,23 +108,14 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         self.stage_parallel_size = int(stage.get("stage_parallel_size", 1))
         pp_world = int(od_config.parallel_config.pipeline_parallel_size)
         self.layer_groups = pp_world // self.stage_parallel_size
-        if (
-            self.stage_parallel_size not in (1, 4)
-            or pp_world % self.stage_parallel_size
-        ):
-            raise ValueError(
-                "Physis LTX requires stage_parallel_size=1 or 4 dividing PP world size"
-            )
+        if self.stage_parallel_size not in (1, 4) or pp_world % self.stage_parallel_size:
+            raise ValueError("Physis LTX requires stage_parallel_size=1 or 4 dividing PP world size")
         if int(od_config.parallel_config.tensor_parallel_size) != 1:
-            raise ValueError(
-                "Physis LTX Cell execution currently requires tensor_parallel_size=1"
-            )
+            raise ValueError("Physis LTX Cell execution currently requires tensor_parallel_size=1")
         self.pp_rank, _ = resolve_pp_rank_and_group()
         self.model_path = str(od_config.model)
         root = Path(self.model_path)
-        transformer_config = json.loads(
-            (root / "transformer" / "config.json").read_text()
-        )
+        transformer_config = json.loads((root / "transformer" / "config.json").read_text())
         self.transformer = StageLTXTransformer(
             transformer_config,
             layer_groups=self.layer_groups,
@@ -155,9 +138,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         if self.pp_rank == 0:
             index = json.loads((root / "model_index.json").read_text())
             with torch.device("cpu"):
-                self.tokenizer = getattr(
-                    transformers, index["tokenizer"][1]
-                ).from_pretrained(
+                self.tokenizer = getattr(transformers, index["tokenizer"][1]).from_pretrained(
                     root / "tokenizer",
                     local_files_only=True,
                 )
@@ -230,9 +211,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     output_hidden_states=True,
                 ).hidden_states
                 stacked = torch.stack(hidden, dim=-1).flatten(2, 3).to(torch.bfloat16)
-                video, _, mask = self.connectors(
-                    stacked, tokens.attention_mask, padding_side="left"
-                )
+                video, _, mask = self.connectors(stacked, tokens.attention_mask, padding_side="left")
                 encoded = video[:, mask[0].bool()].float().to(device)
             shape = torch.tensor(encoded.shape, device=device, dtype=torch.long)
         else:
@@ -240,9 +219,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         if pp is not None and pp.world_size > 1:
             pp.broadcast(shape, src=0)
         if self.pp_rank != 0:
-            encoded = torch.empty(
-                tuple(shape.tolist()), device=device, dtype=torch.float32
-            )
+            encoded = torch.empty(tuple(shape.tolist()), device=device, dtype=torch.float32)
         if pp is not None and pp.world_size > 1:
             pp.broadcast(encoded, src=0)
         return encoded
@@ -254,12 +231,11 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         if str(extra.get("cell_schedule", "same_step")) != "same_step":
             raise ValueError("Physis LTX requires Same-Step history")
         if int(extra.get("kv_history_chunks", 18)) != 18:
-            raise ValueError(
-                "Physis LTX requires 18 recent history chunks plus its clean sink"
-            )
+            raise ValueError("Physis LTX requires 18 recent history chunks plus its clean sink")
         chunks = int(extra.get("num_chunks", self.default_chunks))
         if chunks < 2:
             raise ValueError("Use at least two chunks for Physis LTX Cell execution")
+        validate_physis_request(req.sampling_params, num_frames=8 * chunks + 9, frame_rate=24.0)
         plan = build_cell_plan(
             CellSchedule(
                 chunks=chunks - 1,
@@ -283,16 +259,12 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         else:
             hidden = pp.recv_tensor_dict(src=self.pp_rank - 1)["hidden_states"]
         for block in range(tf.start_layer, tf.end_layer):
-            hidden = tf.block(
-                block, hidden, chunk=0, step=step, latent=latent, timestep=timestep
-            )
+            hidden = tf.block(block, hidden, chunk=0, step=step, latent=latent, timestep=timestep)
         if group < self.layer_groups - 1:
             pp.send_tensor_dict({"hidden_states": hidden}, dst=self.pp_rank + 1)
             prediction = torch.empty_like(latent)
         else:
-            prediction = tf.unembed(
-                hidden, chunk=0, step=step, latent=latent, timestep=timestep
-            ).float()
+            prediction = tf.unembed(hidden, chunk=0, step=step, latent=latent, timestep=timestep).float()
         if pp is not None and pp.world_size > 1:
             pp.broadcast(prediction, src=self.layer_groups - 1)
         return prediction
@@ -302,14 +274,8 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         mean = self.vae.latents_mean.float().view(1, -1, 1, 1, 1)
         std = self.vae.latents_std.float().view(1, -1, 1, 1, 1)
         latent = latent.to(device).float() * std / self.vae.config.scaling_factor + mean
-        temb = (
-            torch.zeros(1, device=device, dtype=torch.bfloat16)
-            if self.vae.config.timestep_conditioning
-            else None
-        )
-        return self.vae.decode(latent.to(torch.bfloat16), temb, return_dict=False)[
-            0
-        ].clamp(-1, 1)
+        temb = torch.zeros(1, device=device, dtype=torch.bfloat16) if self.vae.config.timestep_conditioning else None
+        return self.vae.decode(latent.to(torch.bfloat16), temb, return_dict=False)[0].clamp(-1, 1)
 
     def forward(self, req):
         assert self._chunk_ctx is not None
@@ -320,9 +286,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
             plan, extra = self._plan_for(item)
             seed = int(extra.get("seed", item.sampling_params.seed or 0))
             request_id = str(item.request_id)
-            prompt = self._encode_prompt(
-                self._prompt_text(item.prompt), device, torch.float32
-            )
+            prompt = self._encode_prompt(self._prompt_text(item.prompt), device, torch.float32)
             tf = self.transformer
             tf.sink_pages.clear()
             tf.capture_sink = False
@@ -338,9 +302,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     step=step,
                     pp=pp,
                 )
-                latent = sampler.advance(
-                    latent, prediction, step=step, seed=seed, chunk=0
-                )
+                latent = sampler.advance(latent, prediction, step=step, seed=seed, chunk=0)
             sink_latent = latent
             timing.mark(0)
             tf.capture_sink = True
@@ -374,8 +336,6 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     ],
                     dim=2,
                 )
-                if extra.get("latent_output_file"):
-                    torch.save(latent.cpu(), str(extra["latent_output_file"]))
                 result = self._video_output(self._decode_latents(latent))
                 result.stage_durations = durations
                 outputs.append(result)

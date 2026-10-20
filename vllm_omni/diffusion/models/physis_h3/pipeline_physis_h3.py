@@ -16,11 +16,12 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
 from vllm_omni.diffusion.models.physis_wan.pipeline_physis_wan import PhysisWanCell
+from vllm_omni.diffusion.models.physis_wan.request import validate_physis_request
 from vllm_omni.diffusion.models.physis_wan.sampler import WAN22_5B, WanFourStepSampler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import get_wan22_post_process_func as get_wan22_post_process_func
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from .positions import output_frames
@@ -176,6 +177,7 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         chunks = int(extra.get("num_chunks", 48))
         if chunks < 3:
             raise ValueError("H3 whole-sequence VAE decoding requires at least three latent chunks")
+        validate_physis_request(req.sampling_params, num_frames=output_frames(chunks))
         plan = build_cell_plan(
             CellSchedule(
                 chunks=chunks - 1,
@@ -271,8 +273,6 @@ class PhysisH3Pipeline(CausVidWanPipeline):
             if self.pp_rank == 0:
                 chunks = finished[request_id]
                 latents = torch.cat([sink_latent, *(chunks[i] for i in range(plan.schedule.chunks))], dim=2)
-                if extra.get("latent_output_file"):
-                    torch.save(latents.cpu(), str(extra["latent_output_file"]))
                 video = self._decode_latents(latents)
                 result = self._video_output(video)
                 result.stage_durations = durations

@@ -71,14 +71,8 @@ class _CellAttention:
     ):
         assert encoder_hidden_states is None and attention_mask is None
         owner = self.owner
-        gates = (
-            attn.to_gate_logits(hidden_states)
-            if attn.to_gate_logits is not None
-            else None
-        )
-        query, key, value = LTX2AudioVideoAttnProcessor._project_qkv(
-            attn, hidden_states, hidden_states, True
-        )
+        gates = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
+        query, key, value = LTX2AudioVideoAttnProcessor._project_qkv(attn, hidden_states, hidden_states, True)
         query, key = attn.norm_q(query), attn.norm_k(key)
         batch, tokens, _ = query.shape
         key = key.unflatten(2, (attn.heads, attn.head_dim))
@@ -92,17 +86,12 @@ class _CellAttention:
         if context is not None:
             # The deployment's FP32 pool preserves normalized K exactly.
             # V is BF16, so its FP32 storage conversion is also exact.
-            context.key_pool.index_copy_(
-                0, context.video_slots, key[0].to(context.key_pool.dtype)
-            )
-            context.value_pool.index_copy_(
-                0, context.video_slots, value[0].to(context.value_pool.dtype)
-            )
+            context.key_pool.index_copy_(0, context.video_slots, key[0].to(context.key_pool.dtype))
+            context.value_pool.index_copy_(0, context.video_slots, value[0].to(context.value_pool.dtype))
             count = context.seq_len // context.block_size
             blocks = context.block_table[0, : count - 1].to(torch.long)
             slots = (
-                blocks[:, None] * context.block_size
-                + torch.arange(context.block_size, device=blocks.device)[None, :]
+                blocks[:, None] * context.block_size + torch.arange(context.block_size, device=blocks.device)[None, :]
             ).flatten()
             sink_key, sink_value = owner.sink_pages[self.layer]
             key = torch.cat(
@@ -134,8 +123,7 @@ class _CellAttention:
         output = attn.attn(query, key, value, None).flatten(2, 3).to(query.dtype)
         if gates is not None:
             output = (
-                output.view(batch, tokens, attn.heads, attn.head_dim)
-                * (2.0 * torch.sigmoid(gates)).unsqueeze(-1)
+                output.view(batch, tokens, attn.heads, attn.head_dim) * (2.0 * torch.sigmoid(gates)).unsqueeze(-1)
             ).reshape(batch, tokens, -1)
         return attn.to_out[1](attn.to_out[0](output))
 
@@ -147,9 +135,7 @@ class StageLTXTransformer(nn.Module):
             config["patch_size"],
             config["patch_size_t"],
         ) != (1, 1):
-            raise ValueError(
-                "Physis LTX requires connector embeddings and unit patches"
-            )
+            raise ValueError("Physis LTX requires connector embeddings and unit patches")
         self.layer_groups, self.pp_rank = layer_groups, pp_rank
         self.group = pp_rank % layer_groups
         self.is_stage_first, self.is_stage_last = (
@@ -162,23 +148,14 @@ class StageLTXTransformer(nn.Module):
             config["attention_head_dim"],
         )
         self.dim = self.num_heads * self.head_dim
-        self.start_layer, self.end_layer = stage_layer_range(
-            self.num_layers, self.group, layer_groups
-        )
+        self.start_layer, self.end_layer = stage_layer_range(self.num_layers, self.group, layer_groups)
         self.compute_dtype = dtype
         device = torch.empty(()).device
-        allowed = set(
-            inspect.signature(LTX2VideoTransformer3DModel.__init__).parameters
-        )
+        allowed = set(inspect.signature(LTX2VideoTransformer3DModel.__init__).parameters)
         with torch.device("meta"):
-            model = LTX2VideoTransformer3DModel(
-                **{key: value for key, value in config.items() if key in allowed}
-            )
+            model = LTX2VideoTransformer3DModel(**{key: value for key, value in config.items() if key in allowed})
         model.transformer_blocks = nn.ModuleDict(
-            {
-                str(index): model.transformer_blocks[index]
-                for index in range(self.start_layer, self.end_layer)
-            }
+            {str(index): model.transformer_blocks[index] for index in range(self.start_layer, self.end_layer)}
         )
         for index, block in model.transformer_blocks.items():
             _drop(block, AUDIO_BLOCK_PARTS)
@@ -199,9 +176,7 @@ class StageLTXTransformer(nn.Module):
             _drop(model, ("proj_in", "keyframes_abs_pos_embedding"))
         if not self.is_stage_last:
             _drop(model, ("norm_out", "proj_out", "scale_shift_table"))
-        self.model = (
-            model.to_empty(device=device).to(dtype=dtype).eval().requires_grad_(False)
-        )
+        self.model = model.to_empty(device=device).to(dtype=dtype).eval().requires_grad_(False)
         self.sink_pages = {}
         self.capture_sink = False
         self._kv_context = None
@@ -227,10 +202,7 @@ class StageLTXTransformer(nn.Module):
                     continue
                 if parts[0] == "transformer_blocks":
                     index = int(parts[1])
-                    if (
-                        not self.start_layer <= index < self.end_layer
-                        or parts[2] in AUDIO_BLOCK_PARTS
-                    ):
+                    if not self.start_layer <= index < self.end_layer or parts[2] in AUDIO_BLOCK_PARTS:
                         continue
                 if not self.is_stage_first and parts[0] in (
                     "proj_in",
@@ -270,9 +242,7 @@ class StageLTXTransformer(nn.Module):
 
     def embed(self, latent):
         batch, channels, frames, height, width = latent.shape
-        rows = latent.permute(0, 2, 3, 4, 1).reshape(
-            batch, frames * height * width, channels
-        )
+        rows = latent.permute(0, 2, 3, 4, 1).reshape(batch, frames * height * width, channels)
         with torch.autocast(latent.device.type, dtype=self.compute_dtype):
             return self.model.proj_in(rows)
 
@@ -282,25 +252,16 @@ class StageLTXTransformer(nn.Module):
         key = float(timestep), tokens
         if key not in self._embeddings:
             with torch.autocast(latent.device.type, dtype=self.compute_dtype):
-                per_token = torch.full(
-                    (batch * tokens,), key[0], device=latent.device, dtype=torch.float32
-                )
-                temb, embedded = self.model.time_embed(
-                    per_token, batch_size=batch, hidden_dtype=torch.float32
-                )
+                per_token = torch.full((batch * tokens,), key[0], device=latent.device, dtype=torch.float32)
+                temb, embedded = self.model.time_embed(per_token, batch_size=batch, hidden_dtype=torch.float32)
                 temb, embedded = (
                     temb.view(batch, -1, temb.size(-1)),
                     embedded.view(batch, -1, embedded.size(-1)),
                 )
                 prompt = None
-                if (
-                    self.model.prompt_modulation
-                    and self.model.config.use_prompt_adaln_single
-                ):
+                if self.model.prompt_modulation and self.model.config.use_prompt_adaln_single:
                     prompt, _ = self.model.prompt_adaln(
-                        torch.full(
-                            (batch,), key[0], device=latent.device, dtype=torch.float32
-                        ),
+                        torch.full((batch,), key[0], device=latent.device, dtype=torch.float32),
                         batch_size=batch,
                         hidden_dtype=torch.float32,
                     )
@@ -316,19 +277,10 @@ class StageLTXTransformer(nn.Module):
         ]
         grid = torch.stack(torch.meshgrid(*axes, indexing="ij"))
         delta = torch.ones((3, 1, 1, 1), device=latent.device, dtype=torch.float32)
-        coords = (
-            torch.stack((grid, grid + delta), dim=-1)
-            .flatten(1, 3)
-            .unsqueeze(0)
-            .repeat(batch, 1, 1, 1)
-        )
+        coords = torch.stack((grid, grid + delta), dim=-1).flatten(1, 3).unsqueeze(0).repeat(batch, 1, 1, 1)
         rope = self.model.rope
-        coords = coords * torch.tensor(rope.scale_factors, device=latent.device).view(
-            1, 3, 1, 1
-        )
-        coords[:, 0] = (
-            coords[:, 0] + rope.causal_offset - rope.scale_factors[0]
-        ).clamp(min=0)
+        coords = coords * torch.tensor(rope.scale_factors, device=latent.device).view(1, 3, 1, 1)
+        coords[:, 0] = (coords[:, 0] + rope.causal_offset - rope.scale_factors[0]).clamp(min=0)
         coords[:, 0] = coords[:, 0] / self.fps
         return coords
 
@@ -339,14 +291,9 @@ class StageLTXTransformer(nn.Module):
             start = 0 if chunk == 0 else chunk + 2
             stop = start + latent.shape[2]
             first = start - history_tokens // per_frame
-            tables = self.model.rope(
-                self.coords(first, stop, latent), device=latent.device
-            )
+            tables = self.model.rope(self.coords(first, stop, latent), device=latent.device)
             axis = 2 if tables[0].ndim == 4 else 1
-            own = tuple(
-                table.narrow(axis, history_tokens, latent.shape[2] * per_frame)
-                for table in tables
-            )
+            own = tuple(table.narrow(axis, history_tokens, latent.shape[2] * per_frame) for table in tables)
             self._rotary = {key: (own, tables)}
         return self._rotary[key]
 
@@ -364,23 +311,15 @@ class StageLTXTransformer(nn.Module):
             text = self._text
             if block.cross_attn_adaln:
                 if prompt is not None:
-                    shift_kv, scale_kv = block.get_mod_params(
-                        block.prompt_scale_shift_table, prompt, batch
-                    )
+                    shift_kv, scale_kv = block.get_mod_params(block.prompt_scale_shift_table, prompt, batch)
                 else:
-                    shift_kv, scale_kv = (
-                        block.prompt_scale_shift_table[None, None]
-                        .to(hidden.dtype)
-                        .unbind(dim=2)
-                    )
+                    shift_kv, scale_kv = block.prompt_scale_shift_table[None, None].to(hidden.dtype).unbind(dim=2)
                 text = text * (1 + scale_kv) + shift_kv
             norm = block.norm2(hidden)
             if block.video_cross_attn_adaln:
                 shift_q, scale_q, gate_q = params[6:9]
                 norm = norm * (1 + scale_q) + shift_q
-            cross = block.attn2(
-                norm, encoder_hidden_states=text, attention_mask=self._text_mask
-            )
+            cross = block.attn2(norm, encoder_hidden_states=text, attention_mask=self._text_mask)
             if block.video_cross_attn_adaln:
                 cross = cross * gate_q
             hidden = hidden + cross
@@ -397,6 +336,4 @@ class StageLTXTransformer(nn.Module):
             shift, scale = values[:, :, 0], values[:, :, 1]
             out = self.model.proj_out(self.model.norm_out(hidden) * (1 + scale) + shift)
         batch, channels, frames, height, width = latent.shape
-        return out.reshape(batch, frames, height, width, channels).permute(
-            0, 4, 1, 2, 3
-        )
+        return out.reshape(batch, frames, height, width, channels).permute(0, 4, 1, 2, 3)

@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Ordering,
@@ -481,4 +480,3 @@ def test_no_clean_pass_requires_same_step(ordering):
 def test_no_clean_pass_rejects_wrong_stage_count(stages):
     with pytest.raises(ValueError, match="stages must be 1 or num_denoise_steps"):
         CellSchedule(4, 4, stages, 1, Ordering.SAME_STEP, 18, clean_pass=False)
-

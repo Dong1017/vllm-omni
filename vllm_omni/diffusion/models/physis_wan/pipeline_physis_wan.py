@@ -8,7 +8,6 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer, UMT5EncoderModel
-
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
@@ -17,11 +16,11 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 
+from .request import validate_physis_request
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
-
 
 PROFILES = {
     "wan21_1p3b": (WAN21_1_3B, (1, 16, 1, 60, 104), 19),
@@ -46,7 +45,9 @@ class PhysisStageWanTransformer(StageWanTransformer):
             for attention in (block.attn1, block.attn2):
                 for name in ("norm_q", "norm_k"):
                     original = getattr(attention, name)
-                    norm = torch.nn.RMSNorm(original.hidden_size, eps=original.variance_epsilon, elementwise_affine=True)
+                    norm = torch.nn.RMSNorm(
+                        original.hidden_size, eps=original.variance_epsilon, elementwise_affine=True
+                    )
                     norm.weight = original.weight
                     setattr(attention, name, norm)
             for norm in (block.norm1, block.norm3):
@@ -96,9 +97,7 @@ class PhysisStageWanTransformer(StageWanTransformer):
         self._physis_chunk = chunk
         self._physis_layer = index
         self._physis_latent = latent
-        return super().block(
-            index, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=kv_ctx
-        )
+        return super().block(index, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=kv_ctx)
 
     def _tables(self, history_tokens, tokens_per_frame):
         latent = self._physis_latent
@@ -132,8 +131,7 @@ class PhysisStageWanTransformer(StageWanTransformer):
             count = ctx.seq_len // ctx.block_size
             blocks = ctx.block_table[0, :count].to(torch.long)
             slots = (
-                blocks[:, None] * ctx.block_size
-                + torch.arange(ctx.block_size, device=blocks.device)[None, :]
+                blocks[:, None] * ctx.block_size + torch.arange(ctx.block_size, device=blocks.device)[None, :]
             ).flatten()
             sink_key, sink_value = self.sink_pages[self._physis_layer]
             key = torch.cat((sink_key, ctx.key_pool.index_select(0, slots)), dim=0).unsqueeze(0)
@@ -172,8 +170,13 @@ class PhysisWanCell(WanCell):
         else:
             assert tokens is not None
         tokens = tf.block(
-            block, tokens, chunk=chunk + 1, step=step, latent=latent,
-            timestep=timestep, kv_ctx=kv_contexts[0][0],
+            block,
+            tokens,
+            chunk=chunk + 1,
+            step=step,
+            latent=latent,
+            timestep=timestep,
+            kv_ctx=kv_contexts[0][0],
         )
         if not (block == tf.end_layer - 1 and tf.is_stage_last):
             live[chunk] = latent
@@ -217,9 +220,13 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 self.text_encoder = UMT5EncoderModel.from_pretrained(
                     Path(model_path) / "text_encoder", torch_dtype=torch.bfloat16, local_files_only=True
                 ).eval()
-            self.vae = DistributedAutoencoderKLWan.from_pretrained(
-                model_path, subfolder="vae", torch_dtype=torch.bfloat16, local_files_only=True
-            ).to(device).eval()
+            self.vae = (
+                DistributedAutoencoderKLWan.from_pretrained(
+                    model_path, subfolder="vae", torch_dtype=torch.bfloat16, local_files_only=True
+                )
+                .to(device)
+                .eval()
+            )
 
     def _encode_prompt(self, prompt, device, dtype):
         _, pp = resolve_pp_rank_and_group()
@@ -246,14 +253,23 @@ class PhysisWanPipeline(CausVidWanPipeline):
         chunks = int(extra.get("num_chunks", self.default_chunks))
         if chunks < 2:
             raise ValueError("Use at least two chunks for Physis Wan Cell execution")
+        validate_physis_request(req.sampling_params, num_frames=4 * chunks + 5)
         stages = self.stage_parallel_size
         if stages not in (1, 4):
             raise ValueError("Physis Wan supports stage_parallel_size=1 or 4")
-        plan = build_cell_plan(CellSchedule(
-            chunks=chunks - 1, num_denoise_steps=4, stages=stages, layer_groups=self.layer_groups,
-            ordering=Ordering.SAME_STEP, kv_history_chunks=18, blocks=self.transformer.num_layers,
-            blocks_per_rank=self.transformer.local_num_layers, clean_pass=False,
-        ))
+        plan = build_cell_plan(
+            CellSchedule(
+                chunks=chunks - 1,
+                num_denoise_steps=4,
+                stages=stages,
+                layer_groups=self.layer_groups,
+                ordering=Ordering.SAME_STEP,
+                kv_history_chunks=18,
+                blocks=self.transformer.num_layers,
+                blocks_per_rank=self.transformer.local_num_layers,
+                clean_pass=False,
+            )
+        )
         return plan, extra, 4
 
     def _sink_forward(self, latent, timestep, *, step, pp):
@@ -264,9 +280,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
         else:
             hidden = pp.recv_tensor_dict(src=self.pp_rank - 1)["hidden_states"]
         for block in range(tf.start_layer, tf.end_layer):
-            hidden = tf.block(
-                block, hidden, chunk=0, step=step, latent=latent, timestep=timestep, kv_ctx=None
-            )
+            hidden = tf.block(block, hidden, chunk=0, step=step, latent=latent, timestep=timestep, kv_ctx=None)
         if group < self.layer_groups - 1:
             pp.send_tensor_dict({"hidden_states": hidden}, dst=self.pp_rank + 1)
             result = torch.empty_like(latent)
@@ -306,8 +320,14 @@ class PhysisWanPipeline(CausVidWanPipeline):
             tf.capture_sink = False
             self._chunk_ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
             adapter = PhysisWanCell(
-                tf, sampler=sampler, prompt_embeds=prompt, latent_shape=self.latent_shape,
-                seed=seed, device=device, dtype=dtype, on_finished=timing.mark,
+                tf,
+                sampler=sampler,
+                prompt_embeds=prompt,
+                latent_shape=self.latent_shape,
+                seed=seed,
+                device=device,
+                dtype=dtype,
+                on_finished=timing.mark,
             )
             run_cell_pipeline(ctx=self._chunk_ctx, adapter=adapter)
             finished = self._gather_finished(adapter.finished, pp)
@@ -315,8 +335,6 @@ class PhysisWanPipeline(CausVidWanPipeline):
             if self.pp_rank == 0:
                 chunks = finished[request_id]
                 ordered = [sink_latent, *(chunks[index] for index in range(plan.schedule.chunks))]
-                if extra.get("latent_output_file"):
-                    torch.save(torch.cat(ordered, dim=2).cpu(), str(extra["latent_output_file"]))
                 video = self._decode_latents(torch.cat(ordered, dim=2))
                 result = self._video_output(video)
                 result.stage_durations = durations
@@ -325,4 +343,3 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 outputs.append(self._placeholder_output(device, dtype))
             tf.sink_pages.clear()
         return outputs
-

@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from vllm.logger import init_logger
-
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -184,7 +183,6 @@ class CausVidWanPipeline(nn.Module):
     def _init_codec(self, model_path: str) -> None:
         """Load UMT5 + Wan VAE. Prefer rank 0 for VAE decode ownership."""
         from transformers import AutoTokenizer, UMT5EncoderModel
-
         from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
             DistributedAutoencoderKLWan,
         )
@@ -597,4 +595,3 @@ class CausVidWanPipeline(nn.Module):
             else:
                 outputs.append(self._placeholder_output(device, dtype))
         return outputs
-
