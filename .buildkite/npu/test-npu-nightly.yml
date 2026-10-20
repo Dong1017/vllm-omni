@@ -379,14 +379,14 @@ steps:
           HF_HUB_OFFLINE: "1"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+            exit $$?
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
         key: nightly-diffusion-x2v-timeline-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_accuracy
