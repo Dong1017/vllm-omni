@@ -8,6 +8,7 @@ import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -58,6 +59,21 @@ def test_sdpa_npu_packed_padding_matches_dense_mask():
         scale=0.5,
     ).permute(0, 2, 1, 3)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.cpu
+def test_sdpa_packed_mask_free_gate_is_npu_only(monkeypatch):
+    """H3 skips the padding mask only behind this gate: on for NPU, off elsewhere.
+
+    A revert of SDPABackend.supports_packed_mask_free to the base False would
+    silently restore the Q x K padding mask on NPU while the forward_npu test
+    above stays green, so pin the gate itself.
+    """
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    assert SDPABackend.supports_packed_mask_free() is True
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    assert SDPABackend.supports_packed_mask_free() is False
 
 
 def test_sdpa_expands_kv_when_native_gqa_kernel_is_unavailable(monkeypatch):
