@@ -357,6 +357,7 @@ steps:
           HF_HUB_OFFLINE: "1"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          VLLM_TEST_MINIMAX_H3_MODEL: MiniMaxAI/MiniMax-H3
         artifact_paths:
           - "tests/dfx/perf/results/*.json"
         commands:
@@ -374,6 +375,7 @@ steps:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           HF_HUB_OFFLINE: "1"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          VLLM_TEST_MINIMAX_H3_MODEL: MiniMaxAI/MiniMax-H3
         commands:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py -m "full_model and npu and A3 and diffusion and cards_2" --run-level full_model
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
