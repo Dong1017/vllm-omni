@@ -339,10 +339,6 @@ def test_modular_local_model_root_uses_text_encoder_without_partition_files(tmp_
         json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
         encoding="utf-8",
     )
-    (root / "fastvideo_inference.json").write_text(
-        json.dumps(_fastvideo_metadata()),
-        encoding="utf-8",
-    )
 
     assert is_minimax_h3_modular(str(root)) is True
     assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "text_encoder")
@@ -410,10 +406,6 @@ def test_diffusion_resolver_returns_local_modular_root_without_partition_files(t
     root.mkdir()
     (root / "modular_model_index.json").write_text(
         json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
-        encoding="utf-8",
-    )
-    (root / "fastvideo_inference.json").write_text(
-        json.dumps(_fastvideo_metadata()),
         encoding="utf-8",
     )
 
