@@ -37,10 +37,14 @@ class _FakeToken2Wav:
         self.device_spk_calls = 0
         self.trt_spk_calls = 0
         self.device_spk_use_trt = None
+        self.speaker_graph_config = None
 
     def enable_device_spk_embedding(self, *, use_trt=True):
         self.device_spk_calls += 1
         self.device_spk_use_trt = use_trt
+
+    def enable_speaker_cuda_graph(self, config):
+        self.speaker_graph_config = config
 
     def enable_trt_spk_embedding(self):
         self.trt_spk_calls += 1
@@ -149,6 +153,7 @@ def test_cuda_speaker_backend_preserves_lazy_model_loading(tmp_path, monkeypatch
 
 
 _OTHER_DEFAULTS = {
+    "token2wav_spk_cuda_graph",
     "token2wav_float16",
     "token2wav_trt",
     "code2wav_bfloat16_attention_cache",
@@ -263,3 +268,12 @@ def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, device_pla
     # Mutating the stage config afterwards must not re-read it per forward.
     model.vllm_config.model_config.stage_connector_config["extra"]["token2wav_allow_tf32"] = True
     assert model._tf32_mode == "off"
+
+
+@pytest.mark.parametrize("value,enabled", [(True, True), ("true", True), (False, False), ("false", False)])
+def test_speaker_graph_flag_reaches_selected_backend(tmp_path, monkeypatch, value, enabled):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    model, speaker = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cuda_graph": value})
+    assert speaker.device_spk_calls == 1
+    assert speaker.speaker_graph_config is (model.vllm_config if enabled else None)

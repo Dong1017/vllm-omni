@@ -1598,6 +1598,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                     "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
                     "(token2wav_device_spk=false)"
                 )
+        if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
+            token2wav.enable_speaker_cuda_graph(self.vllm_config)
+            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1609,6 +1612,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
+            cfm_float16=read_bool_flag(extra, "cfm_float16", False),
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
