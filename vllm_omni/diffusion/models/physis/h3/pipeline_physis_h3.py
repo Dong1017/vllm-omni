@@ -16,11 +16,16 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
-from vllm_omni.diffusion.models.physis.common import build_physis_cell_plan, validate_physis_request
+from vllm_omni.diffusion.models.physis.common import (
+    build_physis_cell_plan,
+    prepare_video_output,
+    validate_physis_request,
+)
 from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanCell
 from vllm_omni.diffusion.models.physis.wan.sampler import WAN22_5B, WanFourStepSampler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import get_wan22_post_process_func as get_wan22_post_process_func
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
+from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
@@ -54,7 +59,7 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         model_cfg = dict(od_config.model_config or {})
         stage_cfg = dict(getattr(od_config, "ar_diffusion_stage_config", None) or {})
         stage_cfg.update(model_cfg.get("ar_diffusion_stage_config") or {})
-        self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1))
+        self.step_replicas = cfg_step_replicas(stage_cfg)
         parallel = od_config.parallel_config
         if (
             int(parallel.tensor_parallel_size) != 1
@@ -65,9 +70,9 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         if int(parallel.cfg_parallel_size) != 1:
             raise ValueError("Physis H3 is guidance distilled and requires CFG1")
         world = int(parallel.pipeline_parallel_size)
-        if self.stage_parallel_size not in (1, 4) or world % self.stage_parallel_size:
-            raise ValueError("Physis H3 requires S1 or S4 with an integral layer-group count")
-        self.layer_groups = world // self.stage_parallel_size
+        if self.step_replicas != 4 or world < 4 or world % self.step_replicas:
+            raise ValueError("Physis H3 requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")
+        self.layer_groups = world // self.step_replicas
         self.pp_rank, _ = resolve_pp_rank_and_group()
         self.device = get_local_device()
         config = json.loads((Path(self.model_path) / "transformer" / "config.json").read_text(encoding="utf-8"))
@@ -145,7 +150,6 @@ class PhysisH3Pipeline(CausVidWanPipeline):
             block_size=self.block_size,
             max_chunk_tokens=self.block_size,
             max_history_chunks=18,
-            resident_history_steps=4 if self.stage_parallel_size == 1 else 1,
         )
 
     def _encode_prompt(self, prompt, device, dtype):
@@ -180,7 +184,7 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         validate_physis_request(req.sampling_params, num_frames=output_frames(chunks))
         plan = build_physis_cell_plan(
             chunks=chunks,
-            stages=self.stage_parallel_size,
+            step_replicas=self.step_replicas,
             layer_groups=self.layer_groups,
             blocks=self.transformer.num_layers,
             blocks_per_rank=self.transformer.local_num_layers,
@@ -268,7 +272,7 @@ class PhysisH3Pipeline(CausVidWanPipeline):
                 chunks = finished[request_id]
                 latents = torch.cat([sink_latent, *(chunks[i] for i in range(plan.schedule.chunks))], dim=2)
                 video = self._decode_latents(latents)
-                result = self._video_output(video)
+                result = prepare_video_output(self._video_output(video), output_type=item.sampling_params.output_type)
                 result.stage_durations = durations
                 outputs.append(result)
             else:

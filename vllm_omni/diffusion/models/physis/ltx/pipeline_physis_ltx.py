@@ -21,7 +21,11 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     _as_request_list,
 )
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-from vllm_omni.diffusion.models.physis.common import build_physis_cell_plan, validate_physis_request
+from vllm_omni.diffusion.models.physis.common import (
+    build_physis_cell_plan,
+    prepare_video_output,
+    validate_physis_request,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
@@ -29,6 +33,7 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import (
     resolve_pp_rank_and_group,
     run_cell_pipeline,
 )
+from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
@@ -60,7 +65,7 @@ class PhysisLTXCell(WanCell):
             live=live,
         )
         tf, timestep = self.transformer, self._timesteps[step]
-        if block == tf.start_layer and tf.is_stage_first:
+        if block == tf.start_layer and tf.is_layer_group_first:
             tokens = tf.embed(latent)
         else:
             assert tokens is not None
@@ -73,7 +78,7 @@ class PhysisLTXCell(WanCell):
             timestep=timestep,
             kv_ctx=kv_contexts[0][0],
         )
-        if not (block == tf.end_layer - 1 and tf.is_stage_last):
+        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
             live[chunk] = latent
             return {"latent": latent, "hidden_states": tokens}
         prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
@@ -101,11 +106,11 @@ class PhysisLTXPipeline(CausVidWanPipeline):
             **dict(getattr(od_config, "ar_diffusion_stage_config", None) or {}),
             **dict(config.get("ar_diffusion_stage_config") or {}),
         }
-        self.stage_parallel_size = int(stage.get("stage_parallel_size", 1))
+        self.step_replicas = cfg_step_replicas(stage)
         pp_world = int(od_config.parallel_config.pipeline_parallel_size)
-        self.layer_groups = pp_world // self.stage_parallel_size
-        if self.stage_parallel_size not in (1, 4) or pp_world % self.stage_parallel_size:
-            raise ValueError("Physis LTX requires stage_parallel_size=1 or 4 dividing PP world size")
+        if self.step_replicas != 4 or pp_world < 4 or pp_world % self.step_replicas:
+            raise ValueError("Physis LTX requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")
+        self.layer_groups = pp_world // self.step_replicas
         if int(od_config.parallel_config.tensor_parallel_size) != 1:
             raise ValueError("Physis LTX Cell execution currently requires tensor_parallel_size=1")
         self.pp_rank, _ = resolve_pp_rank_and_group()
@@ -182,7 +187,6 @@ class PhysisLTXPipeline(CausVidWanPipeline):
             block_size=self.block_size,
             max_chunk_tokens=self.max_chunk_tokens,
             max_history_chunks=18,
-            resident_history_steps=4 if self.stage_parallel_size == 1 else 1,
         )
 
     def _encode_prompt(self, prompt, device, dtype):
@@ -201,7 +205,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     add_special_tokens=True,
                     return_tensors="pt",
                 )
-                hidden = self.text_encoder(
+                hidden = self.text_encoder.base_model(
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
                     output_hidden_states=True,
@@ -234,7 +238,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         validate_physis_request(req.sampling_params, num_frames=8 * chunks + 9, frame_rate=24.0)
         plan = build_physis_cell_plan(
             chunks=chunks,
-            stages=self.stage_parallel_size,
+            step_replicas=self.step_replicas,
             layer_groups=self.layer_groups,
             blocks=self.transformer.num_layers,
             blocks_per_rank=self.transformer.local_num_layers,
@@ -326,7 +330,9 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     ],
                     dim=2,
                 )
-                result = self._video_output(self._decode_latents(latent))
+                result = prepare_video_output(
+                    self._video_output(self._decode_latents(latent)), output_type=item.sampling_params.output_type
+                )
                 result.stage_durations = durations
                 outputs.append(result)
             else:

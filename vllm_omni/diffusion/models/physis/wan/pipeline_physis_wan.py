@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -17,9 +16,10 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
 from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
+from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 
-from ..common import build_physis_cell_plan, validate_physis_request
+from ..common import build_physis_cell_plan, prepare_video_output, validate_physis_request
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
 PROFILES = {
@@ -165,7 +165,7 @@ class PhysisWanCell(WanCell):
         )
         tf = self.transformer
         timestep = self._timesteps[step]
-        if block == tf.start_layer and tf.is_stage_first:
+        if block == tf.start_layer and tf.is_layer_group_first:
             tokens = tf.embed(latent)
         else:
             assert tokens is not None
@@ -178,7 +178,7 @@ class PhysisWanCell(WanCell):
             timestep=timestep,
             kv_ctx=kv_contexts[0][0],
         )
-        if not (block == tf.end_layer - 1 and tf.is_stage_last):
+        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
             live[chunk] = latent
             return {"latent": latent, "hidden_states": tokens}
         prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
@@ -200,6 +200,12 @@ class PhysisWanPipeline(CausVidWanPipeline):
         profile, shape, chunks = PROFILES[profile_name]
         if config.get("causvid_ckpt") or config.get("generator_ckpt"):
             raise ValueError("Physis checkpoints must not receive a CausVid overlay")
+        stage_cfg = dict(getattr(od_config, "ar_diffusion_stage_config", None) or {})
+        stage_cfg.update(config.get("ar_diffusion_stage_config") or {})
+        step_replicas = cfg_step_replicas(stage_cfg)
+        pp_world = int(od_config.parallel_config.pipeline_parallel_size)
+        if step_replicas != 4 or pp_world < 4 or pp_world % step_replicas:
+            raise ValueError("Physis Wan requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")
         super().__init__(od_config=od_config, prefix=prefix)
         self.profile = profile
         self.latent_shape = shape
@@ -238,10 +244,6 @@ class PhysisWanPipeline(CausVidWanPipeline):
             pp.broadcast(encoded, src=0)
         return encoded
 
-    def ar_diffusion_noisy_kv_spec(self):
-        spec = super().ar_diffusion_noisy_kv_spec()
-        return replace(spec, resident_history_steps=4 if self.stage_parallel_size == 1 else 1)
-
     def _plan_for(self, req):
         extra = dict(req.sampling_params.extra_args or {})
         if int(extra.get("num_denoise_steps", 4)) != 4:
@@ -254,11 +256,9 @@ class PhysisWanPipeline(CausVidWanPipeline):
         if chunks < 2:
             raise ValueError("Use at least two chunks for Physis Wan Cell execution")
         validate_physis_request(req.sampling_params, num_frames=4 * chunks + 5)
-        if self.stage_parallel_size not in (1, 4):
-            raise ValueError("Physis Wan supports stage_parallel_size=1 or 4")
         plan = build_physis_cell_plan(
             chunks=chunks,
-            stages=self.stage_parallel_size,
+            step_replicas=self.step_replicas,
             layer_groups=self.layer_groups,
             blocks=self.transformer.num_layers,
             blocks_per_rank=self.transformer.local_num_layers,
@@ -329,7 +329,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 chunks = finished[request_id]
                 ordered = [sink_latent, *(chunks[index] for index in range(plan.schedule.chunks))]
                 video = self._decode_latents(torch.cat(ordered, dim=2))
-                result = self._video_output(video)
+                result = prepare_video_output(self._video_output(video), output_type=item.sampling_params.output_type)
                 result.stage_durations = durations
                 outputs.append(result)
             else:

@@ -1,7 +1,7 @@
 # Physis Same-Step video models
 
 Experimental text-to-video pipelines for five post-trained Physis checkpoints.
-These use the Same-Step schedule from PR #9078 and native Omni transformer,
+These use the Same-Step schedule with the topology contract from PR #9169 and native Omni transformer,
 encoder and decoder components. Full output quality equivalence to the model
 reference is not established; this is not a general replacement for the base models.
 
@@ -35,7 +35,8 @@ time rate of 24; playback FPS is a separate output setting.
 
 ## Generate one video
 
-The default deployment is one GPU. This example uses Wan 2.1 1.3B:
+The default deployment requires four GPUs, one replica per trained denoising
+step. This example uses Wan 2.1 1.3B:
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -68,18 +69,21 @@ physis_h3.yaml with their respective classes and request shapes.
 
 ## Parallel layouts and measurement
 
-TP and SP remain 1. The deployment's pipeline_parallel_size is S times G:
+TP and SP remain 1. Four trained denoising steps require step_replicas S=4;
+the deployment's pipeline_parallel_size is S times G:
 
-| GPUs | stage_parallel_size S | Layer groups G | Meaning |
+| GPUs | step_replicas S | Layer groups G | Meaning |
 | ---: | ---: | ---: | --- |
-| 1 | 1 | 1 | Serial four-step execution |
-| 2 | 1 | 2 | Transformer layers split between two GPUs |
 | 4 | 4 | 1 | One weight replica per denoising step |
+| 8 | 4 | 2 | Each step replica splits its transformer layers between two GPUs |
 
 Update stages[0].devices to logical IDs within the scheduler's visible GPU
 allocation and stages[0].parallel_config.pipeline_parallel_size to the GPU
-count. Set model_config.ar_diffusion_stage_config.stage_parallel_size to S.
+count. Set model_config.ar_diffusion_stage_config.step_replicas to 4.
 Do not overwrite the scheduler's CUDA_VISIBLE_DEVICES.
+
+One- and two-GPU results from before PR #9169 are historical evidence for the
+earlier serial schedule. They do not validate a current supported deployment.
 
 Text encoders run on CPU; rank 0 decodes the whole latent sequence on GPU.
 H3 requires vae_use_tiling: true as supplied in its deploy config. LTX uses
@@ -91,3 +95,25 @@ encoding, DiT, VAE and postprocessing, excluding model initialization and file
 encoding. Run one warmup and three measured requests with the fixed workload
 above. Keep DiT timing, E2E wall time and playback FPS separate. Scaling between
 the layouts above changes both GPU count and the parallel layout.
+
+For a four-GPU benchmark, use the selected Physis deployment config and keep
+these values in its deployment copy; retain the model-specific fields:
+
+```yaml
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    parallel_config:
+      pipeline_parallel_size: 4
+      tensor_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+    model_config:
+      ar_diffusion_stage_config:
+        step_replicas: 4
+```
+
+The four-step Same-Step schedule has no clean-history step. The permanent
+clean sink is computed separately and remains part of each model's attention
+history.

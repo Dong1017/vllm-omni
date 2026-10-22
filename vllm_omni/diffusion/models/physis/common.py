@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
+
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.experimental.ar_diffusion.cell_schedule import CellPlan, CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -33,18 +36,26 @@ def validate_physis_request(
 
 
 def build_physis_cell_plan(
-    *, chunks: int, stages: int, layer_groups: int, blocks: int, blocks_per_rank: int
+    *, chunks: int, step_replicas: int, layer_groups: int, blocks: int, blocks_per_rank: int
 ) -> CellPlan:
     return build_cell_plan(
         CellSchedule(
             chunks=chunks - 1,
             num_denoise_steps=4,
-            stages=stages,
+            step_replicas=step_replicas,
             layer_groups=layer_groups,
             ordering=Ordering.SAME_STEP,
             kv_history_chunks=18,
             blocks=blocks,
             blocks_per_rank=blocks_per_rank,
-            clean_pass=False,
         )
     )
+
+
+def prepare_video_output(output: DiffusionOutput, *, output_type: str) -> DiffusionOutput:
+    if output.media is not None:
+        video = output.media.video
+        if output_type == "latent":
+            return replace(output, output=video.tensor, media=None)
+        output.media = output.media.with_video(replace(video, spec=replace(video.spec, preserve_input_dtype=True)))
+    return output

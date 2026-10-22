@@ -139,7 +139,7 @@ class StageLTXTransformer(nn.Module):
             raise ValueError("Physis LTX requires connector embeddings and unit patches")
         self.layer_groups, self.pp_rank = layer_groups, pp_rank
         self.group = pp_rank % layer_groups
-        self.is_stage_first, self.is_stage_last = (
+        self.is_layer_group_first, self.is_layer_group_last = (
             self.group == 0,
             self.group == layer_groups - 1,
         )
@@ -173,9 +173,9 @@ class StageLTXTransformer(nn.Module):
                 setattr(block, name, norm)
             block.attn1.set_processor(_CellAttention(self, int(index)))
         _drop(model, AUDIO_MODEL_PARTS)
-        if not self.is_stage_first:
+        if not self.is_layer_group_first:
             _drop(model, ("proj_in", "keyframes_abs_pos_embedding"))
-        if not self.is_stage_last:
+        if not self.is_layer_group_last:
             _drop(model, ("norm_out", "proj_out", "scale_shift_table"))
         self.model = model.to_empty(device=device).to(dtype=dtype).eval().requires_grad_(False)
         self.sink_pages = {}
@@ -205,12 +205,12 @@ class StageLTXTransformer(nn.Module):
                     index = int(parts[1])
                     if not self.start_layer <= index < self.end_layer or parts[2] in AUDIO_BLOCK_PARTS:
                         continue
-                if not self.is_stage_first and parts[0] in (
+                if not self.is_layer_group_first and parts[0] in (
                     "proj_in",
                     "keyframes_abs_pos_embedding",
                 ):
                     continue
-                if not self.is_stage_last and parts[0] in (
+                if not self.is_layer_group_last and parts[0] in (
                     "norm_out",
                     "proj_out",
                     "scale_shift_table",

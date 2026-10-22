@@ -36,8 +36,8 @@ class PhysisStageH3Transformer(nn.Module):
         super().__init__()
         self.layer_groups = layer_groups
         self.group = pp_rank % layer_groups
-        self.is_stage_first = self.group == 0
-        self.is_stage_last = self.group == layer_groups - 1
+        self.is_layer_group_first = self.group == 0
+        self.is_layer_group_last = self.group == layer_groups - 1
         self.num_layers = int(transformer_config["num_layers"])
         if self.num_layers % layer_groups:
             raise ValueError("H3 Cell layer groups must divide the checkpoint's layer count")
@@ -51,14 +51,14 @@ class PhysisStageH3Transformer(nn.Module):
         model.blocks = nn.ModuleDict({str(self.start_layer + i): block for i, block in enumerate(model.blocks)})
         del model.audio_patch_proj
         del model.final_layer.audio_out
-        if not self.is_stage_first:
+        if not self.is_layer_group_first:
             del model.video_patch_proj
             del model.condition_proj
             del model.token_refiner
-        if not self.is_stage_last:
+        if not self.is_layer_group_last:
             del model.final_layer
         attentions = [block.attn for block in model.blocks.values()]
-        if self.is_stage_first:
+        if self.is_layer_group_first:
             attentions.extend(block.attn for block in model.token_refiner.blocks)
         for attention in attentions:
             for name in ("q_norm", "k_norm"):
@@ -113,9 +113,9 @@ class PhysisStageH3Transformer(nn.Module):
                     if self.start_layer <= target[2][1] < self.end_layer:
                         raise ValueError(f"Owned H3 block has no target for {name}")
                 elif (
-                    not self.is_stage_first
+                    not self.is_layer_group_first
                     and target[0].startswith(("video_patch_proj", "condition_proj", "token_refiner"))
-                ) or (not self.is_stage_last and target[0].startswith("final_layer")):
+                ) or (not self.is_layer_group_last and target[0].startswith("final_layer")):
                     continue
                 else:
                     raise ValueError(f"H3 checkpoint has no native parameter for {name}")
@@ -142,7 +142,7 @@ class PhysisStageH3Transformer(nn.Module):
         device = next(self.backbone.parameters()).device
         self.text_positions = torch.zeros(self.text_tokens, 3, device=device, dtype=torch.float64)
         self.text_positions[:, 0] = torch.arange(self.text_tokens, device=device, dtype=torch.float64)
-        if self.is_stage_first:
+        if self.is_layer_group_first:
             text, _ = self.backbone.condition_proj(encoder_hidden_states[0].to(torch.bfloat16))
             lengths = torch.tensor([0, self.text_tokens], device=device, dtype=torch.int32)
             refiner = self.backbone.token_refiner
