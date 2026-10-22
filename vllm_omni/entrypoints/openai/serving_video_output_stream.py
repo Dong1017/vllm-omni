@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     StreamingVideoFormat,
+    _resolve_audio_sample_rate,
     create_streaming_video_encoder,
     decode_input_reference,
 )
@@ -871,7 +872,7 @@ class OmniStreamingVideoOutputHandler:
                         )
                         if chunk_audio is not None:
                             metadata["num_audio_samples"] = self._num_audio_samples(chunk_audio)
-                            metadata["audio_sample_rate"] = audio_sample_rate
+                            metadata["audio_sample_rate"] = encoder.audio_sample_rate
                         yield (chunk, metadata)
 
             completed = True
@@ -1097,9 +1098,9 @@ class OmniStreamingVideoOutputHandler:
         sample_rate = None
         if isinstance(metadata, dict):
             audio_metadata = metadata.get("audio")
-            if isinstance(audio_metadata, dict) and isinstance(audio_metadata.get("sample_rate"), int):
-                sample_rate = int(audio_metadata["sample_rate"])
-        return audio, sample_rate
+            if isinstance(audio_metadata, dict):
+                sample_rate = audio_metadata.get("sample_rate")
+        return audio, _resolve_audio_sample_rate(audio, sample_rate) if sample_rate is not None else None
 
     @staticmethod
     def _num_audio_samples(audio: Any) -> int:
@@ -1141,6 +1142,12 @@ class OmniStreamingVideoOutputHandler:
         num_frames: int,
         stream_metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        """Describe submitted media and emitted byte length, not a standalone fragment.
+
+        Frame/sample counts and event IDs refer to the source generation chunk.
+        Codec/muxer buffering can move its media into a later binary frame;
+        a trailer reports zero submitted frames while flushing buffered media.
+        """
         return {
             "type": "video.chunk_metadata",
             "request_id": request_id,

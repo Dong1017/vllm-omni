@@ -248,7 +248,9 @@ class FragmentedMP4Muxer:
     :meth:`mux_audio_samples`, each chunk continuing the previous one on the
     audio timeline. AAC frames are 1024 samples, so the encoder buffers the
     remainder of a chunk internally and emits it with the next chunk or on
-    ``close``.
+    ``close``. A/V fragmentation uses a 100 ms duration threshold. The muxer also
+    retains the last incomplete fragment, so each method returns newly emitted
+    bytes rather than a complete encoding of that method's input chunk.
     """
 
     def __init__(
@@ -268,7 +270,7 @@ class FragmentedMP4Muxer:
         self._closed = False
         muxer_options = {"movflags": "+frag_every_frame+empty_moov+default_base_moof"}
         if audio_sample_rate is not None:
-            # A/V 按短时间窗切分，避免逐视频帧切分导致 AAC 时间戳重复。
+            # Short A/V fragments avoid duplicate AAC timestamps from per-frame cuts.
             muxer_options = {"movflags": "+empty_moov+default_base_moof", "frag_duration": "100000"}
         self._container = av.open(
             self._buf,
@@ -338,6 +340,10 @@ class FragmentedMP4Muxer:
     @property
     def has_audio(self) -> bool:
         return self._audio_stream is not None
+
+    @property
+    def audio_sample_rate(self) -> int | None:
+        return self._audio_sample_rate if self.has_audio else None
 
     def mux_video_frames(self, video_frames: np.ndarray) -> bytes:
         """Mux a batch of ``uint8`` RGB frames and return newly written MP4 bytes."""
@@ -450,28 +456,24 @@ def finalize_streaming_video_bytes(
         raise ValueError(f"Unsupported streaming video format: {input_format}")
 
     try:
-        container = cast(Any, av.open(io.BytesIO(video_bytes), format=demux_format))
-    except Exception:
-        return video_bytes
-
-    with container:
-        if container.streams.audio:
-            # Remux 保留两轨的压缩数据和时间戳，避免保存时丢失音频。
-            playback_buffer = io.BytesIO()
-            media_streams = [stream for stream in container.streams if stream.type in ("video", "audio")]
-            with cast(Any, av.open(playback_buffer, mode="w", format="mp4")) as output:
-                output_streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
-                for packet in container.demux(*media_streams):
-                    if packet.dts is None:
-                        continue
-                    packet.stream = output_streams[packet.stream.index]
-                    output.mux(packet)
-            return playback_buffer.getvalue()
-        try:
+        with cast(Any, av.open(io.BytesIO(video_bytes), format=demux_format)) as container:
+            if container.streams.audio:
+                # Preserve both compressed tracks and their timestamps when saving.
+                playback_buffer = io.BytesIO()
+                media_streams = [stream for stream in container.streams if stream.type in ("video", "audio")]
+                with cast(Any, av.open(playback_buffer, mode="w", format="mp4")) as output:
+                    output_streams = {stream.index: output.add_stream_from_template(stream) for stream in media_streams}
+                    for packet in container.demux(*media_streams):
+                        if packet.dts is None:
+                            continue
+                        packet.stream = output_streams[packet.stream.index]
+                        output.mux(packet)
+                return playback_buffer.getvalue()
             stream = container.streams.video[0]
             frame_arrays = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
-        except Exception:
-            return video_bytes
+    except Exception:
+        # Saving is best-effort; retain the received stream on media errors.
+        return video_bytes
 
     if not frame_arrays:
         return video_bytes

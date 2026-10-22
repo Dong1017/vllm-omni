@@ -34,6 +34,7 @@ from collections import deque
 from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import httpx
@@ -786,12 +787,16 @@ def _log_video_encoding_path(
 
 
 def _resolve_audio_sample_rate(audio: AudioInput | None, audio_sample_rate: int | None) -> int:
+    if audio_sample_rate is not None:
+        if isinstance(audio_sample_rate, bool) or not isinstance(audio_sample_rate, Integral) or audio_sample_rate <= 0:
+            raise ValueError("audio_sample_rate must be a positive integer")
+        return int(audio_sample_rate)
     if audio is not None and audio_sample_rate is None:
         logger.info_once(
             "Audio sample rate was not provided; using default sample rate of %s Hz.",
             DEFAULT_AUDIO_SAMPLE_RATE,
         )
-    return audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE
+    return DEFAULT_AUDIO_SAMPLE_RATE
 
 
 def _encode_prepared_video_bytes_legacy(
@@ -962,11 +967,23 @@ class FragmentedMP4VideoEncoder:
         The audio track is created with the first chunk that carries audio and
         must then be present on every later chunk; the chunk's samples are
         appended after its frames so both timelines advance together.
+        Returned bytes may include buffered packets from an earlier call and
+        omit the current tail until a later call or close().
         """
         from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
 
         frames_u8 = _coerce_video_to_uint8_frames(video) if _has_frames(video) else None
         audio_np = _coerce_audio_to_numpy(audio) if audio is not None and _has_samples(audio) else None
+        if audio_sample_rate is not None:
+            audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate)
+        if self._muxer is not None:
+            if self._muxer.has_audio:
+                if frames_u8 is not None and audio_np is None:
+                    raise ValueError("Every video chunk must include audio after the audio track is created.")
+                if audio_sample_rate is not None and audio_sample_rate != self._muxer.audio_sample_rate:
+                    raise ValueError("audio_sample_rate must match the existing audio track")
+            elif audio_np is not None:
+                raise ValueError("Audio arrived after the fMP4 header was written without an audio track.")
         if self._muxer is None:
             if frames_u8 is None:
                 return b""
@@ -974,7 +991,7 @@ class FragmentedMP4VideoEncoder:
             if audio_np is not None:
                 audio_channels = int(min(audio_np.shape)) if audio_np.ndim == 2 else 1
                 muxer_kwargs = {
-                    "audio_sample_rate": audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+                    "audio_sample_rate": _resolve_audio_sample_rate(audio_np, audio_sample_rate),
                     "audio_channels": 1 if audio_channels == 1 else 2,
                 }
             self._muxer = FragmentedMP4Muxer(
@@ -988,10 +1005,12 @@ class FragmentedMP4VideoEncoder:
         if frames_u8 is not None:
             chunk += self._muxer.mux_video_frames(frames_u8)
         if audio_np is not None:
-            if not self._muxer.has_audio:
-                raise ValueError("Audio arrived after the fMP4 header was written without an audio track.")
             chunk += self._muxer.mux_audio_samples(audio_np)
         return chunk
+
+    @property
+    def audio_sample_rate(self) -> int | None:
+        return self._muxer.audio_sample_rate if self._muxer is not None else None
 
     def close(self) -> bytes:
         """Close the underlying fMP4 muxer and return trailing bytes, if any."""

@@ -68,6 +68,32 @@ Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
 
+### Audio and chunk boundaries
+
+If the first video chunk includes audio, the server creates an AAC track. Every
+later video chunk must then include nonempty audio. An explicit sample rate must
+be a positive integer and must match the track's initial rate; invalid chunks
+are rejected before advancing either media timeline. Omitting a later sample
+rate keeps the track's rate. If no initial rate is provided, the server uses
+24,000 Hz. Audio cannot be added after a video-only MP4 header has been emitted.
+
+The binary frames form one continuous fMP4 stream, rather than independently
+decodable files. In `video.chunk_metadata`, `byte_length` describes the following
+binary frame. `num_frames`, `num_audio_samples`, `generation_chunk_index` and
+interaction event IDs describe the source media submitted during that encoding
+call; they do not count the media packets already present in those bytes.
+`audio_sample_rate` reports the rate used for the audio track.
+
+The audio/video muxer uses a 100 ms fragment-duration threshold and retains an
+incomplete final fragment. AAC also buffers incomplete 1024-sample frames and
+encoder delay. A chunk's tail can therefore arrive with the next chunk or the
+final trailer. This is buffering across chunk boundaries, not an additional
+100 ms of timestamp drift accumulated on every chunk. A trailer reports zero
+submitted frames but can contain buffered media. Clients must append bytes in
+receive order and use the MP4 timestamps for playback and playback feedback,
+rather than treating the source counts or event IDs as exact playback markers.
+When progressive-MP4 finalization fails, saving retains the received fMP4 bytes.
+
 ## Playback Backpressure
 
 A compatible single-stage interactive pipeline can pace generation against a

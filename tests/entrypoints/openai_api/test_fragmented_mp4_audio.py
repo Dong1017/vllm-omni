@@ -104,7 +104,7 @@ def test_taomate_phase_fragments_preserve_audio_video_timelines(
     streams, frames, samples = _probe(stream)
     assert streams == 2
     assert frames == frames_so_far
-    # AAC 的尾部 padding 限制在两个 codec frame 内。
+    # Keep AAC tail padding within two codec frames.
     assert frames_so_far * 32000 // 24 <= samples <= frames_so_far * 32000 // 24 + 2 * 1024
     with av.open(io.BytesIO(stream)) as container:
         video_times = [float(frame.pts * frame.time_base) for frame in container.decode(video=0)]
@@ -134,3 +134,112 @@ def test_finalize_audio_video_stream_preserves_both_encoded_tracks() -> None:
                 timestamps.append([float(packet.pts * packet.time_base) for packet in packets])
         assert payloads[0] == payloads[1]
         assert timestamps[0] == pytest.approx(timestamps[1])
+
+
+@pytest.mark.parametrize("audio", [None, np.empty((0, 2), dtype=np.float32)], ids=["missing", "empty"])
+def test_encoder_rejects_missing_audio_without_advancing_video(audio: np.ndarray | None) -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    stream = encoder.encode(_frames(17), _sine(17 * 32000 // 24), audio_sample_rate=32000)
+    with pytest.raises(ValueError, match="include audio"):
+        encoder.encode(_frames(17), audio, audio_sample_rate=32000)
+    stream += encoder.encode(_frames(17), _sine(17 * 32000 // 24))
+    stream += encoder.close()
+    assert _probe(stream)[1] == 34
+
+
+def test_encoder_rejects_changed_sample_rate_without_advancing_timelines() -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    stream = encoder.encode(_frames(17), _sine(17 * 32000 // 24), audio_sample_rate=np.int64(32000))
+    with pytest.raises(ValueError, match="match the existing audio track"):
+        encoder.encode(_frames(17), _sine(17 * 48000 // 24, rate=48000), audio_sample_rate=48000)
+    stream += encoder.encode(_frames(17), _sine(17 * 32000 // 24))
+    stream += encoder.close()
+    assert encoder.audio_sample_rate == 32000
+    assert _probe(stream)[1] == 34
+    with av.open(io.BytesIO(stream)) as container:
+        packets = [packet for packet in container.demux(audio=0) if packet.size]
+        assert all(packet.time_base.denominator == 32000 for packet in packets)
+        assert all(right.pts > left.pts for left, right in zip(packets, packets[1:]))
+
+
+@pytest.mark.parametrize("sample_rate", [0, -32000, True, 32000.5, "32000"])
+def test_encoder_rejects_invalid_initial_sample_rate(sample_rate) -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    with pytest.raises(ValueError, match="positive integer"):
+        encoder.encode(_frames(17), _sine(17 * 32000 // 24), audio_sample_rate=sample_rate)
+    assert encoder.audio_sample_rate is None
+
+
+def test_encoder_rejects_late_audio_before_advancing_video() -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    stream = encoder.encode(_frames(17))
+    with pytest.raises(ValueError, match="audio track"):
+        encoder.encode(_frames(17), _sine(17 * 32000 // 24), audio_sample_rate=32000)
+    stream += encoder.encode(_frames(17))
+    stream += encoder.close()
+    assert _probe(stream)[1] == 34
+
+
+def test_audio_video_chunk_tail_is_flushed_without_timestamp_drift() -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
+    stream = b""
+    submitted = 0
+    for count in (34, 34, 34, 22):
+        sample_start = submitted * 32000 // 24
+        submitted += count
+        samples = _sine(submitted * 32000 // 24 - sample_start)
+        stream += encoder.encode(_frames(count), samples, audio_sample_rate=32000)
+        with av.open(io.BytesIO(stream)) as container:
+            timestamps = [float(frame.pts * frame.time_base) for frame in container.decode(video=0)]
+        assert 0 < len(timestamps) < submitted
+        assert timestamps == pytest.approx(np.arange(len(timestamps)) / 24, abs=1 / 90000)
+    stream += encoder.close()
+    assert _probe(stream)[1] == submitted
+    with av.open(io.BytesIO(stream)) as container:
+        timestamps = [float(frame.pts * frame.time_base) for frame in container.decode(video=0)]
+    assert timestamps == pytest.approx(np.arange(submitted) / 24, abs=1 / 90000)
+
+
+@pytest.mark.parametrize("cut", [1, 64, 256, 1024])
+def test_finalize_truncated_audio_video_stream_is_best_effort(cut: int) -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
+    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24), audio_sample_rate=32000)
+    streamed += encoder.close()
+    truncated = streamed[:-cut]
+    saved = finalize_streaming_video_bytes(truncated, input_format="m4s", fps=24)
+    assert saved
+    with av.open(io.BytesIO(saved)) as container:
+        assert len(container.streams.video) == len(container.streams.audio) == 1
+
+
+def test_finalize_nonmonotonic_fragment_timestamps_returns_received_bytes() -> None:
+    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
+    streamed = encoder.encode(_frames(34), _sine(34 * 32000 // 24), audio_sample_rate=32000)
+    streamed += encoder.close()
+    damaged = bytearray(streamed)
+    offset = 0
+    changed = 0
+    while True:
+        offset = damaged.find(b"tfdt", offset)
+        if offset < 0:
+            break
+        # tfdt stores a full-box header followed by a 32- or 64-bit decode time.
+        width = 8 if damaged[offset + 4] == 1 else 4
+        start = offset + 8
+        if int.from_bytes(damaged[start : start + width], "big"):
+            damaged[start : start + width] = bytes(width)
+            changed += 1
+        offset += 4
+    assert changed > 1
+    received = bytes(damaged)
+    previous_dts: dict[int, int] = {}
+    regressed = False
+    with av.open(io.BytesIO(received)) as container:
+        for packet in container.demux():
+            if packet.size and packet.dts is not None:
+                index = packet.stream.index
+                if index in previous_dts and packet.dts < previous_dts[index]:
+                    regressed = True
+                previous_dts[index] = packet.dts
+    assert regressed
+    assert finalize_streaming_video_bytes(received, input_format="m4s", fps=24) == received
