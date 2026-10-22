@@ -348,7 +348,7 @@ steps:
           - "tests/dfx/perf/results/*.json"
         commands:
           - |
-            [ -d "$${VLLM_TEST_MINIMAX_H3_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/FL2VA" || true
+            [ -d "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_FL2VA_MODEL/FL2VA" || true
             export BENCHMARK_DIR=tests/dfx/perf/results
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
