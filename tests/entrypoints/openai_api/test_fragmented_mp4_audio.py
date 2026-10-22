@@ -10,7 +10,11 @@ import av
 import numpy as np
 import pytest
 
-from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer, finalize_streaming_video_bytes
+from vllm_omni.diffusion.utils.media_utils import (
+    FragmentedMP4Muxer,
+    finalize_streaming_video_bytes,
+    mux_video_audio_bytes,
+)
 from vllm_omni.entrypoints.openai.video_api_utils import FragmentedMP4VideoEncoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -29,12 +33,7 @@ def _sine(samples: int, rate: int = 32000) -> np.ndarray:
 
 
 def _probe(buffer: bytes) -> tuple[int, int, int]:
-    """(stream count, decoded video frames, muxed audio samples).
-
-    Audio is counted from the muxed AAC packets (1024 samples each): PyAV's
-    decode iterator stops early on short fragmented streams, while ffmpeg
-    decodes them completely.
-    """
+    """Return stream count, decoded video frames and presented audio samples."""
     with av.open(io.BytesIO(buffer)) as container:
         video = [stream for stream in container.streams if stream.type == "video"]
         audio = [stream for stream in container.streams if stream.type == "audio"]
@@ -42,7 +41,7 @@ def _probe(buffer: bytes) -> tuple[int, int, int]:
     samples = 0
     if audio:
         with av.open(io.BytesIO(buffer)) as container:
-            samples = sum(1024 for packet in container.demux(container.streams.audio[0]) if packet.size)
+            samples = sum(frame.samples for frame in container.decode(audio=0))
     return len(video) + len(audio), frames, samples
 
 
@@ -58,11 +57,10 @@ def test_muxer_writes_video_and_audio_fragments(chunks: int) -> None:
     streams, frames, samples = _probe(stream)
     assert streams == 2
     assert frames == 17 * chunks
-    # The first AAC priming length of content is dropped so that both
-    # timelines start at zero; close() pads the tail one AAC frame past the
-    # last video frame and the encoder rounds up to whole 1024-sample frames.
-    expected = chunks * (17 * 32000 // 24) - 1024
-    assert expected <= samples <= expected + 4 * 1024
+    # The edit list removes encoder priming, preserving all generated samples.
+    # close() pads one AAC frame past the video end; encoding rounds up.
+    expected = chunks * (17 * 32000 // 24)
+    assert expected <= samples <= expected + 2 * 1024
 
 
 def test_encoder_adds_audio_track_when_the_first_chunk_carries_audio() -> None:
@@ -111,8 +109,11 @@ def test_taomate_phase_fragments_preserve_audio_video_timelines(
     assert video_times == pytest.approx(np.arange(frames_so_far) / 24, abs=1 / 90000)
     with av.open(io.BytesIO(stream)) as container:
         audio_times = [float(packet.pts * packet.time_base) for packet in container.demux(audio=0) if packet.size]
-    assert audio_times[0] == 0
+    assert audio_times[0] == pytest.approx(-1024 / 32000)
     assert all(right > left for left, right in zip(audio_times, audio_times[1:]))
+    with av.open(io.BytesIO(stream)) as container:
+        first_audio = next(container.decode(audio=0))
+        assert first_audio.pts * first_audio.time_base == 0
 
 
 def test_finalize_audio_video_stream_preserves_both_encoded_tracks() -> None:
@@ -243,3 +244,26 @@ def test_finalize_nonmonotonic_fragment_timestamps_returns_received_bytes() -> N
                 previous_dts[index] = packet.dts
     assert regressed
     assert finalize_streaming_video_bytes(received, input_format="m4s", fps=24) == received
+
+
+@pytest.mark.parametrize("first_chunk_frames", [1, 17])
+def test_aac_priming_preserves_the_first_generated_samples(first_chunk_frames: int) -> None:
+    samples = 34 * 32000 // 24
+    waveform = np.zeros((samples, 2), dtype=np.float32)
+    waveform[:1024] = _sine(1024)
+    reference = mux_video_audio_bytes(_frames(34), waveform, fps=24, audio_sample_rate=32000)
+    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
+    split = first_chunk_frames * 32000 // 24
+    streamed = encoder.encode(_frames(first_chunk_frames), waveform[:split], audio_sample_rate=32000)
+    streamed += encoder.encode(_frames(34 - first_chunk_frames), waveform[split:], audio_sample_rate=32000)
+    streamed += encoder.close()
+    saved = finalize_streaming_video_bytes(streamed, input_format="m4s", fps=24)
+    decoded = []
+    for data in (reference, streamed, saved):
+        with av.open(io.BytesIO(data)) as container:
+            frames = list(container.decode(audio=0))
+            assert frames[0].pts * frames[0].time_base == 0
+            decoded.append(np.concatenate([frame.to_ndarray() for frame in frames], axis=1))
+    assert np.abs(decoded[0][:, :1024]).max() > 0.1
+    for actual in decoded[1:]:
+        np.testing.assert_allclose(actual[:, :1024], decoded[0][:, :1024], rtol=0, atol=1e-6)

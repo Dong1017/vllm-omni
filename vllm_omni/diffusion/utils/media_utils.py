@@ -236,7 +236,7 @@ class ChunkedMP4Encoder:
 
 
 _MUX_CLOCK_HZ = 90_000
-_AAC_PRIMING_SAMPLES = 1024
+_AAC_FRAME_SAMPLES = 1024
 
 
 class FragmentedMP4Muxer:
@@ -271,7 +271,7 @@ class FragmentedMP4Muxer:
         muxer_options = {"movflags": "+frag_every_frame+empty_moov+default_base_moof"}
         if audio_sample_rate is not None:
             # Short A/V fragments avoid duplicate AAC timestamps from per-frame cuts.
-            muxer_options = {"movflags": "+empty_moov+default_base_moof", "frag_duration": "100000"}
+            muxer_options = {"movflags": "+empty_moov+delay_moov+default_base_moof", "frag_duration": "100000"}
         self._container = av.open(
             self._buf,
             mode="w",
@@ -298,7 +298,6 @@ class FragmentedMP4Muxer:
             pass
         self._ticks_per_frame = Fraction(_MUX_CLOCK_HZ) / Fraction(fps)
         self._video_frames_written = 0
-        self._video_offset_ticks = 0
 
         options: dict[str, object] = {"crf": str(crf)}
         if video_codec_options:
@@ -314,8 +313,6 @@ class FragmentedMP4Muxer:
         self._audio_sample_rate = 0
         self._audio_layout = "stereo"
         self._audio_samples_written = 0
-        self._audio_priming_samples = 0
-        self._audio_skip_pending = 0
         if audio_sample_rate is not None:
             if audio_sample_rate <= 0:
                 raise ValueError("audio_sample_rate must be positive")
@@ -329,13 +326,8 @@ class FragmentedMP4Muxer:
             )
             self._audio_stream.layout = self._audio_layout
             self._audio_stream.time_base = Fraction(1, self._audio_sample_rate)
-            # A fragmented file cannot carry the edit list that hides the AAC
-            # encoder delay (one 1024-sample frame). Keep both timelines
-            # starting at zero and drop the first priming-length of audio
-            # content instead: every later sample is then presented at its true
-            # time next to the video frame it belongs to.
-            self._audio_priming_samples = _AAC_PRIMING_SAMPLES if audio_codec == "aac" else 0
-            self._audio_skip_pending = self._audio_priming_samples
+            # delay_moov lets FFmpeg record AAC priming in an edit list after
+            # seeing the first packets. Keep every generated input sample.
 
     @property
     def has_audio(self) -> bool:
@@ -353,7 +345,7 @@ class FragmentedMP4Muxer:
 
         for frame_data in video_frames:
             frame = av.VideoFrame.from_ndarray(frame_data, format="rgb24")
-            frame.pts = self._video_offset_ticks + int(round(self._video_frames_written * self._ticks_per_frame))
+            frame.pts = int(round(self._video_frames_written * self._ticks_per_frame))
             frame.time_base = self._video_time_base
             self._video_frames_written += 1
             for packet in self._stream.encode(frame):
@@ -377,15 +369,11 @@ class FragmentedMP4Muxer:
             planar = np.ascontiguousarray(np.repeat(planar, 2, axis=0))
         if planar.shape[0] != channels:
             raise ValueError(f"audio chunk has {planar.shape[0]} channels; the session uses {channels}")
-        if self._audio_skip_pending:
-            skip = min(self._audio_skip_pending, int(planar.shape[1]))
-            planar = np.ascontiguousarray(planar[:, skip:])
-            self._audio_skip_pending -= skip
         if planar.shape[1] == 0:
             return b""
         frame = av.AudioFrame.from_ndarray(planar, format="fltp", layout=self._audio_layout)
         frame.sample_rate = self._audio_sample_rate
-        frame.pts = self._audio_priming_samples + self._audio_samples_written
+        frame.pts = self._audio_samples_written
         frame.time_base = Fraction(1, self._audio_sample_rate)
         self._audio_samples_written += int(planar.shape[1])
         for packet in self._audio_stream.encode(frame):
@@ -402,11 +390,10 @@ class FragmentedMP4Muxer:
             # track outlasts the video track, so pad the audio with silence to
             # one AAC frame past the last video frame.
             video_end = Fraction(self._video_frames_written) * self._ticks_per_frame / _MUX_CLOCK_HZ
-            audio_end = Fraction(self._audio_priming_samples + self._audio_samples_written, self._audio_sample_rate)
-            missing = int(round((video_end - audio_end) * self._audio_sample_rate)) + _AAC_PRIMING_SAMPLES
+            audio_end = Fraction(self._audio_samples_written, self._audio_sample_rate)
+            missing = int(round((video_end - audio_end) * self._audio_sample_rate)) + _AAC_FRAME_SAMPLES
             if missing > 0:
                 channels = 2 if self._audio_layout == "stereo" else 1
-                self._audio_skip_pending = 0
                 tail = self.mux_audio_samples(np.zeros((channels, missing), dtype=np.float32))
         for packet in self._stream.encode():
             self._container.mux(packet)

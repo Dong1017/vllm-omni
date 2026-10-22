@@ -94,6 +94,11 @@ receive order and use the MP4 timestamps for playback and playback feedback,
 rather than treating the source counts or event IDs as exact playback markers.
 When progressive-MP4 finalization fails, saving retains the received fMP4 bytes.
 
+AAC encoder priming is represented by the MP4 edit list, rather than by dropping
+generated samples. The initialization header is delayed until FFmpeg has the
+initial timestamps. Encoded AAC packets can start at negative timestamps;
+presented audio and video start at zero after the player's priming adjustment.
+
 ## Playback Backpressure
 
 A compatible single-stage interactive pipeline can pace generation against a
