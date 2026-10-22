@@ -33,7 +33,10 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
 
 Control events are JSON text frames. Each `video.chunk_metadata` event is
 immediately followed by one binary WebSocket frame containing fragmented MP4
-bytes.
+bytes. If an encoding call emits no bytes yet, the server still sends its
+metadata followed by an empty binary frame (`byte_length: 0`). This preserves
+source counts and interaction events. Empty binary frames add no media to the
+stream and do not indicate completion; wait for `session.done`.
 
 | Direction | Event or frame | Purpose |
 | ----------- | ---------------- | --------- |
@@ -70,6 +73,10 @@ a progressive MP4 file.
 
 ### Audio and chunk boundaries
 
+A generation result containing audio must contain exactly one video; multiple
+videos with one audio payload are rejected before encoding any of that result.
+Video-only results may contain multiple videos.
+
 If the first video chunk includes audio, the server creates an AAC track. Every
 later video chunk must then include nonempty audio. An explicit sample rate must
 be a positive integer and must match the track's initial rate; invalid chunks
@@ -98,6 +105,10 @@ AAC encoder priming is represented by the MP4 edit list, rather than by dropping
 generated samples. The initialization header is delayed until FFmpeg has the
 initial timestamps. Encoded AAC packets can start at negative timestamps;
 presented audio and video start at zero after the player's priming adjustment.
+Clients must honor the edit list (`elst`) in the fMP4 initialization segment,
+including when using Media Source Extensions (MSE). Ignoring it can delay audio
+by one AAC frame (1024 samples, or 32 ms at 32 kHz). Playback checks here use
+PyAV/FFmpeg; browser MSE playback has not been validated.
 
 ## Playback Backpressure
 

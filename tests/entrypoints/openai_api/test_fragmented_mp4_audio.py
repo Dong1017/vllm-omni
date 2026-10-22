@@ -267,3 +267,98 @@ def test_aac_priming_preserves_the_first_generated_samples(first_chunk_frames: i
     assert np.abs(decoded[0][:, :1024]).max() > 0.1
     for actual in decoded[1:]:
         np.testing.assert_allclose(actual[:, :1024], decoded[0][:, :1024], rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["video-list", "batched-array"])
+def test_audio_result_rejects_multiple_videos_before_encoding(batched: bool) -> None:
+    from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+    from vllm_omni.outputs import OmniRequestOutput
+
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+    videos = np.stack([_frames(34), _frames(34)]) if batched else [_frames(34), _frames(34)]
+    result = OmniRequestOutput.from_diffusion(
+        request_id="multi-video",
+        images=[],
+        multimodal_output={
+            "video": videos,
+            "audio": _sine(34 * 32000 // 24),
+            "metadata": {"audio": {"sample_rate": 32000}},
+        },
+    )
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    try:
+        with pytest.raises(ValueError, match="exactly one video"):
+            next(handler._encode_generation_result(result, "multi-video", encoder))
+        assert encoder.audio_sample_rate is None
+    finally:
+        assert encoder.close() == b""
+
+
+def test_video_only_result_preserves_multiple_videos() -> None:
+    from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+    from vllm_omni.outputs import OmniRequestOutput
+
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+    result = OmniRequestOutput.from_diffusion(
+        request_id="multi-video", images=[], multimodal_output={"video": [_frames(17), _frames(17)]}
+    )
+    encoder = FragmentedMP4VideoEncoder(fps=24)
+    try:
+        chunks = list(handler._encode_generation_result(result, "multi-video", encoder))
+    finally:
+        trailer = encoder.close()
+    assert len(chunks) == 2
+    assert [metadata["num_frames"] for _, metadata in chunks] == [17, 17]
+    assert _probe(b"".join(chunk for chunk, _ in chunks) + trailer)[:2] == (1, 34)
+
+
+@pytest.mark.parametrize("frame_counts", [(1,), (1, 1, 17)])
+def test_buffered_audio_result_preserves_all_source_metadata(frame_counts: tuple[int, ...]) -> None:
+    from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+    from vllm_omni.outputs import OmniRequestOutput
+
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
+    chunks = []
+    submitted = 0
+    try:
+        for index, count in enumerate(frame_counts):
+            start = submitted * 32000 // 24
+            submitted += count
+            samples = submitted * 32000 // 24 - start
+            stream_metadata = {
+                "generation_chunk_index": index,
+                "output_chunk_index": index,
+                "started_event_ids": [f"start-{index}"],
+                "active_event_ids": [f"active-{index}"],
+                "completed_event_ids": [f"done-{index}"],
+                "coalesced_event_ids": [f"coalesced-{index}"],
+                "pacing": {"generated_seconds": submitted / 24},
+            }
+            result = OmniRequestOutput.from_diffusion(
+                request_id="buffered",
+                images=[],
+                multimodal_output={
+                    "video": _frames(count),
+                    "audio": _sine(samples),
+                    "metadata": {"audio": {"sample_rate": 32000}, "stream": stream_metadata},
+                },
+            )
+            encoded = list(handler._encode_generation_result(result, "buffered", encoder))
+            assert len(encoded) == 1
+            chunk, metadata = encoded[0]
+            assert metadata["num_frames"] == count
+            assert metadata["num_audio_samples"] == samples
+            assert metadata["audio_sample_rate"] == 32000
+            assert metadata["byte_length"] == len(chunk)
+            assert all(metadata[key] == value for key, value in stream_metadata.items())
+            chunks.extend(encoded)
+    finally:
+        trailer = encoder.close()
+    assert chunks[0][0] == b""
+    assert chunks[0][1]["byte_length"] == 0
+    assert sum(metadata["num_frames"] for _, metadata in chunks) == submitted
+    assert sum(metadata["num_audio_samples"] for _, metadata in chunks) == submitted * 32000 // 24
+    streams, frames, samples = _probe(b"".join(chunk for chunk, _ in chunks) + trailer)
+    assert streams == 2 and frames == submitted
+    assert submitted * 32000 // 24 <= samples <= submitted * 32000 // 24 + 2 * 1024
