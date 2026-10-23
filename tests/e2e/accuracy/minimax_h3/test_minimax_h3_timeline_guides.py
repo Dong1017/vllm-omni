@@ -137,7 +137,7 @@ def _tone_power_fraction(waveform: np.ndarray, seconds: float) -> float:
     return float(power[band].sum() / power[1:].sum())
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=2)
 def test_minimax_h3_timeline_guides_condition_frames_and_audio(tmp_path: Path) -> None:
     image_guide = _gradient_frame(0.0)
     clip_guide = np.stack([_gradient_frame(0.5 + 0.02 * index) for index in range(CLIP_GUIDE_FRAMES)])
