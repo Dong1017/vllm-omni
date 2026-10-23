@@ -75,7 +75,10 @@ a progressive MP4 file.
 
 A generation result containing audio must contain exactly one video; multiple
 videos with one audio payload are rejected before encoding any of that result.
-Video-only results may contain multiple videos.
+Video-only results may contain multiple videos. Their generation chunk index,
+interaction event IDs, pacing fields and output chunk index are reported only
+with the first video. Each video retains its own submitted frame count and
+emitted byte length.
 
 If the first video chunk includes audio, the server creates an AAC track. Every
 later video chunk must then include nonempty audio. An explicit sample rate must

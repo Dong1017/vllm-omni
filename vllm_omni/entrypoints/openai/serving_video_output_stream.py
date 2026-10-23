@@ -891,14 +891,15 @@ class OmniStreamingVideoOutputHandler:
         audio, audio_sample_rate = self._extract_audio_output(result)
         if audio is not None and len(videos) != 1:
             raise ValueError("A streaming result with audio must contain exactly one video.")
-        for video in videos:
+        stream_metadata = self._extract_stream_metadata(result)
+        for index, video in enumerate(videos):
             chunk = encoder.encode(video, audio, audio_sample_rate=audio_sample_rate)
             metadata = self._build_chunk_metadata(
                 request_id=request_id,
                 kind="media",
                 byte_length=len(chunk),
                 num_frames=self._num_video_frames(video),
-                stream_metadata=self._extract_stream_metadata(result),
+                stream_metadata=stream_metadata if index == 0 else {},
             )
             if audio is not None:
                 metadata["num_audio_samples"] = self._num_audio_samples(audio)

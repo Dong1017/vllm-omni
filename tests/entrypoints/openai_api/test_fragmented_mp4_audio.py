@@ -294,13 +294,26 @@ def test_audio_result_rejects_multiple_videos_before_encoding(batched: bool) -> 
         assert encoder.close() == b""
 
 
-def test_video_only_result_preserves_multiple_videos() -> None:
+@pytest.mark.parametrize("batched", [False, True], ids=["video-list", "batched-array"])
+def test_video_only_result_preserves_multiple_videos(batched: bool) -> None:
     from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
     from vllm_omni.outputs import OmniRequestOutput
 
     handler = object.__new__(OmniStreamingVideoOutputHandler)
+    stream_metadata = {
+        "generation_chunk_index": 3,
+        "output_chunk_index": 5,
+        "started_event_ids": ["started"],
+        "active_event_ids": ["active"],
+        "completed_event_ids": ["completed"],
+        "coalesced_event_ids": ["coalesced"],
+        "pacing": {"generated_seconds": 34 / 24},
+    }
+    videos = np.stack([_frames(17), _frames(17)]) if batched else [_frames(17), _frames(17)]
     result = OmniRequestOutput.from_diffusion(
-        request_id="multi-video", images=[], multimodal_output={"video": [_frames(17), _frames(17)]}
+        request_id="multi-video",
+        images=[],
+        multimodal_output={"video": videos, "metadata": {"stream": stream_metadata}},
     )
     encoder = FragmentedMP4VideoEncoder(fps=24)
     try:
@@ -309,6 +322,14 @@ def test_video_only_result_preserves_multiple_videos() -> None:
         trailer = encoder.close()
     assert len(chunks) == 2
     assert [metadata["num_frames"] for _, metadata in chunks] == [17, 17]
+    first, second = [metadata for _, metadata in chunks]
+    assert all(first[key] == value for key, value in stream_metadata.items())
+    assert second["generation_chunk_index"] is None
+    for key in ("started_event_ids", "active_event_ids", "completed_event_ids"):
+        assert second[key] == []
+    for key in ("coalesced_event_ids", "output_chunk_index", "pacing"):
+        assert key not in second
+    assert all(metadata["byte_length"] == len(chunk) for chunk, metadata in chunks)
     assert _probe(b"".join(chunk for chunk, _ in chunks) + trailer)[:2] == (1, 34)
 
 
