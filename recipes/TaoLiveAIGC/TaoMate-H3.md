@@ -127,6 +127,33 @@ To cancel a job that is `in_progress`, use `DELETE /v1/videos/{id}`. Cancellatio
 checked at student denoise-step boundaries; it does not preempt a kernel already
 running. A subsequent request starts with fresh request-owned state.
 
+### Measure ordinary request latency
+
+Use the serial job benchmark to time POST through receipt of the complete MP4.
+Its 50 ms poll interval avoids the two-second polling granularity of the general
+diffusion load benchmark. File writes and media decoding are outside the timer.
+
+```bash
+cat > request.json <<'JSON'
+{
+  "prompt": "A friendly presenter in a quiet studio explains how to grow a small garden, speaking clearly with natural gestures.",
+  "size": "480x864", "num_frames": "124", "fps": "24",
+  "seed": "8301", "num_inference_steps": "3"
+}
+JSON
+python benchmarks/diffusion/benchmark_video_jobs.py \
+  --base-url http://127.0.0.1:8000 --request-json request.json \
+  --warmup 1 --requests 34 --poll-interval 0.05 \
+  --output block-a.json --save-first block-a.mp4
+```
+
+For an optimization comparison, keep the checkpoint, adapter, devices, inputs and
+configuration fixed. Enable `taomate_h3_decode_overlap` and
+`taomate_h3_teacher_cuda_graph` in both arms; enable `taomate_h3_vae_cuda_graph`
+only in the candidate. Restart and warm each arm, and use AB/BA/AB blocks rather
+than comparing one first request. This measures serial latency; it does not
+establish concurrent throughput or tail-latency improvements.
+
 ## Client and prompt updates
 
 ```bash
@@ -192,6 +219,7 @@ the supplied YAML files enable additional optimizations.
 | `taomate_h3_adaln_cache` | true | Cache exact AdaLN projections. Disable to recompute small projections and avoid the host digest synchronization. |
 | `taomate_h3_lora_merge` | false | Experimental shadow student weights with merged LoRA; restores base weights for the teacher. Leave off for the validated FP8 configuration. |
 | `taomate_h3_decode_overlap` | false | Queue video decode on a second CUDA stream alongside clean commit. |
+| `taomate_h3_vae_cuda_graph` | false | Capture and replay fixed-shape video VAE tile decode; tile gather collectives remain outside the graph. |
 | `taomate_h3_cudnn_benchmark` | false | Enable cuDNN autotuning for fixed-shape VAE convolutions. |
 | `taomate_h3_vae_decoder_tile_size` | checkpoint: 256 | Decoder tile edge, a positive multiple of 16. Preserve 256 for the released checkpoint; too few tiles for the VAE ranks trigger a slower fallback. |
 | `taomate_h3_vae_decoder_tile_overlap_min` | checkpoint: 64 | Minimum tile overlap, a nonnegative multiple of 16. The USP2 config uses 32. |
