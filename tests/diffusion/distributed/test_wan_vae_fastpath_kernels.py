@@ -1346,6 +1346,4 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
     error = difference.max().item()
     mse = (difference**2).mean().item()
     psnr = float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
-    assert error <= tolerance and psnr >= 45.0, (
-        f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
-    )
+    assert error <= tolerance and psnr >= 45.0, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
