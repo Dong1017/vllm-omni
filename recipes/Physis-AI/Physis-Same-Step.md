@@ -29,9 +29,16 @@ hf download Physis-AI/physisserve-wan2p1_1p3b-same_step-sdv2 \
 
 All profiles currently require 832x480, four trained denoising steps,
 guidance scale 1, one output and 18 history chunks plus a permanent clean sink.
-Set the standard num_frames explicitly to match num_chunks. Different explicit
+The supplied deployment configs leave num_frames unset, so omitted frame counts
+resolve from the selected profile and num_chunks before validation. When passing
+OmniDiffusionSamplingParams directly, set num_frames explicitly or use None to
+select that model default. Different explicit
 resolution, step count or frame count raises ValueError. LTX uses a fixed model
 time rate of 24; playback FPS is a separate output setting.
+
+An omitted seed uses 0 for reproducible output. The same prompt, configuration
+and seed produce the same video; set seed to another integer for a different
+sample. If supplied, extra_args.seed takes precedence over the standard seed.
 
 ## Generate one video
 

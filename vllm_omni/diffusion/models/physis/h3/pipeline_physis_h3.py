@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncode
 from vllm_omni.diffusion.models.physis.common import (
     build_physis_cell_plan,
     prepare_video_output,
+    validate_physis_parallel_config,
     validate_physis_request,
 )
 from vllm_omni.diffusion.models.physis.wan.pipeline_physis_wan import PhysisWanCell
@@ -53,6 +54,7 @@ class PhysisH3Pipeline(CausVidWanPipeline):
     _vae_modules = ["vae"]
 
     def __init__(self, *, od_config, prefix=""):
+        validate_physis_parallel_config(od_config.parallel_config)
         nn.Module.__init__(self)
         self.od_config = od_config
         self.model_path = str(od_config.model)
@@ -61,14 +63,6 @@ class PhysisH3Pipeline(CausVidWanPipeline):
         stage_cfg.update(model_cfg.get("ar_diffusion_stage_config") or {})
         self.step_replicas = cfg_step_replicas(stage_cfg)
         parallel = od_config.parallel_config
-        if (
-            int(parallel.tensor_parallel_size) != 1
-            or int(parallel.ulysses_degree) != 1
-            or int(parallel.ring_degree) != 1
-        ):
-            raise ValueError("Physis H3 Cell execution currently requires TP1/SP1")
-        if int(parallel.cfg_parallel_size) != 1:
-            raise ValueError("Physis H3 is guidance distilled and requires CFG1")
         world = int(parallel.pipeline_parallel_size)
         if self.step_replicas != 4 or world < 4 or world % self.step_replicas:
             raise ValueError("Physis H3 requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")

@@ -6,7 +6,7 @@ import pytest
 import torch
 from diffusers.video_processor import VideoProcessor
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -18,6 +18,7 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.models.physis.common import (
     build_physis_cell_plan,
     prepare_video_output,
+    validate_physis_parallel_config,
     validate_physis_request,
 )
 from vllm_omni.diffusion.postprocess.device_reduction import reduce_video_to_uint8_frames
@@ -66,6 +67,20 @@ def test_ltx_model_frame_rate_is_separate_from_output_playback_rate():
 def test_optional_fixed_settings_can_be_unspecified():
     params = OmniDiffusionSamplingParams(num_frames=None)
     validate_physis_request(params, num_frames=81)
+    assert params.num_frames == 81
+
+
+def test_supported_parallel_layout_is_accepted():
+    validate_physis_parallel_config(DiffusionParallelConfig(pipeline_parallel_size=4))
+
+
+@pytest.mark.parametrize(
+    "name", ["tensor_parallel_size", "ulysses_degree", "ring_degree", "allgather_degree", "cfg_parallel_size"]
+)
+def test_unsupported_parallel_dimensions_are_rejected(name):
+    parallel = DiffusionParallelConfig(pipeline_parallel_size=4, **{name: 2})
+    with pytest.raises(ValueError, match=rf"{name}=2"):
+        validate_physis_parallel_config(parallel)
 
 
 def test_explicit_recipe_is_accepted():

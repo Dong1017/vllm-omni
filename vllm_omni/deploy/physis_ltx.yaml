@@ -11,6 +11,8 @@ stages:
       enable_device_postprocess: true
     model_class_name: PhysisLTXPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    default_sampling_params:
+      num_frames: null
     parallel_config:
       pipeline_parallel_size: 4
     model_config:

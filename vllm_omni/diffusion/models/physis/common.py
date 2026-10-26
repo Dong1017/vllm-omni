@@ -3,9 +3,55 @@
 
 from dataclasses import replace
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.experimental.ar_diffusion.cell_schedule import CellPlan, CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+
+class PhysisCell(WanCell):
+    def forward(self, tasks, kv_contexts, *, hidden):
+        assert len(tasks) == 1
+        req, (chunk, step, block) = tasks[0]
+        assert 0 <= step < 4
+        self._last_meta = (req, chunk, step)
+        live = self._live.setdefault(req, {})
+        latent, tokens = self._resolve_latent_hidden(
+            req=req, chunk=chunk, step=step, index=0, n_tasks=1, hidden=hidden, live=live
+        )
+        tf = self.transformer
+        timestep = self._timesteps[step]
+        if block == tf.start_layer and tf.is_layer_group_first:
+            tokens = tf.embed(latent)
+        else:
+            assert tokens is not None
+        tokens = tf.block(
+            block,
+            tokens,
+            chunk=chunk + 1,
+            step=step,
+            latent=latent,
+            timestep=timestep,
+            kv_ctx=kv_contexts[0][0],
+        )
+        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
+            live[chunk] = latent
+            return {"latent": latent, "hidden_states": tokens}
+        prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
+        latent = self.sampler.advance(latent, prediction, step=step, seed=self.seed, chunk=chunk + 1)
+        live[chunk] = latent
+        if step == 3:
+            self.finished.setdefault(req, {})[chunk] = latent.detach()
+            if self.on_finished is not None:
+                self.on_finished(chunk + 1, latent)
+        return {"latent": latent}
+
+
+def validate_physis_parallel_config(parallel: DiffusionParallelConfig) -> None:
+    for name in ("tensor_parallel_size", "ulysses_degree", "ring_degree", "allgather_degree", "cfg_parallel_size"):
+        value = getattr(parallel, name)
+        if value != 1:
+            raise ValueError(f"Physis Cell execution requires TP1/SP1/CFG1; received {name}={value}")
 
 
 def validate_physis_request(
@@ -14,6 +60,8 @@ def validate_physis_request(
     num_frames: int,
     frame_rate: float | None = None,
 ) -> None:
+    if params.num_frames is None:
+        params.num_frames = num_frames
     expected = {
         "height": 480,
         "width": 832,

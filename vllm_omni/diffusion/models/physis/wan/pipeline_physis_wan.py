@@ -11,7 +11,13 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.diffusion.models.physis.common import (
+    PhysisCell,
+    build_physis_cell_plan,
+    prepare_video_output,
+    validate_physis_parallel_config,
+    validate_physis_request,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
@@ -19,7 +25,6 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_an
 from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 
-from ..common import build_physis_cell_plan, prepare_video_output, validate_physis_request
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
 PROFILES = {
@@ -145,56 +150,18 @@ class PhysisStageWanTransformer(StageWanTransformer):
         return attn.dropout(attn.to_out(output))
 
 
-class PhysisWanCell(WanCell):
-    def __init__(self, transformer, *, sampler, **kwargs):
-        super().__init__(transformer, sampler=sampler, **kwargs)
-
+class PhysisWanCell(PhysisCell):
     def _init_noise(self, chunk):
         return self.sampler.initial_noise(
             self.latent_shape, device=self.device, dtype=self.dtype, seed=self.seed, chunk=chunk + 1
         )
-
-    def forward(self, tasks, kv_contexts, *, hidden):
-        assert len(tasks) == 1
-        req, (chunk, step, block) = tasks[0]
-        assert 0 <= step < 4
-        self._last_meta = (req, chunk, step)
-        live = self._live.setdefault(req, {})
-        latent, tokens = self._resolve_latent_hidden(
-            req=req, chunk=chunk, step=step, index=0, n_tasks=1, hidden=hidden, live=live
-        )
-        tf = self.transformer
-        timestep = self._timesteps[step]
-        if block == tf.start_layer and tf.is_layer_group_first:
-            tokens = tf.embed(latent)
-        else:
-            assert tokens is not None
-        tokens = tf.block(
-            block,
-            tokens,
-            chunk=chunk + 1,
-            step=step,
-            latent=latent,
-            timestep=timestep,
-            kv_ctx=kv_contexts[0][0],
-        )
-        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
-            live[chunk] = latent
-            return {"latent": latent, "hidden_states": tokens}
-        prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
-        latent = self.sampler.advance(latent, prediction, step=step, seed=self.seed, chunk=chunk + 1)
-        live[chunk] = latent
-        if step == 3:
-            self.finished.setdefault(req, {})[chunk] = latent.detach()
-            if self.on_finished is not None:
-                self.on_finished(chunk + 1, latent)
-        return {"latent": latent}
 
 
 class PhysisWanPipeline(CausVidWanPipeline):
     _transformer_cls = PhysisStageWanTransformer
 
     def __init__(self, *, od_config, prefix=""):
+        validate_physis_parallel_config(od_config.parallel_config)
         config = dict(od_config.model_config or {})
         profile_name = config["physis_profile"]
         profile, shape, chunks = PROFILES[profile_name]

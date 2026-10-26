@@ -12,6 +12,8 @@ stages:
     vae_use_tiling: true
     model_class_name: PhysisH3Pipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    default_sampling_params:
+      num_frames: null
     parallel_config:
       pipeline_parallel_size: 4
     model_config:

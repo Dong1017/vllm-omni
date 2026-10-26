@@ -20,10 +20,11 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CausVidWanPipeline,
     _as_request_list,
 )
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.physis.common import (
+    PhysisCell,
     build_physis_cell_plan,
     prepare_video_output,
+    validate_physis_parallel_config,
     validate_physis_request,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -41,54 +42,13 @@ from .sampler import LTXFourStepSampler
 from .transformer import StageLTXTransformer
 
 
-class PhysisLTXCell(WanCell):
+class PhysisLTXCell(PhysisCell):
     def _init_noise(self, chunk):
         return self.sampler.initial_noise(self.latent_shape, device=self.device, seed=self.seed, chunk=chunk + 1)
 
     def activation_spec(self, *, batch, include_hidden):
         spec = super().activation_spec(batch=batch, include_hidden=include_hidden)
         return [(name, shape, torch.bfloat16 if name == "hidden_states" else dtype) for name, shape, dtype in spec]
-
-    def forward(self, tasks, kv_contexts, *, hidden):
-        assert len(tasks) == 1
-        request, (chunk, step, block) = tasks[0]
-        assert 0 <= step < 4
-        self._last_meta = request, chunk, step
-        live = self._live.setdefault(request, {})
-        latent, tokens = self._resolve_latent_hidden(
-            req=request,
-            chunk=chunk,
-            step=step,
-            index=0,
-            n_tasks=1,
-            hidden=hidden,
-            live=live,
-        )
-        tf, timestep = self.transformer, self._timesteps[step]
-        if block == tf.start_layer and tf.is_layer_group_first:
-            tokens = tf.embed(latent)
-        else:
-            assert tokens is not None
-        tokens = tf.block(
-            block,
-            tokens,
-            chunk=chunk + 1,
-            step=step,
-            latent=latent,
-            timestep=timestep,
-            kv_ctx=kv_contexts[0][0],
-        )
-        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
-            live[chunk] = latent
-            return {"latent": latent, "hidden_states": tokens}
-        prediction = tf.unembed(tokens, chunk=chunk + 1, step=step, latent=latent, timestep=timestep)
-        latent = self.sampler.advance(latent, prediction, step=step, seed=self.seed, chunk=chunk + 1)
-        live[chunk] = latent
-        if step == 3:
-            self.finished.setdefault(request, {})[chunk] = latent.detach()
-            if self.on_finished is not None:
-                self.on_finished(chunk + 1, latent)
-        return {"latent": latent}
 
 
 class PhysisLTXPipeline(CausVidWanPipeline):
@@ -98,6 +58,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
     _resident_modules: ClassVar[list[str]] = []
 
     def __init__(self, *, od_config, prefix=""):
+        validate_physis_parallel_config(od_config.parallel_config)
         nn.Module.__init__(self)
         del prefix
         self.od_config = od_config
@@ -111,8 +72,6 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         if self.step_replicas != 4 or pp_world < 4 or pp_world % self.step_replicas:
             raise ValueError("Physis LTX requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")
         self.layer_groups = pp_world // self.step_replicas
-        if int(od_config.parallel_config.tensor_parallel_size) != 1:
-            raise ValueError("Physis LTX Cell execution currently requires tensor_parallel_size=1")
         self.pp_rank, _ = resolve_pp_rank_and_group()
         self.model_path = str(od_config.model)
         root = Path(self.model_path)

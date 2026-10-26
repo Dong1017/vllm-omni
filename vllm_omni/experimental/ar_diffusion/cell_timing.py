@@ -10,12 +10,12 @@ class CellTiming:
         self.enabled = enabled
         self.events = []
         if enabled:
-            self.started = torch.cuda.Event(enable_timing=True)
+            self.started = torch.Event(enable_timing=True)
             self.started.record()
 
     def mark(self, chunk, latent=None):
         if self.enabled:
-            event = torch.cuda.Event(enable_timing=True)
+            event = torch.Event(enable_timing=True)
             event.record()
             self.events.append((chunk, event))
 
@@ -23,7 +23,7 @@ class CellTiming:
         if not self.enabled:
             return {}
         last = pp is None or pp.rank_in_group == pp.world_size - 1
-        payload = [None]
+        payload: list[dict[str, float] | None] = [None]
         if last:
             self.events[-1][1].synchronize()
             previous = 0.0
