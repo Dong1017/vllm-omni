@@ -354,13 +354,6 @@
           "seed": 42,
           "flow_shift": 12.0,
           "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
-        },
-        "baseline": {
-          "H100": {
-            "request_throughput": 0.0263,
-            "mean_e2el_ms": 38208.9,
-            "mean_peak_memory_mb": 29538.6667
-          }
         }
       }
     ]
