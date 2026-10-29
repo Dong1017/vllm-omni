@@ -283,14 +283,48 @@ class TestGetMropeInputPositions:
 
         positions, delta = model.get_mrope_input_positions(input_tokens, **kwargs)
         # 256/32=8 -> grids = [[1,8,8], [1,16,16]] (small uses factor//2=16 base)
-        # Decode order (reversed): grid[-1]=[1,16,16]=256, grid[-2]=[1,8,8]=64, EOS=1
+        # Decode length: preview 16*16 + target 8*8 + EOS = 321
         total_decode = 256 + 64 + 1  # 321
         assert positions.shape == (3, 4 + total_decode)
-        # delta = max_position + 1 - seq_len
-        # Positions advance by max(h,w) per grid: max(16,16)=16, max(8,8)=8
-        # max_pos = seq_len(4) + 16 + 8 = 28, then EOS at 28
-        # delta = 28 + 1 - 4 = 25
-        assert delta == 25
+        # Linear decode continues the prefill positions directly; the linear
+        # prefill has no 2D expansion, so delta is 0 and the upstream linear
+        # fallback (context_len + delta) matches the reference's
+        # past_seen_tokens wherever the precomputed track is not applied.
+        assert delta == 0
+
+    def test_t2i_decode_positions_are_linear(self, model):
+        """t2i decode positions must be linear increments, all three dims equal."""
+        input_tokens = [100, 101, 102, 16384]  # text + <bos>
+        kwargs = {"target_h": 768, "target_w": 768}
+
+        positions, _ = model.get_mrope_input_positions(input_tokens, **kwargs)
+        seq_len = len(input_tokens)
+        # 768/32=24 -> grids = [[1,24,24], [1,16,16]]
+        total_decode = 16 * 16 + 24 * 24 + 1
+        assert positions.shape == (3, seq_len + total_decode)
+        decode = positions[:, seq_len:]
+        expected = list(range(seq_len, seq_len + total_decode))
+        for dim in range(3):
+            assert decode[dim].tolist() == expected
+
+    def test_i2i_decode_positions_are_linear(self, model):
+        """i2i decode positions must be linear increments from the prefill end."""
+        source_grid = [1, 2, 2]  # 2x2 = 4 image tokens
+        target_grid = [1, 8, 8]  # 8x8 = 64 tokens
+        mrope_grid = torch.tensor([source_grid, target_grid], dtype=torch.long)
+        input_tokens = [100, 101, 16384] + [167855] * 4 + [16385, 16384]
+
+        positions, _ = model.get_mrope_input_positions(input_tokens, mrope_image_grid_thw=mrope_grid)
+        seq_len = len(input_tokens)
+        total_decode = 8 * 8 + 1  # target grid + EOS
+        assert positions.shape == (3, seq_len + total_decode)
+        decode = positions[:, seq_len:]
+        for dim in range(3):
+            vals = decode[dim].tolist()
+            assert vals == list(range(vals[0], vals[0] + total_decode))
+        # The three dimensions must agree on every decode position.
+        assert torch.equal(decode[0], decode[1])
+        assert torch.equal(decode[1], decode[2])
 
     def test_t2i_1024_default_grids(self, model):
         """t2i with default 1024x1024 grids when no explicit target size."""
