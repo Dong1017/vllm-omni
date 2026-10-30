@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 from vllm import SamplingParams
 
 from vllm_omni.model_executor.models.glm_image.prompt import propagate_target_size
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_target_size_is_per_request():

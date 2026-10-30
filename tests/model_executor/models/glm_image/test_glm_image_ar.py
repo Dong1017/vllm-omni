@@ -286,8 +286,24 @@ class TestGetMropeInputPositions:
         torch.nn.Module.__init__(reference)
         reference.config = model.config
         tokens = [
-            16576, 19030, 39717, 16901, 16776, 20670, 18477, 167845, 117687,
-            16732, 117687, 167846, 167845, 115829, 16732, 115829, 167846, 16384,
+            16576,
+            19030,
+            39717,
+            16901,
+            16776,
+            20670,
+            18477,
+            167845,
+            117687,
+            16732,
+            117687,
+            167846,
+            167845,
+            115829,
+            16732,
+            115829,
+            167846,
+            16384,
         ]
         grids = torch.tensor([[1, height // 32, width // 32], [1, preview_h, preview_w]])
         prefill, ref_delta = reference.get_rope_index(torch.tensor([tokens]), grids)
