@@ -1205,6 +1205,13 @@ class SanaWmSelfAttention(nn.Module):
     ) -> bool:
         """Cheap metadata gate for the compiled leaves (no data scans).
 
+        Only the q/k/v tensors are inspected — their metadata decides whether
+        the compiled leaves' specialization holds. The gate is intentionally
+        not the single source of truth for the full input contract: proj/rope
+        shape checks are deferred to ``_validate_cam_prep_inputs`` (re-run by
+        the compiled coordinator before the leaves), and proj/rope layout is
+        ungated because both paths accept arbitrary strides there.
+
         ``require_cuda=False`` lifts only the device check so tests can exercise
         the remaining dtype/shape/layout conditions on CPU; production dispatch
         keeps the default.
@@ -1228,7 +1235,11 @@ class SanaWmSelfAttention(nn.Module):
 
         Falls back to the native function whenever gradients are required
         (grad enabled with any of the seven tensor inputs marked
-        requires_grad) or the metadata gate rejects the call.
+        requires_grad) or the metadata gate rejects the call. ``k_scale`` is a
+        Python float at the production call site; the compiled branch keeps the
+        ``float()`` normalization so the leaf's scalar argument stays a plain
+        float if a 0-d tensor is ever passed, while the native branch forwards
+        it unchanged.
         """
         needs_grad = torch.is_grad_enabled() and (
             q_normed.requires_grad

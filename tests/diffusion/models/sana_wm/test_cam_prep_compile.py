@@ -262,7 +262,12 @@ def test_gradient_runs_fall_back_to_native(monkeypatch):
     def sentinel(*args, **kwargs):
         return marker_out
 
-    monkeypatch.setattr(tr_module, "get_compiled_cam_prep", lambda: sentinel)
+    # Counting getter: one entry per dispatch attempt on the compiled path.
+    def counting_getter():
+        compiled_calls.append(1)
+        return sentinel
+
+    monkeypatch.setattr(tr_module, "get_compiled_cam_prep", counting_getter)
     monkeypatch.setattr(SanaWmSelfAttention, "_cam_prep_supported", lambda self, q, k, v: True)
     a = _bare_attention()
     a.set_cam_prep_use_compiled(True)
@@ -272,9 +277,10 @@ def test_gradient_runs_fall_back_to_native(monkeypatch):
         for other in GRAD_INPUTS:
             kwargs[other].requires_grad_(False)
         kwargs[name].requires_grad_(True)
+        before = len(compiled_calls)
         with torch.enable_grad():
             out_fallback = a._cam_prep_callable()(**kwargs)
-        assert compiled_calls == [], f"{name} with requires_grad must not reach the compiled leaves"
+        assert len(compiled_calls) == before, f"{name} with requires_grad must not reach the compiled leaves"
         assert out_fallback is not marker_out  # falls back to native, not the sentinel
         # The same inputs without grad requirements go through the compiled path.
         for other in GRAD_INPUTS:
@@ -282,7 +288,7 @@ def test_gradient_runs_fall_back_to_native(monkeypatch):
         with torch.enable_grad():
             out = a._cam_prep_callable()(**kwargs)
         assert out is marker_out
-    assert compiled_calls == []  # the compiled path was never reached
+        assert len(compiled_calls) == before + 1  # only the no-grad call reached the compiled path
 
 
 def test_enable_gate_requires_env_and_non_eager_config(monkeypatch):
