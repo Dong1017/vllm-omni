@@ -11,15 +11,8 @@ stages:
   # Stage 0: AR Model (GlmImageForConditionalGeneration)
   # Generates prior_token_ids for conditioning the diffusion process.
   # max_tokens is the theoretical maximum (2048x2048 t2i ≈ 4353
-  # tokens) and only covers paths without a per-request budget
-  # (offline Omni.generate, custom clients). Under the linear decode
-  # positions (#9305) EOS arrives late or never on the vLLM
-  # trajectory, including 1024x1024 grids, so the online serving
-  # path caps each request at the grid's exact budget
-  # (preview+target+1, via get_ar_max_tokens_builder) — the same
-  # count the reference implementation truncates at — and the parser
-  # slices at fixed offsets. Do NOT lower this ceiling below the
-  # largest served resolution's preview+target+1.
+  # tokens) and covers paths without a per-request budget. The serving
+  # path caps generation at the requested grid's token budget.
   - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.6

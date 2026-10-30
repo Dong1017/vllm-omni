@@ -2045,12 +2045,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
     supports_mrope = True
 
-    # GLM-Image pre-computes M-RoPE positions for both prefill and decode
-    # phases.  Prefill uses 2D spatial encoding for source-image tokens (i2i);
-    # decode positions are plain linear increments matching the reference
-    # implementation (transformers generate falls back to arange +
-    # past_seen_tokens).  This flag tells the runner to use those positions
-    # instead of the default linear increments during decode.
+    # GLM-Image pre-computes spatial M-RoPE positions for decode grids.
     precomputed_mrope_decode = True
 
     # The downstream GLM-Image diffusion stage consumes generated token ids and
@@ -2643,15 +2638,28 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             num_decode_grids = len(image_grid_thw) - num_source_images
 
             if num_decode_grids > 0:
-                # Decode positions are plain linear increments with all three
-                # M-RoPE dimensions identical. The reference implementation
-                # (transformers generate) never passes position_ids, so every
-                # generated token falls back to arange + past_seen_tokens; a 2D
-                # grid track diverges from it (#9305). The generated length is
-                # the target grid plus a terminal EOS slot.
-                total_decode_tokens = sum(h * w for _, h, w in image_grid_thw[num_source_images:]) + 1
-                decode_positions = torch.arange(current_pos, current_pos + total_decode_tokens, dtype=torch.long)
-                decode_positions = decode_positions.unsqueeze(0).expand(3, -1)
+                decode_pos_lists: list[torch.Tensor] = []
+                decode_pos = current_pos
+
+                # Process decode grids in REVERSE order (last grid first)
+                # GLM-Image generates small image first (e.g., 16x16), then large (32x32)
+                for i in range(1, num_decode_grids + 1):
+                    grid_idx = len(image_grid_thw) - i  # -1, -2, ... from end
+                    _, h, w = image_grid_thw[grid_idx]
+                    total_tokens = h * w
+
+                    # Build 2D positions following reference implementation
+                    position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                    position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
+                    position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
+
+                    decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
+                    decode_pos += max(h, w)
+
+                # Add position for EOS token
+                decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+
+                decode_positions = torch.cat(decode_pos_lists, dim=1)
 
                 # Concatenate prefill and decode positions
                 llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
@@ -2660,32 +2668,47 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         elif image_grid_thw:
             # Text-to-image mode: no source images, just text + generation positions
+            # Build position IDs considering image regions for decode phase
+            current_pos = 0
+
             # All prefill tokens get sequential 1D positions
             prefill_positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, -1)
+            current_pos = seq_len
 
-            # Decode positions are plain linear increments over the generated
-            # tokens, all three M-RoPE dimensions identical. The reference
-            # implementation (transformers generate with GlmImageProcessor
-            # prompts) never passes position_ids, so decode falls back to
-            # arange + past_seen_tokens; the previous 2D grid track diverged
-            # from that reference and corrupted non-1024 grids (#9305). The
-            # generated length is preview grid + target grid + a terminal EOS
-            # slot.
-            total_decode_tokens = sum(h * w for _, h, w in image_grid_thw) + 1
-            decode_positions = torch.arange(seq_len, seq_len + total_decode_tokens, dtype=torch.long)
-            decode_positions = decode_positions.unsqueeze(0).expand(3, -1)
+            # Pre-compute decode positions for all grids (all for generation)
+            decode_pos_lists: list[torch.Tensor] = []
+            decode_pos = current_pos
+
+            # For t2i with grids [[1,32,32], [1,16,16]]:
+            # - First generate small image (16x16 = 256 tokens) from grid[-1]
+            # - Then generate large image (32x32 = 1024 tokens) from grid[-2]
+            # - Finally generate EOS
+            # Process in reverse order for GLM-Image generation pattern
+            for i in range(1, len(image_grid_thw) + 1):
+                grid_idx = -i  # -1, -2, ... (last grid first)
+                _, h, w = image_grid_thw[grid_idx]
+                total_tokens = h * w
+
+                # Build 2D positions following reference implementation
+                position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
+                position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
+
+                decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
+                decode_pos += max(h, w)
+
+            # Add position for EOS token
+            decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+
+            decode_positions = torch.cat(decode_pos_lists, dim=1)
 
             # Concatenate prefill and decode positions
             llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
-            # Linear decode continues the prefill positions directly, so the
-            # upstream linear fallback (context_len + delta) is also correct
-            # when the precomputed track is not applied (e.g. graph replay).
-            return llm_positions, 0
         else:
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
 
-        mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+        mrope_position_delta = 0
 
         # Debug logging for M-RoPE position calculation
         logger.debug(
