@@ -278,7 +278,11 @@ class _Session:
         self.noise_ahead = None
         if ahead is not None:
             ahead_index, official_audio, video_noise = ahead.result()
-            assert ahead_index == index
+            if ahead_index != index:
+                # A cancelled or reset request can leave a stale draw for
+                # another index behind; recompute rather than assert (the
+                # assert form also vanishes under ``python -O``).
+                official_audio, video_noise = self._request_noise(index)
         else:
             official_audio, video_noise = self._request_noise(index)
         audio_rows = (
@@ -1580,6 +1584,11 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             patch_size=(1, 2, 2),
         )
         decode_stream = self._decode_stream()
+        # One predicate for the final-chunk flush, shared by the decode-overlap
+        # and the eager path below; evaluated before the chunk counter
+        # advances. request_denoise_completed reads the same comparison after
+        # the advance (chunk_num_steps is always set on this path).
+        final_chunk = state.chunk_index + 1 >= state.total_chunks
         decode_started = time.perf_counter()
         frames_device: Any = None
         frame_start = 0
@@ -1593,7 +1602,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             with torch.cuda.stream(decode_stream):
                 latent.record_stream(decode_stream)
                 frame_start, frames_device = session.video_decoder.push_device(latent)
-                if state.chunk_index + 1 >= state.total_chunks:
+                if final_chunk:
                     flush_start, flushed = session.video_decoder.flush_device()
                     if flushed is not None:
                         if frames_device is None:
@@ -1609,6 +1618,11 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 audio_stream = self._audio_decode_stream()
                 audio_stream.wait_stream(torch.cuda.current_stream(self.device))
                 audio_started = time.perf_counter()
+                # Ordering requirement: decode_range_device may rebind
+                # audio_decoder.latents to a trimmed contiguous copy allocated
+                # on this stream, so any later append (issued on the main
+                # stream) must stay behind the wait_stream after the fetch
+                # below, not just behind this record_stream.
                 with torch.cuda.stream(audio_stream):
                     session.audio_decoder.latents.record_stream(audio_stream)
                     audio_device = session.audio_decoder.decode_range_device(
@@ -1667,7 +1681,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         state.chunk_index += 1
         last_phase = (completed_chunk_index % NUM_PHASES) == NUM_PHASES - 1
         session_done = state.request_denoise_completed
-        if session_done and decode_stream is None:
+        if final_chunk and decode_stream is None:
             flush_start, flushed = session.video_decoder.flush()
             if flushed is not None:
                 frames = flushed if frames is None else np.concatenate((frames, flushed), axis=0)
@@ -1721,7 +1735,8 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 ""
                 if graph is None
                 else f", teacher graphs {graph.stats()}"
-                + ("" if self._tm_text_graph is None else f", text graphs {self._tm_text_graph.stats()}"),
+                + ("" if self._tm_text_graph is None else f", text graphs {self._tm_text_graph.stats()}")
+                + ("" if self._tm_vae_decode_graph is None else f", vae graphs {self._tm_vae_decode_graph.stats()}"),
             )
         session.last_phase_end = phase_end
         if self._tm_profiler is not None and completed_chunk_index == self._tm_profile_chunk:
